@@ -921,10 +921,22 @@ class Emitter {
                 }
                 auto invocation =
                     function + "." + callableMethod(from) + "(" + join(arguments) + ")";
-                auto body = destination->getReturnType()->isVoidType()
-                                ? "{ " + invocation + "; }"
-                                : converted(invocation, source->getReturnType(),
-                                            destination->getReturnType());
+                std::string body;
+                if (destination->getReturnType()->isVoidType())
+                    body = "{ " + invocation + "; }";
+                else if (scalarReference(destination->getReturnType())) {
+                    if (!scalarReference(source->getReturnType()) ||
+                        !ctx.hasSameType(clean(source->getReturnType()),
+                                         clean(destination->getReturnType())))
+                        fail(SourceLocation(), "this callable reference-result conversion needs "
+                                               "additional lifetime lowering");
+                    body = invocation;
+                } else {
+                    if (scalarReference(source->getReturnType()))
+                        invocation += ".get()";
+                    body = converted(invocation, source->getReturnType(),
+                                     destination->getReturnType());
+                }
                 line("return (" + type(target) + ") ((" + join(parameters) + ") -> " + body + ");");
             });
         }
@@ -1037,7 +1049,7 @@ class Emitter {
             update && update->isPrefix() && update->isIncrementDecrementOp())
             markReference(update->getSubExpr());
         if (auto binary = dyn_cast_or_null<BinaryOperator>(bare(e))) {
-            if (binary->getOpcode() == BO_Assign)
+            if (binary->isAssignmentOp())
                 markReference(binary->getLHS());
             if (binary->getOpcode() == BO_Comma) {
                 markReference(binary->getRHS());
@@ -1057,6 +1069,11 @@ class Emitter {
             auto n = c->getDirectCallee()->getNameAsString();
             if ((n == "move" || n == "forward" || n == "as_const") && c->getNumArgs())
                 markReference(c->getArg(0));
+            if ((n == "min" || n == "max") && c->getNumArgs() >= 2 &&
+                c->getDirectCallee()->getReturnType()->isReferenceType()) {
+                markReference(c->getArg(0));
+                markReference(c->getArg(1));
+            }
         }
         if (auto v = variableRef(e); v && !v->hasGlobalStorage())
             cells.insert(v);
@@ -1072,6 +1089,14 @@ class Emitter {
         for (auto child : s->children())
             markCapturedVariables(child);
     }
+    void markReturnedReferences(const Stmt* s) {
+        if (!s || isa<LambdaExpr>(s))
+            return;
+        if (auto returned = dyn_cast<ReturnStmt>(s); returned && returned->getRetValue())
+            markReference(returned->getRetValue());
+        for (auto child : s->children())
+            markReturnedReferences(child);
+    }
     void scan(const Stmt* s) {
         if (!s)
             return;
@@ -1081,6 +1106,8 @@ class Emitter {
             reservedNames.insert(identifier(r->getDecl()->getNameAsString()));
         if (auto l = dyn_cast<LambdaExpr>(s)) {
             auto callable = lambdaOperator(l->getLambdaClass());
+            if (scalarReference(callable->getReturnType()))
+                markReturnedReferences(callable->getBody());
             for (auto p : callable->parameters()) {
                 reservedNames.insert(identifier(p->getNameAsString()));
                 if (scalarReference(p->getType()))
@@ -1231,10 +1258,26 @@ class Emitter {
         }
         return wrapped;
     }
+    bool returnsScalarReference(const CallExpr* call) {
+        if (auto function = call->getDirectCallee()) {
+            if (user(function))
+                return scalarReference(function->getReturnType());
+            if (auto op = dyn_cast<CXXOperatorCallExpr>(call);
+                op && op->getOperator() == OO_Call && op->getNumArgs() &&
+                family(op->getArg(0)->getType()) == "function")
+                return scalarReference(function->getReturnType());
+            return false;
+        }
+        return scalarReference(callableType(call->getCallee()->getType())->getReturnType());
+    }
     std::string reference(const Expr* e) {
         auto wrapped = referenceSource(e);
         if (isa<MaterializeTemporaryExpr>(wrapped))
             return "JppRef.cell(" + expr(e) + ")";
+        if (auto call = dyn_cast<CallExpr>(bare(e)); call && returnsScalarReference(call))
+            return expression(call);
+        if (auto compound = dyn_cast<CompoundAssignOperator>(bare(e)))
+            return compoundAssignment(compound, true);
         if (auto update = dyn_cast<UnaryOperator>(bare(e));
             update && update->isPrefix() && update->isIncrementDecrementOp())
             return std::string(dataPointer(update->getSubExpr()->getType())
@@ -1267,6 +1310,16 @@ class Emitter {
             auto n = c->getDirectCallee()->getNameAsString();
             if ((n == "move" || n == "forward" || n == "as_const") && c->getNumArgs())
                 return reference(c->getArg(0));
+            if ((n == "min" || n == "max") && c->getNumArgs() >= 2 &&
+                c->getDirectCallee()->getReturnType()->isReferenceType()) {
+                auto item = clean(c->getDirectCallee()->getReturnType());
+                auto predicate = c->getNumArgs() > 2
+                                     ? comparatorPredicate(c->getArg(2)->getType(), item, item,
+                                                           expr(c->getArg(2)))
+                                     : comparisonPredicate(item, item);
+                return "Jpp." + n + "Reference(" + reference(c->getArg(0)) + ", " +
+                       reference(c->getArg(1)) + ", " + predicate + ")";
+            }
             if (auto call = dyn_cast<CXXMemberCallExpr>(c)) {
                 auto member = dyn_cast<MemberExpr>(bare(call->getCallee()));
                 if (member) {
@@ -1570,6 +1623,8 @@ class Emitter {
         return {};
     }
     std::string assign(const Expr* lhs, const std::string& rhs) {
+        if (auto call = dyn_cast<CallExpr>(bare(lhs)); call && returnsScalarReference(call))
+            return reference(lhs) + ".set(" + rhs + ")";
         if (isa<AbstractConditionalOperator>(bare(lhs)))
             return reference(lhs) + ".set(" + rhs + ")";
         if (auto d = dyn_cast<DeclRefExpr>(bare(lhs));
@@ -1734,12 +1789,16 @@ class Emitter {
             }
             auto invocation =
                 function + "." + callableMethod(comparator) + "(" + join(arguments) + ")";
+            if (scalarReference(prototype->getReturnType()))
+                invocation += ".get()";
             line("return (java.util.function.BiPredicate<" + boxed(leftType) + ", " +
                  boxed(rightType) + ">) ((" + join(parameters) + ") -> " +
                  booleanValue(invocation, prototype->getReturnType()) + ");");
         });
     }
-    bool addressHasSideEffects(const Expr* e) const {
+    bool addressHasSideEffects(const Expr* e) {
+        if (auto call = dyn_cast<CallExpr>(bare(e)); call && returnsScalarReference(call))
+            return true;
         if (auto [base, index] = subscript(e); base)
             return isMap(base->getType()) || base->HasSideEffects(ctx) ||
                    index->HasSideEffects(ctx);
@@ -1747,12 +1806,13 @@ class Emitter {
             return m->getBase()->HasSideEffects(ctx);
         return e->HasSideEffects(ctx);
     }
-    std::string compoundAssignment(const CompoundAssignOperator* e) {
+    std::string compoundAssignment(const CompoundAssignOperator* e, bool asReference = false) {
         if (dataPointer(e->getLHS()->getType())) {
             if (clean(e->getLHS()->getType())->getPointeeType()->isVoidType())
                 fail(e, "GNU void-pointer arithmetic needs byte-addressed storage");
             auto left = temporary("jppPointer"), right = temporary("jppOffset");
-            return "Jpp.compound(" + intArgument(e->getRHS()) + ", " + reference(e->getLHS()) +
+            return std::string(asReference ? "Jpp.compoundReference(" : "Jpp.compound(") +
+                   intArgument(e->getRHS()) + ", " + reference(e->getLHS()) +
                    ", (" + left + ", " + right + ") -> " + left + ".plus(" +
                    (e->getOpcode() == BO_SubAssign ? "-(" + right + ")" : right) + "))";
         }
@@ -1771,7 +1831,7 @@ class Emitter {
         auto dr = dyn_cast<DeclRefExpr>(bare(lhs));
         bool referenceAlias =
             dr && aliases.count(dr->getDecl()) && aliases[dr->getDecl()].ends_with(".get()");
-        if (!addressHasSideEffects(lhs) && !cell(variableRef(lhs)) && !referenceAlias &&
+        if (!asReference && !addressHasSideEffects(lhs) && !cell(variableRef(lhs)) && !referenceAlias &&
             !rhs->HasSideEffects(ctx)) {
             auto indexed = dyn_cast<ArraySubscriptExpr>(bare(lhs));
             bool javaLvalue = dr || isa<MemberExpr>(bare(lhs)) ||
@@ -1787,7 +1847,8 @@ class Emitter {
         }
         // C++17 sequences the RHS before the lvalue. The helper also evaluates the address once.
         auto left = temporary("jppLeft"), right = temporary("jppRight");
-        return "Jpp.compound(" + expr(rhs) + ", " + reference(lhs) + ", (" + left + ", " + right +
+        return std::string(asReference ? "Jpp.compoundReference(" : "Jpp.compound(") +
+               expr(rhs) + ", " + reference(lhs) + ", (" + left + ", " + right +
                ") -> " + calculate(left, right) + ")";
     }
     std::string binary(const Expr* lhs, const Expr* rhs, std::string op, QualType result) {
@@ -2881,6 +2942,13 @@ class Emitter {
         return join(a);
     }
     std::string expr(const Expr* input) {
+        auto result = expression(input);
+        if (auto call = dyn_cast_or_null<CallExpr>(strip(input));
+            call && returnsScalarReference(call))
+            return "(" + result + ").get()";
+        return result;
+    }
+    std::string expression(const Expr* input) {
         if (!input)
             return "";
         auto e = strip(input);
@@ -3185,6 +3253,22 @@ class Emitter {
         }
         if (auto x = dyn_cast<CXXOperatorCallExpr>(e)) {
             auto op = x->getOperator();
+            if (auto function = x->getDirectCallee();
+                function && user(function) && !function->isImplicit() &&
+                !function->isDefaulted() &&
+                !(isa<CXXMethodDecl>(function) &&
+                  cast<CXXMethodDecl>(function)->getParent()->isLambda())) {
+                bool method = isa<CXXMethodDecl>(function);
+                std::vector<std::string> arguments;
+                for (unsigned i = method ? 1 : 0; i < x->getNumArgs(); ++i) {
+                    auto argument = x->getArg(i);
+                    auto target = function->getParamDecl(i - (method ? 1 : 0))->getType();
+                    arguments.push_back(scalarReference(target) ? reference(argument)
+                                                                : value(argument, target, true));
+                }
+                return (method ? expr(x->getArg(0)) + "." : "") + name(function) + "(" +
+                       join(arguments) + ")";
+            }
             if (op == OO_LessLess && x->getNumArgs() == 2 && stream(x->getArg(0)->getType()))
                 return outputChain(x);
             if (op == OO_GreaterGreater && x->getNumArgs() == 2 && stream(x->getArg(0)->getType()))
@@ -3467,7 +3551,7 @@ class Emitter {
         aliases = std::move(oldAliases);
         if (!captures.empty())
             return "new " + functionType(f->getType()->getAs<FunctionProtoType>()) + "() { " +
-                   join(captures, " ") + " public " + type(f->getReturnType()) + " call(" +
+                   join(captures, " ") + " public " + parameterType(f->getReturnType()) + " call(" +
                    join(params) + ") " + body + " }";
         return "(" + functionType(f->getType()->getAs<FunctionProtoType>()) + ") ((" +
                join(params) + ") -> " + body + ")";
@@ -3855,7 +3939,9 @@ class Emitter {
                 expressionStatement(r->getRetValue());
                 if (!terminates(bare(r->getRetValue())))
                     line("return;");
-            } else
+            } else if (current && scalarReference(current->getReturnType()))
+                line("return " + reference(r->getRetValue()) + ";");
+            else
                 line("return " +
                      value(r->getRetValue(),
                            current ? current->getReturnType() : r->getRetValue()->getType(), true) +
@@ -4237,7 +4323,7 @@ class Emitter {
             line("}");
         } else {
             bool stat = !isa<CXXMethodDecl>(f) || cast<CXXMethodDecl>(f)->isStatic();
-            line(std::string(stat ? "static " : "") + type(f->getReturnType()) + " " + name(f) +
+            line(std::string(stat ? "static " : "") + parameterType(f->getReturnType()) + " " + name(f) +
                  "(" + join(params) + ")");
             line("{");
             ++indent;
@@ -4405,6 +4491,8 @@ class Emitter {
                 if (scalarReference(p->getType()))
                     references.insert(p);
             }
+            if (scalarReference(f->getReturnType()))
+                markReturnedReferences(f->getBody());
             scan(f->getBody());
         }
         for (auto v : globals)
@@ -4467,11 +4555,14 @@ class Emitter {
                         value = "jppCopy(" + value + ")";
                     bridge.push_back(value);
                 }
-            line("interface " + n + extends + " { " + type(f->getReturnType()) + " call(" +
+            auto result = "call(" + join(bridge) + ")";
+            if (scalarReference(f->getReturnType()))
+                result += ".get()";
+            line("interface " + n + extends + " { " + parameterType(f->getReturnType()) + " call(" +
                  join(p) + ");" +
                  (pred ? " default boolean test(" + boxed(f->getParamType(0)) + " a, " +
                              boxed(f->getParamType(1)) + " b) { return " +
-                             booleanValue("call(" + join(bridge) + ")", f->getReturnType()) + "; }"
+                             booleanValue(result, f->getReturnType()) + "; }"
                        : "") +
                  " }");
         }

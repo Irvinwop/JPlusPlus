@@ -46,6 +46,8 @@ Byte-string cases compare literal and input bytes for UTF-8, invalid UTF-8, embe
 
 Discarded-expression cases use conditional, comma, arithmetic, cast, and literal expressions in statement and loop-update positions. Native results distinguish skipped updates, duplicate evaluation, and updates incorrectly executed after a break or continue. Heap cases combine explicit lambdas, copied stateful comparators, comparator factories, range element conversion, supplied containers, and independent copies. Mutating the original comparator or container must not change the stored ordering or values.
 
+Reference-result cases mutate through direct and recursive functions, function pointers, methods, overloaded subscripts and dereference, lambdas, and `std::function`. They compare retained aliases, pointer offsets, addresses of neighboring elements, selected extrema, static storage, and conversion to value-returning callables. Side-effect counters catch repeated calls when a returned reference is used as an assignment destination; a compound-assignment result must retain the original element's address.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

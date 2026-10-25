@@ -2565,6 +2565,11 @@ static class Jpp {
                              java.util.function.BiFunction<L, R, L> operation) {
         return target.set(operation.apply(target.get(), right));
     }
+    static <L, R> JppRef<L> compoundReference(R right, JppRef<L> target,
+                                              java.util.function.BiFunction<L, R, L> operation) {
+        target.set(operation.apply(target.get(), right));
+        return target;
+    }
     static <T> int swap(JppRef<T> a, JppRef<T> b) {
         T value = a.get();
         a.set(b.get());
@@ -2576,6 +2581,14 @@ static class Jpp {
     }
     static <T> Comparator<T> comparator(java.util.function.BiPredicate<? super T, ? super T> less) {
         return (a, b) -> less.test(a, b) ? -1 : less.test(b, a) ? 1 : 0;
+    }
+    static <T> JppRef<T> minReference(JppRef<T> first, JppRef<T> second,
+                                      java.util.function.BiPredicate<T, T> less) {
+        return less.test(second.get(), first.get()) ? second : first;
+    }
+    static <T> JppRef<T> maxReference(JppRef<T> first, JppRef<T> second,
+                                      java.util.function.BiPredicate<T, T> less) {
+        return less.test(first.get(), second.get()) ? second : first;
     }
     static <T> Comparator<T> heapComparator(java.util.function.BiPredicate<? super T, ? super T> less) {
         return (a, b) -> less.test(a, b) ? 1 : less.test(b, a) ? -1 : 0;
