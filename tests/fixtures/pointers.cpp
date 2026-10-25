@@ -59,6 +59,13 @@ int main() {
         cout << change(data + 2, 4, y) << ' ' << (at == data + 2) << ' ' << (alias != nullptr)
              << ' ' << (at - alias) << '\n';
         int another[2]{};
+        int storeIndex = 0;
+        int* stored = &(data[storeIndex++] = x + y);
+        int& prefix = ++data[1];
+        prefix += y;
+        int& afterComma = (++storeIndex, data[2]);
+        afterComma -= x;
+        cout << *stored << ' ' << storeIndex << ' ' << data[1] << ' ' << data[2] << '\n';
         int* separate = another;
         cout << (data == &data[0]) << ' ' << (data == separate) << ' '
              << (&globalLeft == &globalLeft) << ' ' << (&globalLeft == &globalRight) << '\n';
@@ -118,6 +125,14 @@ int main() {
         Local* next = new Local{&last, y};
         cout << next->value + next->previous->value << '\n';
         delete next;
+        vector<Node> pool;
+        pool.reserve(16);
+        pool.push_back({nullptr, x});
+        Node* held = &pool.back();
+        pool.push_back({held, y});
+        held->value += y;
+        Node* replaced = &(pool[0] = Node{nullptr, x - y});
+        cout << held->value << ' ' << (replaced == held) << ' ' << pool.back().next->value << '\n';
         map<int, int> mapping;
         int& entry = mapping[x + 1000];
         int* mapped = &entry;

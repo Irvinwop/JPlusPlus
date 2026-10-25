@@ -168,6 +168,9 @@ int main() {
         cases.emplace_back("gnu", expressions.str());
         cases.emplace_back("pointers", expressions.str());
         cases.emplace_back("objects", expressions.str());
+        cases.emplace_back("statics", expressions.str());
+        cases.emplace_back("calls", expressions.str());
+        cases.emplace_back("halt", "");
         cases.emplace_back("coverage", "-19 37 5\n");
         cases.emplace_back("constants", "-17\n");
         cases.emplace_back("names", "-19\n");
@@ -248,6 +251,18 @@ int main() {
             unsignedCases << (i % 9 == 0 ? 0xffffffffU : static_cast<unsigned>(random())) << ' '
                           << (i < boundaries.size() ? boundaries[i] : random()) << '\n';
         cases.emplace_back("unsigned_conversions", unsignedCases.str());
+        auto switchBoundaries = boundaries;
+        switchBoundaries.insert(
+            switchBoundaries.end(),
+            {0x100000001ULL, 7, 8, 0xfffffffffffffff0ULL, 0xffffffffffffffefULL});
+        std::ostringstream switches;
+        switches << switchBoundaries.size() * 4 + 60 << '\n';
+        for (unsigned u : {0U, 1U, 0x80000000U, ~0U})
+            for (auto bits : switchBoundaries)
+                switches << u << ' ' << bits << '\n';
+        for (int i = 0; i < 60; ++i)
+            switches << static_cast<unsigned>(random()) << ' ' << random() << '\n';
+        cases.emplace_back("switches", switches.str());
         write(p / "LibraryDriver.java", "import java.util.*; public class LibraryDriver {"
                                         "public static void main(String[] args) {"
                                         "Scanner in = new Scanner(System.in); int n = in.nextInt();"
@@ -288,11 +303,21 @@ int main() {
             must({(p / "native").string()}, p / "input");
             auto expected = read(p / "stdout");
             std::map<std::string, std::string> expectedFiles;
-            for (const auto& output :
-                 name == "files"      ? std::vector<std::string>{"jpp-io-global.txt"}
-                 : name == "redirect" ? std::vector<std::string>{"jpp-redirect.out"}
-                                      : std::vector<std::string>{})
+            std::vector<std::string> outputNames;
+            if (name == "files")
+                outputNames = {"jpp-io-global.txt"};
+            else if (name == "redirect")
+                outputNames = {"jpp-redirect.out"};
+            else if (name == "statics")
+                outputNames = {"jpp-static.txt", "jpp-static-ref.txt"};
+            else if (name == "halt")
+                outputNames = {"jpp-halt.txt"};
+            for (const auto& output : outputNames) {
+                if (!fs::exists(p / output))
+                    throw std::runtime_error("native file output is missing: " + name + ", " +
+                                             output);
                 expectedFiles.emplace(output, read(p / output));
+            }
             // Generate once per requested Java release, then compile with each independent
             // compiler.
             for (int release : {8, 17, 21}) {

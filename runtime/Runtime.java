@@ -8,6 +8,62 @@ interface JppAssignable<T> extends JppCopyable<T> {
 }
 interface JppUninitialized {}
 
+static class JppStatic<T> extends JppRef<T> {
+    private T value;
+    private boolean initialized;
+    private final boolean ownsResource;
+    JppStatic(T zero, boolean ownsResource) {
+        value = zero;
+        this.ownsResource = ownsResource;
+    }
+    synchronized JppStatic<T> initialize(java.util.function.Supplier<T> initializer) {
+        if (!initialized) {
+            T created = initializer.get();
+            if (value != null && value.getClass().isArray())
+                Jpp.arrayInit(value, created);
+            else
+                value = created;
+            if (ownsResource && value instanceof AutoCloseable)
+                JppStaticResources.track((AutoCloseable)value);
+            initialized = true;
+        }
+        return this;
+    }
+    T get() {
+        return value;
+    }
+    T set(T next) {
+        value = next;
+        return next;
+    }
+}
+
+static class JppStaticResources {
+    private static final ArrayList<AutoCloseable> resources = new ArrayList<AutoCloseable>();
+    private static boolean registered;
+    static synchronized<T extends AutoCloseable> T track(T resource) {
+        if (!registered) {
+            Runtime.getRuntime().addShutdownHook(new Thread(JppStaticResources::closeAll));
+            registered = true;
+        }
+        resources.add(resource);
+        return resource;
+    }
+    static <T extends AutoCloseable> JppRef<T> temporary(JppRef<T> reference) {
+        track(reference.get());
+        return reference;
+    }
+    static synchronized void closeAll() {
+        for (int i = resources.size(); i-- > 0;)
+            try {
+                resources.get(i).close();
+            } catch (Exception exception) {
+                throw new IllegalStateException(exception);
+            }
+        resources.clear();
+    }
+}
+
 static abstract class JppRef<T> {
     abstract T get();
     abstract T set(T value);
@@ -66,6 +122,18 @@ static abstract class JppRef<T> {
     }
     static <T> JppRef<T> at(List<T> a, int i) {
         return of(() -> a.get(i), v -> a.set(i, v), () -> Jpp.pointer(Jpp.begin(a).plus(i)));
+    }
+    static <T> JppRef<T> front(List<T> values) {
+        return at(values, 0);
+    }
+    static <T> JppRef<T> back(List<T> values) {
+        return at(values, values.size() - 1);
+    }
+    static JppRef<Character> front(JppString value) {
+        return at(value, 0);
+    }
+    static JppRef<Character> back(JppString value) {
+        return at(value, value.size() - 1);
     }
     static <T> JppRef<T> at(T[] a, int i) {
         return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
@@ -188,6 +256,11 @@ static class JppString
             data.setLength(0);
             data.append(source.data);
         }
+        return this;
+    }
+    JppString jppSetText(String text) {
+        data.setLength(0);
+        data.append(text);
         return this;
     }
     int size() {
@@ -969,8 +1042,8 @@ static class JppInput implements AutoCloseable {
             c = readByte();
         }
         saved = c;
-        return new JppString(
-            new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8));
+        String text = new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+        return previous == null ? new JppString(text) : previous.jppSetText(text);
     }
     double nextDouble() {
         return nextDouble(0);
@@ -1054,8 +1127,8 @@ static class JppInput implements AutoCloseable {
             bytes.write(c);
         if (c < 0 && bytes.size() == 0)
             good = false;
-        return new JppString(
-            new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8));
+        String text = new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+        return previous == null ? new JppString(text) : previous.jppSetText(text);
     }
 }
 
@@ -1502,6 +1575,22 @@ static final JppInput jppIn = new JppInput();
 static final JppOutput jppOut = new JppOutput(System.out), jppErr = new JppOutput(System.err);
 
 static class Jpp {
+    static <T> JppRef<T> storeReference(T value, JppRef<T> target) {
+        target.set(value);
+        return target;
+    }
+    static <T> JppRef<T> assignReference(T source, JppRef<T> target) {
+        assignRecord(source, target);
+        return target;
+    }
+    static <T> JppRef<T> updatedReference(JppRef<T> target, int amount) {
+        update(target, amount, false);
+        return target;
+    }
+    static <T> JppRef<JppPtr<T>> updatedPointerReference(JppRef<JppPtr<T>> target, int amount) {
+        updatePointer(target, amount, false);
+        return target;
+    }
     @SuppressWarnings({"rawtypes", "unchecked"})
     static <T> T assignValue(T target, T source) {
         if (target instanceof JppAssignable) {

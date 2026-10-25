@@ -41,65 +41,67 @@ const std::set<std::string> javaWords = {
     "while",    "true",   "false",      "null",      "_",          "var",       "yield",
     "record",   "sealed", "permits"};
 
-const std::set<std::string> javaRuntimeNames = {"Object",
-                                                "String",
-                                                "StringBuilder",
-                                                "CharSequence",
-                                                "Boolean",
-                                                "Byte",
-                                                "Short",
-                                                "Character",
-                                                "Integer",
-                                                "Long",
-                                                "Float",
-                                                "Double",
-                                                "Number",
-                                                "Math",
-                                                "StrictMath",
-                                                "System",
-                                                "Runtime",
-                                                "Thread",
-                                                "Class",
-                                                "Arrays",
-                                                "Collections",
-                                                "Comparator",
-                                                "Comparable",
-                                                "Objects",
-                                                "List",
-                                                "ArrayList",
-                                                "Collection",
-                                                "Map",
-                                                "Set",
-                                                "TreeMap",
-                                                "HashMap",
-                                                "TreeSet",
-                                                "NavigableMap",
-                                                "Iterator",
-                                                "Deque",
-                                                "ArrayDeque",
-                                                "PriorityQueue",
-                                                "InputStream",
-                                                "OutputStream",
-                                                "FileInputStream",
-                                                "FileOutputStream",
-                                                "PrintWriter",
-                                                "BufferedWriter",
-                                                "OutputStreamWriter",
-                                                "UncheckedIOException",
-                                                "IOException",
-                                                "ByteArrayOutputStream",
-                                                "Locale",
-                                                "BigInteger",
-                                                "BigDecimal",
-                                                "MathContext",
-                                                "RoundingMode",
-                                                "AutoCloseable",
-                                                "IllegalStateException",
-                                                "UnsupportedOperationException",
-                                                "IllegalArgumentException",
-                                                "IndexOutOfBoundsException",
-                                                "AssertionError",
-                                                "NumberFormatException"};
+const std::set<std::string> javaRuntimeNames = {
+    // Keep source identifiers from hiding Java library types.
+    "Object",
+    "String",
+    "StringBuilder",
+    "CharSequence",
+    "Boolean",
+    "Byte",
+    "Short",
+    "Character",
+    "Integer",
+    "Long",
+    "Float",
+    "Double",
+    "Number",
+    "Math",
+    "StrictMath",
+    "System",
+    "Runtime",
+    "Thread",
+    "Class",
+    "Arrays",
+    "Collections",
+    "Comparator",
+    "Comparable",
+    "Objects",
+    "List",
+    "ArrayList",
+    "Collection",
+    "Map",
+    "Set",
+    "TreeMap",
+    "HashMap",
+    "TreeSet",
+    "NavigableMap",
+    "Iterator",
+    "Deque",
+    "ArrayDeque",
+    "PriorityQueue",
+    "InputStream",
+    "OutputStream",
+    "FileInputStream",
+    "FileOutputStream",
+    "PrintWriter",
+    "BufferedWriter",
+    "OutputStreamWriter",
+    "UncheckedIOException",
+    "IOException",
+    "ByteArrayOutputStream",
+    "Locale",
+    "BigInteger",
+    "BigDecimal",
+    "MathContext",
+    "RoundingMode",
+    "AutoCloseable",
+    "IllegalStateException",
+    "UnsupportedOperationException",
+    "IllegalArgumentException",
+    "IndexOutOfBoundsException",
+    "AssertionError",
+    "NumberFormatException"};
 
 std::string join(const std::vector<std::string>& a, std::string_view sep = ", ") {
     std::string s;
@@ -404,6 +406,8 @@ class Emitter {
     std::unordered_set<const VarDecl*> references;
     std::unordered_set<const VarDecl*> hoistedVariables;
     std::unordered_set<const VarDecl*> selfInitialized;
+    std::unordered_map<const VarDecl*, std::string> staticStorage;
+    std::vector<const VarDecl*> staticLocals;
     std::unordered_map<const LabelDecl*, std::string> jumpLabels;
     std::unordered_map<const FunctionProtoType*, std::string> functionTypes;
     std::vector<std::pair<const FunctionProtoType*, std::string>> interfaces;
@@ -416,6 +420,8 @@ class Emitter {
     std::vector<const FunctionDecl*> enclosingFunctions;
     const CXXRecordDecl* currentRecord = nullptr;
     std::string constructionThis;
+    QualType switchType;
+    std::unordered_map<const CaseStmt*, std::string> switchLabels;
 
     [[noreturn]] void fail(SourceLocation loc, const std::string& message) const {
         auto p = sm.getPresumedLoc(sm.getExpansionLoc(loc));
@@ -453,6 +459,13 @@ class Emitter {
         if (base == options.className)
             base = "cpp_" + base;
         if (auto f = dyn_cast<FunctionDecl>(d)) {
+            static const std::set<std::string> objectMethods = {
+                "getClass", "wait",   "notify", "notifyAll", "toString",
+                "hashCode", "equals", "clone",  "finalize"};
+            if (!isa<CXXConstructorDecl>(f) && !isa<CXXDestructorDecl>(f) &&
+                (objectMethods.count(base) ||
+                 (isa<CXXMethodDecl>(f) && (base == "copy" || base == "compareTo"))))
+                base = "cpp_" + base;
             if (f->isMain())
                 base = "cppMain";
             else if (f->isOverloadedOperator()) {
@@ -775,6 +788,19 @@ class Emitter {
         if (family(t) == "pair")
             return "new " + jt + "(" + defaultValue(element(t)) + ", " +
                    defaultValue(element(t, 1)) + ")";
+        if (auto r = record(t); r && user(r))
+            for (auto constructor : r->ctors())
+                if (constructor->isDefaultConstructor() && constructor->getNumParams()) {
+                    std::vector<std::string> arguments;
+                    for (auto parameter : constructor->parameters()) {
+                        auto argument = parameter->getDefaultArg();
+                        auto target = parameter->getType();
+                        arguments.push_back(scalarReference(target)
+                                                ? reference(argument)
+                                                : value(argument, target, true));
+                    }
+                    return "new " + jt + "(" + join(arguments) + ")";
+                }
         return "new " + jt + "()";
     }
     const Expr* strip(const Expr* e) const {
@@ -935,6 +961,17 @@ class Emitter {
         return result;
     }
     void markReference(const Expr* e) {
+        if (auto update = dyn_cast_or_null<UnaryOperator>(bare(e));
+            update && update->isPrefix() && update->isIncrementDecrementOp())
+            markReference(update->getSubExpr());
+        if (auto binary = dyn_cast_or_null<BinaryOperator>(bare(e))) {
+            if (binary->getOpcode() == BO_Assign)
+                markReference(binary->getLHS());
+            if (binary->getOpcode() == BO_Comma) {
+                markReference(binary->getRHS());
+                markCapturedVariables(binary);
+            }
+        }
         if (auto c = dyn_cast_or_null<ConditionalOperator>(bare(e))) {
             markReference(c->getTrueExpr());
             markReference(c->getFalseExpr());
@@ -966,6 +1003,8 @@ class Emitter {
     void scan(const Stmt* s) {
         if (!s)
             return;
+        if (auto argument = dyn_cast<CXXDefaultArgExpr>(s))
+            scan(argument->getExpr());
         if (auto r = dyn_cast<DeclRefExpr>(s))
             reservedNames.insert(identifier(r->getDecl()->getNameAsString()));
         if (auto l = dyn_cast<LambdaExpr>(s)) {
@@ -986,6 +1025,18 @@ class Emitter {
             for (auto decl : d->decls())
                 if (auto v = dyn_cast<VarDecl>(decl)) {
                     reservedNames.insert(identifier(v->getNameAsString()));
+                    if (v->isStaticLocal() && !staticStorage.count(v->getCanonicalDecl())) {
+                        if (v->getTLSKind() != VarDecl::TLS_None)
+                            fail(v->getLocation(),
+                                 "thread-local storage needs per-thread lowering");
+                        staticStorage[v->getCanonicalDecl()] =
+                            temporary("jppStatic_" + identifier(v->getNameAsString()) + "_");
+                        staticLocals.push_back(v);
+                        cells.insert(v);
+                        markCapturedVariables(v->getInit());
+                        if (v->getType()->isReferenceType())
+                            markReference(v->getInit());
+                    }
                     std::function<bool(const Stmt*)> refersToSelf = [&](const Stmt* s) {
                         if (!s)
                             return false;
@@ -1009,6 +1060,10 @@ class Emitter {
             c && c->getDirectCallee() &&
             (user(c->getDirectCallee()) || c->getDirectCallee()->getNameAsString() == "swap")) {
             auto f = c->getDirectCallee();
+            if (auto method = dyn_cast<CXXMethodDecl>(f); method && method->isStatic())
+                if (auto member = dyn_cast<MemberExpr>(bare(c->getCallee()));
+                    member && member->getBase()->HasSideEffects(ctx))
+                    markCapturedVariables(c);
             unsigned offset = isa<CXXOperatorCallExpr>(c) && isa<CXXMethodDecl>(f) ? 1 : 0;
             for (unsigned i = 0; i < f->getNumParams() && i + offset < c->getNumArgs(); ++i)
                 if (scalarReference(f->getParamDecl(i)->getType()))
@@ -1034,7 +1089,7 @@ class Emitter {
         }
         if (auto c = dyn_cast<CompoundAssignOperator>(s);
             c && (c->getRHS()->HasSideEffects(ctx) || big(c->getLHS()->getType()) ||
-                  dataPointer(c->getLHS()->getType())))
+                  dataPointer(c->getLHS()->getType()) || addressHasSideEffects(c->getLHS())))
             markReference(c->getLHS());
         if (auto b = dyn_cast<BinaryOperator>(s);
             b && b->isAssignmentOp() && isa<AbstractConditionalOperator>(bare(b->getLHS())))
@@ -1077,7 +1132,7 @@ class Emitter {
         for (auto child : s->children())
             scan(child);
     }
-    std::string reference(const Expr* e) {
+    const Expr* referenceSource(const Expr* e) const {
         auto wrapped = e;
         while (true) {
             if (auto cleanup = dyn_cast<ExprWithCleanups>(wrapped))
@@ -1086,16 +1141,64 @@ class Emitter {
                 wrapped = parens->getSubExpr();
             else if (auto cast = dyn_cast<ImplicitCastExpr>(wrapped))
                 wrapped = cast->getSubExpr();
+            else if (auto argument = dyn_cast<CXXDefaultArgExpr>(wrapped))
+                wrapped = argument->getExpr();
             else
                 break;
         }
+        return wrapped;
+    }
+    std::string reference(const Expr* e) {
+        auto wrapped = referenceSource(e);
         if (isa<MaterializeTemporaryExpr>(wrapped))
             return "JppRef.cell(" + expr(e) + ")";
+        if (auto update = dyn_cast<UnaryOperator>(bare(e));
+            update && update->isPrefix() && update->isIncrementDecrementOp())
+            return std::string(dataPointer(update->getSubExpr()->getType())
+                                   ? "Jpp.updatedPointerReference("
+                                   : "Jpp.updatedReference(") +
+                   reference(update->getSubExpr()) + ", " + (update->isIncrementOp() ? "1" : "-1") +
+                   ")";
+        if (auto binary = dyn_cast<BinaryOperator>(bare(e))) {
+            if (binary->getOpcode() == BO_Assign)
+                return "Jpp.storeReference(" +
+                       value(binary->getRHS(), binary->getLHS()->getType()) + ", " +
+                       reference(binary->getLHS()) + ")";
+            if (binary->getOpcode() == BO_Comma)
+                return supplier([&] {
+                    expressionStatement(binary->getLHS());
+                    line("return " + reference(binary->getRHS()) + ";");
+                });
+        }
+        if (auto assignment = dyn_cast<CXXOperatorCallExpr>(bare(e));
+            assignment && assignment->getOperator() == OO_Equal && assignment->getNumArgs() == 2) {
+            auto function = assignment->getDirectCallee();
+            if (function && function->getReturnType()->isReferenceType() &&
+                (!user(function) || function->isImplicit() || function->isDefaulted()))
+                return "Jpp.assignReference(" +
+                       value(assignment->getArg(1), assignment->getArg(0)->getType()) + ", " +
+                       reference(assignment->getArg(0)) + ")";
+        }
         if (auto c = dyn_cast<CallExpr>(bare(e));
             c && c->getDirectCallee() && !user(c->getDirectCallee())) {
             auto n = c->getDirectCallee()->getNameAsString();
             if ((n == "move" || n == "forward" || n == "as_const") && c->getNumArgs())
                 return reference(c->getArg(0));
+            if (auto call = dyn_cast<CXXMemberCallExpr>(c)) {
+                auto member = dyn_cast<MemberExpr>(bare(call->getCallee()));
+                if (member) {
+                    auto objectType = member->getBase()->getType();
+                    if (objectType->isPointerType())
+                        objectType = objectType->getPointeeType();
+                    if (isVec(objectType) || isString(objectType)) {
+                        auto object = expr(member->getBase()) + (member->isArrow() ? ".get()" : "");
+                        if (n == "front" || n == "back")
+                            return "JppRef." + n + "(" + object + ")";
+                        if (n == "at" && c->getNumArgs())
+                            return "JppRef.at(" + object + ", " + intArgument(c->getArg(0)) + ")";
+                    }
+                }
+            }
         }
         if (auto c = dyn_cast<BinaryConditionalOperator>(bare(e)); c && c->isLValue())
             return supplier([&] {
@@ -1191,7 +1294,7 @@ class Emitter {
         }
         return booleanValue(expr(e), e->getType());
     }
-    std::string newArray(QualType t, const Expr* init) {
+    std::string newArray(QualType t, const Expr* init, bool initializeObjects = true) {
         auto a = ctx.getAsArrayType(t);
         if (!a)
             return defaultValue(t);
@@ -1250,7 +1353,7 @@ class Emitter {
             }
             allocation = "(" + type(t) + ") new " + raw + dims;
         }
-        if (part->isRecordType() || big(part))
+        if ((initializeObjects && part->isRecordType()) || big(part))
             return "Jpp.objects(" + allocation + ", () -> " + defaultValue(part) + ")";
         return allocation;
     }
@@ -1572,13 +1675,21 @@ class Emitter {
         auto t = c->getType();
         std::vector<const Expr*> args;
         for (auto a : c->arguments())
-            if (!isa<CXXDefaultArgExpr>(a))
+            if (user(c->getConstructor()) || !isa<CXXDefaultArgExpr>(a))
                 args.push_back(a);
         if (c->getConstructor()->isCopyOrMoveConstructor() && !args.empty()) {
             auto constructor = c->getConstructor();
-            if (user(constructor) && !constructor->isImplicit() && !constructor->isDefaulted())
-                return "new " + type(t) + "(" + expr(args[0]) +
-                       (constructor->isMoveConstructor() ? ", true" : "") + ")";
+            if (user(constructor) && !constructor->isImplicit() && !constructor->isDefaulted()) {
+                std::vector<std::string> bound;
+                for (unsigned i = 0; i < args.size(); ++i) {
+                    auto target = constructor->getParamDecl(i)->getType();
+                    bound.push_back(scalarReference(target) ? reference(args[i])
+                                                            : value(args[i], target, true));
+                }
+                if (constructor->isMoveConstructor())
+                    bound.push_back("true");
+                return "new " + type(t) + "(" + join(bound) + ")";
+            }
             return "jppCopy(" + expr(args[0]) + ")";
         }
         if (args.empty())
@@ -1638,9 +1749,23 @@ class Emitter {
             QualType target = i < c->getConstructor()->getNumParams()
                                   ? c->getConstructor()->getParamDecl(i)->getType()
                                   : args[i]->getType();
-            a.push_back(value(args[i], target, true));
+            a.push_back(user(c->getConstructor()) && scalarReference(target)
+                            ? reference(args[i])
+                            : value(args[i], target, true));
         }
         return "new " + type(t) + "(" + join(a) + ")";
+    }
+    std::string storedElement(const Expr* e, QualType target, bool move) {
+        auto result = value(e, target);
+        if (!copyType(target))
+            return result;
+        if (auto r = record(target); move && r && user(r))
+            for (auto constructor : r->ctors())
+                if (constructor->isMoveConstructor() && !constructor->isImplicit() &&
+                    !constructor->isDefaulted() && !constructor->isDeleted() &&
+                    constructor->hasBody())
+                    return "new " + type(target) + "(" + result + ", true)";
+        return "jppCopy(" + result + ")";
     }
     std::string asIterator(const Expr* e) {
         if (ctx.getAsArrayType(e->getType()))
@@ -1757,6 +1882,12 @@ class Emitter {
             auto ot = obj->getType();
             if (ot->isPointerType())
                 ot = ot->getPointeeType();
+            if (f && user(f)) {
+                auto method = cast<CXXMethodDecl>(f);
+                auto allocatedName = method->getParent()->isLambda() ? "call" : name(f);
+                auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                return object + "." + allocatedName + "(" + arguments(c, f) + ")";
+            }
             auto n = me->getMemberDecl()->getNameAsString();
             if (n == "sync_with_stdio" || (n == "tie" && stream(ot)))
                 return "Jpp.ignore()";
@@ -1806,6 +1937,12 @@ class Emitter {
                 return integerResult(c, o + "." + n + "()");
             bool deque = family(ot) == "queue" || family(ot) == "deque" || family(ot) == "stack";
             bool heap = family(ot) == "priority_queue";
+            if ((deque || heap || isVec(ot)) && c->getNumArgs() == 1 &&
+                (n == "push" || n == "push_back" || n == "push_front")) {
+                bool move = f && f->getNumParams() &&
+                            f->getParamDecl(0)->getType()->isRValueReferenceType();
+                args[0] = storedElement(c->getArg(0), element(ot), move);
+            }
             if (n == "emplace" || n == "emplace_back" || n == "emplace_front") {
                 std::vector<const Expr*> values;
                 for (auto arg : c->arguments())
@@ -1908,8 +2045,6 @@ class Emitter {
                 return "Jpp.pointer(Jpp.begin(" + o + "))";
             if (n == "pop" && family(ot) == "stack")
                 return o + ".pop_back()";
-            if (user(me->getMemberDecl()))
-                n = name(me->getMemberDecl());
             static const std::set<std::string> methods = {
                 "size",        "length", "empty",  "clear",     "front",      "back",
                 "top",         "push",   "pop",    "push_back", "push_front", "pop_back",
@@ -1917,7 +2052,7 @@ class Emitter {
                 "rend",        "erase",  "insert", "count",     "contains",   "lower_bound",
                 "upper_bound", "assign", "substr", "find",      "append",     "at",
                 "swap",        "merge"};
-            if (!user(me->getMemberDecl()) && !methods.count(n))
+            if (!methods.count(n))
                 fail(c, "unsupported library member '" + n + "'");
             if (n == "cbegin")
                 n = "begin";
@@ -1944,10 +2079,18 @@ class Emitter {
         if (user(f) && !f->getBuiltinID()) {
             std::string prefix;
             if (auto method = dyn_cast<CXXMethodDecl>(f); method && method->isStatic()) {
-                if (auto member = dyn_cast<MemberExpr>(bare(c->getCallee())))
-                    prefix = expr(member->getBase()) + ".";
-                else
-                    prefix = name(method->getParent()) + ".";
+                prefix = name(method->getParent()) + ".";
+                if (auto member = dyn_cast<MemberExpr>(bare(c->getCallee()));
+                    member && member->getBase()->HasSideEffects(ctx))
+                    return supplier([&] {
+                        expressionStatement(member->getBase());
+                        auto invocation = prefix + name(f) + "(" + arguments(c, f) + ")";
+                        if (c->getType()->isVoidType()) {
+                            line(invocation + ";");
+                            line("return null;");
+                        } else
+                            line("return " + invocation + ";");
+                    });
             }
             return prefix + name(f) + "(" + arguments(c, f) + ")";
         }
@@ -2052,7 +2195,7 @@ class Emitter {
         if (n == "exit")
             return "Jpp.exit(" + intArgument(c->getArg(0)) + ")";
         if (n == "_Exit")
-            return "System.exit(" + intArgument(c->getArg(0)) + ")";
+            return "Runtime.getRuntime().halt(" + intArgument(c->getArg(0)) + ")";
         if (n == "unreachable")
             return "Jpp.trap()";
         if (n == "bit_cast")
@@ -2400,13 +2543,14 @@ class Emitter {
                 }
                 fail(e, "unsupported library value '" + d->getQualifiedNameAsString() + "'");
             }
+            if (auto v = dyn_cast<VarDecl>(d); v && (v->isFileVarDecl() || v->hasExternalStorage()))
+                return options.className + "." + name(v) + (cell(v) ? ".get()" : "");
             if (auto v = dyn_cast<VarDecl>(d); cell(v))
                 return name(d) + ".get()";
             if (auto v = dyn_cast<VarDecl>(d); v && v->isStaticDataMember())
                 return name(cast<CXXRecordDecl>(v->getDeclContext())) + "." + name(v);
-            if (isa<EnumConstantDecl>(d) || (isa<VarDecl>(d) && cast<VarDecl>(d)->isFileVarDecl()))
-                if (x->hasQualifier() || currentRecord)
-                    return options.className + "." + name(d);
+            if (isa<EnumConstantDecl>(d))
+                return options.className + "." + name(d);
             return name(d);
         }
         if (auto x = dyn_cast<ImplicitCastExpr>(e)) {
@@ -2841,12 +2985,8 @@ class Emitter {
         return "(" + functionType(f->getType()->getAs<FunctionProtoType>()) + ") ((" +
                join(params) + ") -> " + body + ")";
     }
-    std::string variable(const VarDecl* v, bool member = false) {
+    std::string initialValue(const VarDecl* v) {
         auto t = v->getType();
-        if (scalarReference(t))
-            return "final JppRef<" + boxed(t) + "> " + name(v) + " = " + reference(v->getInit());
-        if (auto d = dyn_cast<DecompositionDecl>(v))
-            return decomposition(d, member);
         std::string init;
         if (auto e = v->getInit()) {
             if (clean(t)->isArithmeticType() &&
@@ -2857,6 +2997,29 @@ class Emitter {
                 init = ctx.getAsArrayType(t) ? newArray(t, e) : value(e, t, true);
         } else
             init = defaultValue(t);
+        return init;
+    }
+    std::string variable(const VarDecl* v, bool member = false) {
+        auto t = v->getType();
+        if (v->isStaticLocal()) {
+            auto storage = staticStorage.at(v->getCanonicalDecl());
+            if (t->isReferenceType()) {
+                auto binding = reference(v->getInit());
+                if (fileStream(t) && isa<MaterializeTemporaryExpr>(referenceSource(v->getInit())))
+                    binding = "JppStaticResources.temporary(" + binding + ")";
+                return "final JppRef<" + boxed(t) + "> " + name(v) + " = " + storage +
+                       ".initialize(() -> " + binding + ").get()";
+            }
+            return "final JppRef<" + boxed(t) + "> " + name(v) + " = " + storage + "; " + storage +
+                   ".initialize(() -> " + initialValue(v) + ")";
+        }
+        if (scalarReference(t))
+            return "final JppRef<" + boxed(t) + "> " + name(v) + " = " + reference(v->getInit());
+        if (auto d = dyn_cast<DecompositionDecl>(v))
+            return decomposition(d, member);
+        auto init = initialValue(v);
+        if (member && fileStream(t) && !t->isReferenceType())
+            init = "JppStaticResources.track(" + init + ")";
         if (cells.count(v)) {
             if (v->getInit() && (selfInitialized.count(v) || family(t) == "function" ||
                                  (record(t) && record(t)->isLambda())))
@@ -3008,6 +3171,10 @@ class Emitter {
             return true;
         if (auto label = dyn_cast<LabelStmt>(s))
             return terminates(label->getSubStmt());
+        if (auto label = dyn_cast<CaseStmt>(s))
+            return terminates(label->getSubStmt());
+        if (auto label = dyn_cast<DefaultStmt>(s))
+            return terminates(label->getSubStmt());
         if (auto call = dyn_cast<CallExpr>(s))
             return call->getDirectCallee() && call->getDirectCallee()->isNoReturn();
         if (auto b = dyn_cast<CompoundStmt>(s))
@@ -3095,8 +3262,9 @@ class Emitter {
             bool ownsStream = false;
             if (declarations)
                 for (auto decl : declarations->decls())
-                    if (auto v = dyn_cast<VarDecl>(decl);
-                        v && fileStream(v->getType()) && !v->getType()->isReferenceType())
+                    if (auto v = dyn_cast<VarDecl>(decl); v && fileStream(v->getType()) &&
+                                                          !v->getType()->isReferenceType() &&
+                                                          !v->isStaticLocal())
                         ownsStream = true;
             if (!ownsStream) {
                 stmt(child);
@@ -3107,7 +3275,8 @@ class Emitter {
                 auto v = dyn_cast<VarDecl>(decl);
                 if (!v)
                     fail(child, "unsupported declaration alongside a file stream");
-                if (fileStream(v->getType()) && !v->getType()->isReferenceType()) {
+                if (fileStream(v->getType()) && !v->getType()->isReferenceType() &&
+                    !v->isStaticLocal()) {
                     if (cell(v)) {
                         line(variable(v) + ";");
                         line("try (" + type(v->getType()) + " " + temporary("jppResource") + " = " +
@@ -3150,6 +3319,8 @@ class Emitter {
         if (auto d = dyn_cast<DeclStmt>(s)) {
             for (auto decl : d->decls()) {
                 if (auto v = dyn_cast<VarDecl>(decl)) {
+                    if (v->hasExternalStorage())
+                        continue;
                     if (!hoistedVariables.count(v))
                         line(variable(v) + ";");
                 } else if (isa<TypedefNameDecl>(decl) || isa<UsingDecl>(decl) ||
@@ -3382,14 +3553,86 @@ class Emitter {
             return;
         }
         if (auto sw = dyn_cast<SwitchStmt>(s)) {
+            auto previousType = switchType;
+            auto previousLabels = std::move(switchLabels);
+            switchLabels.clear();
+            switchType = clean(sw->getCond()->getType());
+            if (ctx.getTypeSize(switchType) < 32)
+                switchType = ctx.IntTy;
+            std::vector<const CaseStmt*> cases;
+            bool ranges = false;
+            for (auto label = sw->getSwitchCaseList(); label; label = label->getNextSwitchCase())
+                if (auto c = dyn_cast<CaseStmt>(label)) {
+                    cases.push_back(c);
+                    ranges |= c->getRHS() != nullptr;
+                }
+            bool scope = sw->getInit() || sw->getConditionVariable() || ranges;
+            if (scope) {
+                line("{");
+                ++indent;
+            }
             if (sw->getInit())
                 stmt(sw->getInit());
-            line("switch (" + intArgument(sw->getCond()) + ")");
+            if (sw->getConditionVariable())
+                line(variable(sw->getConditionVariable()) + ";");
+            auto selector = value(sw->getCond(), switchType);
+            if (ranges) {
+                auto saved = temporary("jppSwitch"), selected = temporary("jppCase");
+                line("final " + type(switchType) + " " + saved + " = " + selector + ";");
+                std::string dispatch = "-1";
+                unsigned index = 0;
+                for (auto c : cases) {
+                    auto label = std::to_string(index++);
+                    switchLabels[c] = label;
+                    auto constant = [&](const Expr* e) {
+                        auto v =
+                            e->EvaluateKnownConstInt(ctx).extOrTrunc(ctx.getTypeSize(switchType));
+                        v.setIsUnsigned(switchType->isUnsignedIntegerType());
+                        return integerLiteral(v, switchType);
+                    };
+                    auto first = constant(c->getLHS());
+                    std::string matches;
+                    if (c->getRHS())
+                        matches =
+                            "(" + arithmetic(saved, switchType, first, switchType, ">=") + " && " +
+                            arithmetic(saved, switchType, constant(c->getRHS()), switchType, "<=") +
+                            ")";
+                    else
+                        matches = arithmetic(saved, switchType, first, switchType, "==");
+                    dispatch = "(" + matches + " ? " + label + " : " + dispatch + ")";
+                }
+                line("final int " + selected + " = " + dispatch + ";");
+                selector = selected;
+            } else if (big(switchType))
+                selector = "(" + selector + ").toString()";
+            else if (ctx.getTypeSize(switchType) == 64)
+                selector = "Long.toString(" + selector + ")";
+            line("switch (" + selector + ")");
             block(sw->getBody());
+            if (scope) {
+                --indent;
+                line("}");
+            }
+            switchType = previousType;
+            switchLabels = std::move(previousLabels);
             return;
         }
         if (auto c = dyn_cast<CaseStmt>(s)) {
-            line("case " + expr(c->getLHS()) + ":");
+            std::string label;
+            if (auto found = switchLabels.find(c); found != switchLabels.end())
+                label = found->second;
+            else {
+                if (switchType.isNull())
+                    fail(c, "a case label has no enclosing switch");
+                auto v =
+                    c->getLHS()->EvaluateKnownConstInt(ctx).extOrTrunc(ctx.getTypeSize(switchType));
+                v.setIsUnsigned(switchType->isUnsignedIntegerType());
+                label = big(switchType) ? quote(number(v))
+                        : ctx.getTypeSize(switchType) == 64
+                            ? quote(std::to_string(v.getSExtValue()))
+                            : integerLiteral(v, switchType);
+            }
+            line("case " + label + ":");
             stmt(c->getSubStmt());
             return;
         }
@@ -3634,7 +3877,16 @@ class Emitter {
             --indent;
             line("}");
         }
-        line("public " + n + " copy() { return new " + n + "(this); }");
+        std::vector<std::string> copyArguments = {"this"};
+        if (customCopy)
+            for (unsigned i = 1; i < customCopy->getNumParams(); ++i) {
+                auto parameter = customCopy->getParamDecl(i);
+                copyArguments.push_back(
+                    scalarReference(parameter->getType())
+                        ? reference(parameter->getDefaultArg())
+                        : value(parameter->getDefaultArg(), parameter->getType(), true));
+            }
+        line("public " + n + " copy() { return new " + n + "(" + join(copyArguments) + "); }");
         line("public " + n + " jppAssignFrom(" + n + " other) {");
         ++indent;
         if (customAssignment)
@@ -3749,9 +4001,10 @@ class Emitter {
             line("finally {");
             ++indent;
             line("jppOut.flush(); jppErr.flush();");
-            for (auto v : globals)
-                if (fileStream(v->getType()) && !v->getType()->isReferenceType())
-                    line(name(v) + (cell(v) ? ".get()" : "") + ".close();");
+            if (!staticLocals.empty() || std::any_of(globals.begin(), globals.end(), [&](auto v) {
+                    return fileStream(v->getType()) && !v->getType()->isReferenceType();
+                }))
+                line("JppStaticResources.closeAll();");
             --indent;
             line("}");
             line("if (status != 0) System.exit(status);");
@@ -3767,6 +4020,21 @@ class Emitter {
                              : options.className;
             pointerFields += "static final " + entry.javaType + " " + entry.field + " = " + owner +
                              "::" + name(entry.declaration) + ";\n";
+        }
+        for (auto v : staticLocals) {
+            auto t = v->getType();
+            std::string zero = "null";
+            if (!t->isReferenceType()) {
+                if (clean(t)->isArithmeticType() || clean(t)->isEnumeralType())
+                    zero = defaultValue(t);
+                else if (ctx.getAsArrayType(t))
+                    zero = newArray(t, nullptr, false);
+            }
+            auto storedType = t->isReferenceType() ? "JppRef<" + boxed(t) + ">" : boxed(t);
+            pointerFields += "static final JppStatic<" + storedType + "> " +
+                             staticStorage.at(v->getCanonicalDecl()) + " = new JppStatic<" +
+                             storedType + ">(" + zero + ", " +
+                             (t->isReferenceType() ? "false" : "true") + ");\n";
         }
         program.insert(startupAt, pointerFields);
         std::string startup;

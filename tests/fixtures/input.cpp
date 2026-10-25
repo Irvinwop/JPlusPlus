@@ -63,9 +63,13 @@ int main() {
         cin.ignore(1000, '\n');
     }
     string line = "initial";
-    while (getline(nextStream(), line))
+    string& alias = line;
+    while (getline(nextStream(), line)) {
         cout << line.size() << ':' << line << '\n';
+        cout << alias.size() << ':' << alias << '\n';
+    }
     cout << '[' << line << "] " << calls << ' ' << cin.eof() << ' ' << cin.fail() << '\n';
+    cout << '[' << alias << "]\n";
     int unchanged = 289;
     char letter = '?';
     cin >> unchanged >> letter;

@@ -26,9 +26,31 @@ bool is_constant_evaluated(int value) {
 }
 } // namespace custom
 
+struct ObjectNames {
+    int value;
+    int getClass() {
+        return value + 1;
+    }
+    int hashCode() {
+        return value * 3;
+    }
+    int copy() {
+        return value - 4;
+    }
+    int compareTo(const ObjectNames& other) {
+        return value - other.value;
+    }
+};
+int getClass() {
+    return System * Math;
+}
+
 int main() {
     int input;
     cin >> input;
+    ObjectNames named{input}, otherNamed{-input};
+    cout << named.getClass() << ' ' << named.hashCode() << ' ' << named.copy() << ' '
+         << named.compareTo(otherNamed) << ' ' << getClass() + input << '\n';
     Integer value(input);
     Main main{value.sum(::Math)};
     vector<int> ArrayList{input, main.value, ::System};

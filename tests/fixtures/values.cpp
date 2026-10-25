@@ -19,7 +19,9 @@ int main() {
     cin >> t;
     while (t--) {
         string word;
+        string& inputAlias = word;
         cin >> word;
+        cout << inputAlias << ' ' << inputAlias.size() << '\n';
         string other = word;
         other[0] = 'x';
         Score score{word, (int)word.size()};

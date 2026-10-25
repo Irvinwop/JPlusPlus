@@ -65,6 +65,19 @@ int main() {
         int& saved = destination.value;
         destination = original;
         cout << destination.value << ' ' << saved << ' ' << assigned << '\n';
+        vector<Owned> stored;
+        stored.reserve(4);
+        stored.push_back(original);
+        stored.push_back(std::move(destination));
+        original.value += y;
+        cout << stored[0].value << ' ' << stored[1].value << ' ' << original.value << ' '
+             << destination.value << ' ' << copied << ' ' << moved << '\n';
+        vector<Record> retained;
+        retained.push_back(copy);
+        copy.value += y;
+        retained.push_back(copy);
+        copy = source;
+        cout << retained[0].value << ' ' << retained[1].value << ' ' << copy.value << '\n';
         vector<int> values{x};
         vector<int>& valuesAlias = values;
         vector<int> replacement{y, x - y};

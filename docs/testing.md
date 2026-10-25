@@ -22,6 +22,12 @@ Pointer cases compare offsets, differences, unrelated allocations, scalar and po
 
 Object cases retain references and pointers across assignment, including members and array elements. They compare constructor side effects, aggregate default-member initialization, self references, user copy/move constructors and assignment operators, nested self-assignment, collection aliases, and returns of void expressions. These checks distinguish constructing a copy from assigning into an existing object.
 
+Insertion cases mutate and reuse records after pushing them into vectors, queues, deques, stacks, and heaps. The oracle checks independent stored values and user move-constructor effects. String input cases retain references to a string across extraction and line reading, then mutate through the retained reference.
+
+Static-storage cases compare once-only initialization, repeated and recursive calls, template instantiations, arrays and self pointers, reference bindings, lambda-local statics, and local extern access. Static output streams are inspected after `std::exit`; a separate `std::_Exit` fixture checks that buffered console and file output is discarded.
+
+Switch cases distinguish values with matching low 32 bits, signed and unsigned boundaries, 128-bit conditions, GNU case ranges, enum conditions, condition declarations, and fallthrough. Call cases compare default-expression side effects and global bindings, default reference parameters, user methods named like library operations, and evaluation of static-method receivers.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

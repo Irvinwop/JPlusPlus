@@ -25,6 +25,10 @@ Reference parameters and mutable lambda captures use small reference objects whe
 
 Assignment expressions retain their C++ grouping. Arithmetic compound assignments use Clang's computation types, including integer promotion of booleans and conversion back to the destination type. Simple updates stay as ordinary Java assignments. When evaluation order matters, typed helpers evaluate the right operand before the destination and evaluate the destination once, preserving C++17 sequencing in expressions such as `values[index++] += (index = 3)`.
 
+Local statics use persistent storage fields with lazy initialization at the declaration. Template instantiations receive distinct storage. Scalar and array storage is available before the initializer runs, retaining addresses used by self references. Owned static file streams register in construction order and close in reverse order at normal shutdown. `std::_Exit` bypasses that cleanup and buffered output.
+
+Java's integer switch accepts only narrow integer conditions. Wider switches use decimal string keys; GNU case ranges first select a case ordinal using comparisons with the original C++ signedness. Both forms preserve condition evaluation and ordinary fallthrough.
+
 Unsigned 32/64-bit ordering, division, remainder, and right shifts use Java's unsigned operations. `__int128` arithmetic uses `BigInteger`; it is slower than native arithmetic and currently targets defined signed calculations, not an emulation of every overflow behavior.
 
 The bundled support declarations live in `runtime/Runtime.java`, a source fragment embedded into the C++ binary at build time. A declaration dependency pass selects the helpers referenced by the translated program. Clang's Java formatter formats the complete output.
