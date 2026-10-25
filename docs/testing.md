@@ -52,6 +52,8 @@ Map-swap cases retain references to both the containers and their elements, then
 
 Random-engine cases compare native `mt19937`, `mt19937_64`, an explicitly 32-bit result type with high-bit masks, a 13-bit configuration, and a one-word 64-bit configuration. Seeds include unsigned boundaries and fixed randomized values. Samples and rolling output digests span multiple state refills; discard counts cross 17-, 312-, and 624-word boundaries. Independent copies, assignment aliases, array elements, value parameters and returns, captured engines, default reseeding, and explicit operator calls exercise state ownership. Static bounds called through a factory retain its side effects.
 
+Seed-sequence cases use empty, initializer-list, signed-integer range, and character range construction. Generation lengths cross the 7-, 39-, 68-, and 623-word mixing thresholds and include zero-length and single-element destinations. Guard elements detect writes outside a requested subrange. Native output checks wider destination types, repeated generation, parameter output through an insertion iterator, both standard Mersenne Twister engines, reseeding, and the zero-state safeguard in a two-bit configuration. Signed `labs`/`llabs` cases retain exact integer magnitudes above floating-point precision.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

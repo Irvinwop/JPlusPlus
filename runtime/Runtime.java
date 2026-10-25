@@ -468,6 +468,75 @@ static class JppBitRef implements JppCopyable<JppBitRef> {
     }
 }
 
+static class JppSeedSeq {
+    private final int[] words;
+    JppSeedSeq() {
+        words = new int[0];
+    }
+    JppSeedSeq(int[] values) {
+        words = values.clone();
+    }
+    static <T> JppSeedSeq from(JppIter<T> first, JppIter<T> last,
+                                 java.util.function.Function<T, Integer> convert) {
+        ArrayList<Integer> values = new ArrayList<Integer>();
+        for (JppIter<T> at = first.plus(0); !at.same(last); at.advance(1))
+            values.add(convert.apply(at.get()));
+        int[] words = new int[values.size()];
+        for (int i = 0; i < words.length; ++i)
+            words[i] = values.get(i);
+        return new JppSeedSeq(words);
+    }
+    int size() {
+        return words.length;
+    }
+    private static int wrap(int index, int offset, int size) {
+        return index >= size - offset ? index - (size - offset) : index + offset;
+    }
+    int[] generate(int size) {
+        int[] values = new int[size];
+        if (size == 0)
+            return values;
+        Arrays.fill(values, 0x8b8b8b8b);
+        int spread = size >= 623 ? 11 : size >= 68 ? 7 : size >= 39 ? 5 : size >= 7 ? 3
+                                                                                        : (size - 1) / 2;
+        int firstOffset = (size - spread) / 2, secondOffset = firstOffset + spread;
+        long rounds = Math.max((long)words.length + 1, size);
+        for (long round = 0; round < rounds; ++round) {
+            int index = (int)(round % size);
+            int first = wrap(index, firstOffset, size), second = wrap(index, secondOffset, size);
+            int previous = index == 0 ? size - 1 : index - 1;
+            int mixed = values[index] ^ values[first] ^ values[previous];
+            int a = 1664525 * (mixed ^ (mixed >>> 27));
+            int b = a + index + (round == 0 ? words.length
+                                      : round <= words.length ? words[(int)round - 1] : 0);
+            values[first] += a;
+            values[second] += b;
+            values[index] = b;
+        }
+        for (long round = rounds; round < rounds + size; ++round) {
+            int index = (int)(round % size);
+            int first = wrap(index, firstOffset, size), second = wrap(index, secondOffset, size);
+            int previous = index == 0 ? size - 1 : index - 1;
+            int mixed = values[index] + values[first] + values[previous];
+            int a = 1566083941 * (mixed ^ (mixed >>> 27)), b = a - index;
+            values[first] ^= a;
+            values[second] ^= b;
+            values[index] = b;
+        }
+        return values;
+    }
+    <T> void generate(JppIter<T> first, JppIter<T> last,
+                        java.util.function.Function<Integer, T> convert) {
+        int[] generated = generate(last.minus(first));
+        for (int i = 0; i < generated.length; ++i)
+            first.plus(i).put(convert.apply(generated[i]));
+    }
+    <T> void param(JppIter<T> destination, java.util.function.Function<Integer, T> convert) {
+        for (int i = 0; i < words.length; ++i)
+            destination.plus(i).put(convert.apply(words[i]));
+    }
+}
+
 static class JppMtEngine implements JppAssignable<JppMtEngine> {
     final int width, middle, separation, u, s, t, l;
     final long a, d, b, c, multiplier, mask;
@@ -489,6 +558,11 @@ static class JppMtEngine implements JppAssignable<JppMtEngine> {
         this.multiplier = multiplier;
         mask = width == 64 ? -1L : (1L << width) - 1;
         state = new long[size];
+        seed(seed);
+    }
+    JppMtEngine(int width, int size, int middle, int separation, long a, int u, long d,
+                  int s, long b, int t, long c, int l, long multiplier, JppSeedSeq seed) {
+        this(width, size, middle, separation, a, u, d, s, b, t, c, l, multiplier, 0L);
         seed(seed);
     }
     private JppMtEngine(JppMtEngine other) {
@@ -514,6 +588,23 @@ static class JppMtEngine implements JppAssignable<JppMtEngine> {
             long previous = state[i - 1];
             state[i] = (multiplier * (previous ^ (previous >>> (width - 2))) + i) & mask;
         }
+        position = state.length;
+    }
+    void seed(JppSeedSeq sequence) {
+        int words = (width + 31) / 32;
+        int[] generated = sequence.generate(Math.multiplyExact(words, state.length));
+        boolean empty = true;
+        long lower = separation == 64 ? -1L : (1L << separation) - 1;
+        for (int i = 0; i < state.length; ++i) {
+            long value = Integer.toUnsignedLong(generated[words * i]);
+            if (words == 2)
+                value |= Integer.toUnsignedLong(generated[words * i + 1]) << 32;
+            state[i] = value & mask;
+            if ((i == 0 ? state[i] & (mask ^ lower) : state[i]) != 0)
+                empty = false;
+        }
+        if (empty)
+            state[0] = 1L << (width - 1);
         position = state.length;
     }
     private static long right(long value, int amount) {

@@ -728,6 +728,8 @@ class Emitter {
                 fail(SourceLocation(), "this Mersenne Twister configuration needs wider storage");
             return "JppMtEngine";
         }
+        if (n == "seed_seq")
+            return "JppSeedSeq";
         if (bitReference(t))
             return "JppBitRef";
         if (isVec(t))
@@ -824,6 +826,8 @@ class Emitter {
             return "new JppBitset(" + bitsetSize(t) + ")";
         if (family(t) == "mersenne_twister_engine")
             return mtEngine(t);
+        if (family(t) == "seed_seq")
+            return "new JppSeedSeq()";
         if (family(t) == "less" || family(t) == "greater")
             return element(t)->isVoidType()
                        ? "(" + jt + ") ((a, b) -> Jpp.compare(a, b) " +
@@ -1997,9 +2001,28 @@ class Emitter {
             return defaultValue(t);
         auto n = family(t);
         if (n == "mersenne_twister_engine") {
+            if (args.size() == 1 && family(args[0]->getType()) == "seed_seq")
+                return mtEngine(t, expr(args[0]));
             if (args.size() != 1 || !clean(args[0]->getType())->isIntegerType())
                 fail(c, "Mersenne Twister seed sequences need additional lowering");
             return mtEngine(t, value(args[0], ctx.UnsignedLongLongTy));
+        }
+        if (n == "seed_seq") {
+            if (args.size() == 1)
+                if (auto initializer = dyn_cast<CXXStdInitializerListExpr>(bare(args[0])))
+                    if (auto list = dyn_cast<InitListExpr>(bare(initializer->getSubExpr()))) {
+                        std::vector<std::string> words;
+                        for (auto value : list->inits())
+                            words.push_back(this->value(value, ctx.UnsignedIntTy));
+                        return "new JppSeedSeq(new int[]{" + join(words) + "})";
+                    }
+            if (args.size() == 2) {
+                auto word = temporary("jppWord");
+                return "JppSeedSeq.from(" + asIterator(args[0]) + ", " + asIterator(args[1]) +
+                       ", " + word + " -> " +
+                       converted(word, iteratorElement(args[0]->getType()), ctx.UnsignedIntTy) + ")";
+            }
+            fail(c, "unsupported seed-sequence constructor");
         }
         if (n == "bitset") {
             if (args[0]->getType()->isArithmeticType() || args[0]->getType()->isEnumeralType())
@@ -2328,12 +2351,29 @@ class Emitter {
                 if (n == "discard")
                     return object + ".discard(" + value(c->getArg(0), ctx.UnsignedLongLongTy) + ")";
                 if (n == "seed") {
+                    if (c->getNumArgs() && family(c->getArg(0)->getType()) == "seed_seq")
+                        return object + ".seed(" + expr(c->getArg(0)) + ")";
                     if (c->getNumArgs() && !clean(c->getArg(0)->getType())->isIntegerType())
                         fail(c, "Mersenne Twister seed sequences need additional lowering");
                     return object + ".seed(" +
                            (c->getNumArgs() ? value(c->getArg(0), ctx.UnsignedLongLongTy) : "5489L") + ")";
                 }
                 fail(c, "unsupported Mersenne Twister member " + n);
+            }
+            if (family(ot) == "seed_seq") {
+                auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                if (n == "size")
+                    return integerResult(c, object + ".size()");
+                if (n == "generate" || n == "param") {
+                    auto target = iteratorElement(c->getArg(0)->getType());
+                    auto word = temporary("jppWord");
+                    auto arguments = asIterator(c->getArg(0));
+                    if (n == "generate")
+                        arguments += ", " + asIterator(c->getArg(1));
+                    return object + "." + n + "(" + arguments + ", " + word + " -> " +
+                           converted(word, ctx.UnsignedIntTy, target) + ")";
+                }
+                fail(c, "unsupported seed-sequence member " + n);
             }
             if (bitReference(ot)) {
                 auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
@@ -2845,6 +2885,8 @@ class Emitter {
                        ? "(float)(" + result + ")"
                        : result;
         }
+        if (n == "labs" || n == "llabs")
+            n = "abs";
         static const std::set<std::string> maths = {
             "abs", "fabs", "sqrt",  "sqrtl", "pow", "powl", "floor", "ceil",  "round",
             "log", "log2", "log10", "exp",   "sin", "cos",  "tan",   "atan2", "hypot"};

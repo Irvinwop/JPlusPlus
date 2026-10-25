@@ -35,6 +35,8 @@ Bitsets use Java's `BitSet` with the C++ bound retained explicitly. Shifts move 
 
 Mersenne Twister engines carry their C++ template parameters into a compact state-vector implementation. Seeding, twists, and tempering retain the original word width, including unsigned 64-bit wraparound. Copies own independent state arrays, assignment retains the engine object, and discarding advances whole state blocks without calculating unused tempered outputs. Java's `Random` has a different sequence and is not used for these engines.
 
+`std::seed_seq` stores copied 32-bit seed words and performs its mixing with Java's wrapping integer operations. Iterator adapters retain the destination's C++ element type, so the same generated words can fill unsigned 32-bit or wider storage. Engine initialization combines consecutive seed words in the specified order and applies the all-zero-state safeguard.
+
 Assignment expressions retain their C++ grouping. Arithmetic compound assignments use Clang's computation types, including integer promotion of booleans and conversion back to the destination type. Simple updates stay as ordinary Java assignments. When evaluation order matters, typed helpers evaluate the right operand before the destination and evaluate the destination once, preserving C++17 sequencing in expressions such as `values[index++] += (index = 3)`.
 
 Local statics use persistent storage fields with lazy initialization at the declaration. Template instantiations receive distinct storage. Scalar and array storage is available before the initializer runs, retaining addresses used by self references. Owned static file streams register in construction order and close in reverse order at normal shutdown. `std::_Exit` bypasses that cleanup and buffered output.
