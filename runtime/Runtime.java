@@ -3163,6 +3163,59 @@ static final JppOutput jppOut = new JppOutput(System.out),
                       jppLog = new JppOutput(jppErr);
 
 static class Jpp {
+    static long byteIoCount(long size, long count) {
+        if (size == 0 || count == 0)
+            return 0;
+        if (size < 0 || count < 0 || size > Long.MAX_VALUE / count)
+            throw new IllegalArgumentException("C byte-I/O request exceeds indexed storage limits");
+        return size * count;
+    }
+    static long fread(JppPtr<?> destination, long size, long count, JppInput input) {
+        long requested = byteIoCount(size, count);
+        if (requested == 0)
+            return 0;
+        JppMemory storage = memory(destination);
+        long offset = byteOffset(destination), copied = 0;
+        byte[] buffer = new byte[(int)Math.min(requested, 8192L)];
+        while (copied < requested) {
+            int length = (int)Math.min((long)buffer.length, requested - copied), available = 0;
+            try {
+                while (available < length) {
+                    int value = input.readByte();
+                    if (value < 0)
+                        break;
+                    buffer[available++] = (byte)value;
+                }
+            } catch (UncheckedIOException failure) {
+                // Bytes obtained before an I/O error still belong to this read.
+            }
+            if (available != 0) {
+                storage.write(offset + copied, buffer, 0, available);
+                copied += available;
+            }
+            if (available < length)
+                break;
+        }
+        return copied / size;
+    }
+    static long fwrite(JppPtr<?> source, long size, long count, JppOutput output) {
+        long requested = byteIoCount(size, count);
+        if (requested == 0 || !output.good)
+            return 0;
+        JppMemory storage = memory(source);
+        long offset = byteOffset(source), copied = 0;
+        byte[] buffer = new byte[(int)Math.min(requested, 8192L)];
+        while (copied < requested) {
+            int length = (int)Math.min((long)buffer.length, requested - copied);
+            storage.read(offset + copied, buffer, 0, length);
+            output.print(new String(buffer, 0, length,
+                                    java.nio.charset.StandardCharsets.ISO_8859_1));
+            copied += length;
+            if (!output.good)
+                break;
+        }
+        return copied / size;
+    }
     static <T> T assignUsing(T source, T target, java.util.function.BiConsumer<T, T> assign) {
         assign.accept(source, target);
         return target;

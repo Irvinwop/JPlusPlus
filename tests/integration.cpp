@@ -295,6 +295,11 @@ int main() {
         byteInput += "\r\n";
         byteInput += "élève\xff token\x80\n";
         cases.emplace_back("bytes", byteInput);
+        std::string blockInput;
+        std::mt19937_64 blockRandom(0x62797465);
+        for (unsigned i = 0; i < 70017; ++i)
+            blockInput += static_cast<char>(blockRandom() & 255);
+        cases.emplace_back("byte_io", blockInput);
         auto switchBoundaries = boundaries;
         switchBoundaries.insert(
             switchBoundaries.end(),
@@ -422,7 +427,8 @@ int main() {
                                                      javac + ", " + java + "\nexpected:\n" +
                                                      expected.substr(0, 1000) + "\nactual:\n" +
                                                      read(p / "stdout").substr(0, 1000));
-                        if ((name == "stream_state" || name == "stream_exit") &&
+                        if ((name == "stream_state" || name == "stream_exit" ||
+                             name == "byte_io") &&
                             read(p / "stderr") != expectedErrors)
                             throw std::runtime_error("error output differs from native C++: " +
                                                      name);

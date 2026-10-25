@@ -4088,6 +4088,21 @@ class Emitter {
             }
             return "new JppScanner(jppIn).scan(" + join(a) + ")";
         }
+        if ((n == "fread" || n == "fwrite") && c->getNumArgs() == 4) {
+            auto stream = dyn_cast<DeclRefExpr>(bare(c->getArg(3)));
+            auto target =
+                stream && !user(stream->getDecl()) ? stream->getDecl()->getNameAsString() : "";
+            auto javaStream = n == "fread" && target == "stdin"     ? "jppIn"
+                              : n == "fwrite" && target == "stdout" ? "jppOut"
+                              : n == "fwrite" && target == "stderr" ? "jppErr"
+                                                                    : "";
+            if (!*javaStream)
+                fail(c, n + " needs additional C file-handle lowering for this stream");
+            return integerResult(c, "Jpp." + n + "(" + expr(c->getArg(0)) + ", " +
+                                        value(c->getArg(1), ctx.UnsignedLongLongTy) + ", " +
+                                        value(c->getArg(2), ctx.UnsignedLongLongTy) + ", " +
+                                        javaStream + ")");
+        }
         if (n == "freopen") {
             auto target = dyn_cast<DeclRefExpr>(bare(c->getArg(2)));
             auto streamName = target ? target->getDecl()->getNameAsString() : "";
