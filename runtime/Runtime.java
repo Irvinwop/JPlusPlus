@@ -8,6 +8,78 @@ interface JppAssignable<T> extends JppCopyable<T> {
 }
 interface JppUninitialized {}
 
+interface JppListOwner<T> {
+    List<T> jppStorage();
+}
+
+// ArrayList owns all allocation and element operations. The outer object stays
+// stable when C++ swaps or moves its allocation to another vector.
+static class JppVector<T> extends ArrayList<T>
+        implements JppAssignable<ArrayList<T>>, JppListOwner<T> {
+    ArrayList<T> data;
+    JppVector() { data = new ArrayList<T>(); }
+    JppVector(ArrayList<T> storage) { data = storage; }
+    public List<T> jppStorage() { return data; }
+    public int size() { return data.size(); }
+    public boolean isEmpty() { return data.isEmpty(); }
+    public boolean contains(Object value) { return data.contains(value); }
+    public int indexOf(Object value) { return data.indexOf(value); }
+    public int lastIndexOf(Object value) { return data.lastIndexOf(value); }
+    public T get(int index) { return data.get(index); }
+    public T set(int index, T value) { return data.set(index, value); }
+    public boolean add(T value) { return data.add(value); }
+    public void add(int index, T value) { data.add(index, value); }
+    public boolean addAll(Collection<? extends T> values) { return data.addAll(values); }
+    public boolean addAll(int index, Collection<? extends T> values) {
+        return data.addAll(index, values);
+    }
+    public T remove(int index) { return data.remove(index); }
+    public boolean remove(Object value) { return data.remove(value); }
+    public void clear() { data.clear(); }
+    public void ensureCapacity(int capacity) { data.ensureCapacity(capacity); }
+    public void trimToSize() { data.trimToSize(); }
+    public boolean removeAll(Collection<?> values) { return data.removeAll(values); }
+    public boolean retainAll(Collection<?> values) { return data.retainAll(values); }
+    protected void removeRange(int first, int last) { data.subList(first, last).clear(); }
+    public Object[] toArray() { return data.toArray(); }
+    public <U> U[] toArray(U[] destination) { return data.toArray(destination); }
+    public Iterator<T> iterator() { return data.iterator(); }
+    public ListIterator<T> listIterator() { return data.listIterator(); }
+    public ListIterator<T> listIterator(int index) { return data.listIterator(index); }
+    public List<T> subList(int first, int last) { return data.subList(first, last); }
+    public Spliterator<T> spliterator() { return data.spliterator(); }
+    public void forEach(java.util.function.Consumer<? super T> action) { data.forEach(action); }
+    public boolean removeIf(java.util.function.Predicate<? super T> predicate) {
+        return data.removeIf(predicate);
+    }
+    public void replaceAll(java.util.function.UnaryOperator<T> action) { data.replaceAll(action); }
+    public void sort(Comparator<? super T> compare) { data.sort(compare); }
+    public boolean equals(Object other) { return other == this || data.equals(other); }
+    public int hashCode() { return data.hashCode(); }
+    public String toString() { return data.toString(); }
+    public Object clone() { return new JppVector<T>(new ArrayList<T>(data)); }
+    // These names also override the sequenced-list methods on newer JDKs.
+    public T getFirst() { return data.get(0); }
+    public T getLast() { return data.get(data.size() - 1); }
+    public void addFirst(T value) { data.add(0, value); }
+    public void addLast(T value) { data.add(value); }
+    public T removeFirst() { return data.remove(0); }
+    public T removeLast() { return data.remove(data.size() - 1); }
+    public ArrayList<T> copy() {
+        JppVector<T> result = new JppVector<T>();
+        for (T value : data) result.add(jppCopy(value));
+        return result;
+    }
+    public ArrayList<T> jppAssignFrom(ArrayList<T> source) {
+        if (source != this) {
+            ArrayList<T> replacement = new ArrayList<T>(source.size());
+            for (T value : source) replacement.add(jppCopy(value));
+            data = replacement;
+        }
+        return this;
+    }
+}
+
 static class JppStatic<T> extends JppRef<T> {
     private T value;
     private boolean initialized;
@@ -125,6 +197,9 @@ static abstract class JppRef<T> {
         return of(() -> get.apply(object), v -> set.accept(object, v), object, field);
     }
     static <T> JppRef<T> at(List<T> a, int i) {
+        List<T> storage = Jpp.listStorage(a);
+        if (storage != a)
+            return at(storage, i);
         if (a instanceof JppDeque)
             return ((JppDeque<T>)a).data.reference(i);
         if (a instanceof JppDequeStorage)
@@ -3086,6 +3161,32 @@ static final JppOutput jppOut = new JppOutput(System.out),
                       jppLog = new JppOutput(jppErr);
 
 static class Jpp {
+    static <T> ArrayList<T> movableVector(ArrayList<T> values) {
+        return values instanceof JppVector ? values : new JppVector<T>(values);
+    }
+    static <T> void swapVectors(ArrayList<T> left, ArrayList<T> right) {
+        JppVector<T> a = (JppVector<T>)left, b = (JppVector<T>)right;
+        ArrayList<T> storage = a.data;
+        a.data = b.data;
+        b.data = storage;
+    }
+    static <T> ArrayList<T> moveVector(ArrayList<T> source) {
+        JppVector<T> original = (JppVector<T>)source;
+        JppVector<T> result = new JppVector<T>(original.data);
+        original.data = new ArrayList<T>();
+        return result;
+    }
+    static <T> ArrayList<T> moveAssignVector(ArrayList<T> source, ArrayList<T> target) {
+        JppVector<T> from = (JppVector<T>)source, to = (JppVector<T>)target;
+        to.data = from.data;
+        from.data = new ArrayList<T>();
+        return target;
+    }
+    static <T> JppRef<ArrayList<T>> moveAssignVectorRef(ArrayList<T> source,
+            JppRef<ArrayList<T>> target) {
+        moveAssignVector(source, target.get());
+        return target;
+    }
     static Object productValue(JppProduct product, int index) {
         Object value = product.raw(index);
         return product.binding(index) ? ((JppRef<?>)value).get() : value;
@@ -3893,6 +3994,8 @@ static class Jpp {
         return result;
     }
     static <T> List<T> listStorage(List<T> values) {
+        if (values instanceof JppListOwner)
+            return ((JppListOwner<T>)values).jppStorage();
         return values instanceof JppDeque ? ((JppDeque<T>)values).data : values;
     }
     static <T> void resizeDefault(List<T> a, int n, java.util.function.Supplier<T> factory) {
@@ -3924,30 +4027,31 @@ static class Jpp {
         return begin(a).plus(index);
     }
     static <T> JppIter<T> begin(List<T> a) {
-        if (a instanceof JppDeque) {
-            JppDequeStorage<T> data = ((JppDeque<T>)a).data;
+        List<T> storage = listStorage(a);
+        if (storage instanceof JppDequeStorage) {
+            JppDequeStorage<T> data = (JppDequeStorage<T>)storage;
             return new JppDequeIter<T>(data, data.first, 1);
         }
-        return new JppIter<T>(a, 0, 1);
+        return new JppIter<T>(storage, 0, 1);
     }
     static <T> JppIter<T> end(List<T> a) {
-        if (a instanceof JppDeque)
-            return begin(a).plus(a.size());
-        return new JppIter<T>(a, a.size(), 1);
+        return begin(a).plus(a.size());
     }
     static <T> JppIter<T> rbegin(List<T> a) {
-        if (a instanceof JppDeque) {
-            JppDequeStorage<T> data = ((JppDeque<T>)a).data;
+        List<T> storage = listStorage(a);
+        if (storage instanceof JppDequeStorage) {
+            JppDequeStorage<T> data = (JppDequeStorage<T>)storage;
             return new JppDequeIter<T>(data, data.first + data.size() - 1, -1);
         }
-        return new JppIter<T>(a, a.size() - 1, -1);
+        return new JppIter<T>(storage, a.size() - 1, -1);
     }
     static <T> JppIter<T> rend(List<T> a) {
-        if (a instanceof JppDeque) {
-            JppDequeStorage<T> data = ((JppDeque<T>)a).data;
+        List<T> storage = listStorage(a);
+        if (storage instanceof JppDequeStorage) {
+            JppDequeStorage<T> data = (JppDequeStorage<T>)storage;
             return new JppDequeIter<T>(data, data.first - 1, -1);
         }
-        return new JppIter<T>(a, -1, -1);
+        return new JppIter<T>(storage, -1, -1);
     }
     static <T> T arrayInit(T a, T initial) {
         for (int i = 0; i < java.lang.reflect.Array.getLength(initial); ++i) {

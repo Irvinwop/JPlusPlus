@@ -459,6 +459,7 @@ class Emitter {
     std::map<std::string, std::string> literalArrays;
     std::set<unsigned> tupleArities;
     std::map<std::vector<bool>, std::string> productReferenceKinds;
+    bool vectorStorage = false;
     const FunctionDecl* current = nullptr;
     std::vector<const FunctionDecl*> enclosingFunctions;
     const CXXRecordDecl* currentRecord = nullptr;
@@ -814,6 +815,20 @@ class Emitter {
     }
     bool tupleLike(QualType t) const {
         return product(t) || family(t) == "array";
+    }
+    bool containsVector(QualType t) {
+        t = clean(t);
+        if (family(t) == "vector")
+            return true;
+        if (family(t) == "array")
+            return containsVector(element(t));
+        if (auto array = ctx.getAsArrayType(t))
+            return containsVector(array->getElementType());
+        if (product(t))
+            for (auto item : productTypes(t))
+                if (containsVector(item))
+                    return true;
+        return false;
     }
     std::vector<QualType> productTypes(QualType t) {
         std::vector<QualType> types;
@@ -1405,6 +1420,8 @@ class Emitter {
             return mtEngine(t);
         if (family(t) == "seed_seq")
             return "new JppSeedSeq()";
+        if (family(t) == "vector" && vectorStorage)
+            return "new JppVector<" + boxed(element(t)) + ">()";
         if (chrono(t))
             return chronoValue(t, "0L");
         if (family(t) == "less" || family(t) == "greater")
@@ -1825,6 +1842,20 @@ class Emitter {
                 markCapturedVariables(call);
             if (method == "swap")
                 markCapturedVariables(call);
+            if (method == "swap" || method == "move" || method == "forward") {
+                for (auto argument : call->arguments())
+                    vectorStorage |= containsVector(argument->getType());
+                if (auto member = dyn_cast<CXXMemberCallExpr>(call)) {
+                    auto owner = clean(member->getImplicitObjectArgument()->getType());
+                    if (owner->isPointerType())
+                        owner = owner->getPointeeType();
+                    vectorStorage |= containsVector(owner);
+                }
+            }
+            for (unsigned i = 0;
+                 i < call->getNumArgs() && i < call->getDirectCallee()->getNumParams(); ++i)
+                if (call->getDirectCallee()->getParamDecl(i)->getType()->isRValueReferenceType())
+                    vectorStorage |= containsVector(call->getArg(i)->getType());
             if (method == "emplace" || method == "emplace_back" || method == "emplace_front")
                 if (auto member = dyn_cast<CXXMemberCallExpr>(call)) {
                     auto container = clean(member->getImplicitObjectArgument()->getType());
@@ -1848,6 +1879,9 @@ class Emitter {
                 for (unsigned i = 0; i < function->getNumParams() && i + 1 < c->getNumArgs(); ++i)
                     if (referenceABI(function->getParamDecl(i)->getType()))
                         markReference(c->getArg(i + 1));
+        if (auto c = dyn_cast<CXXConstructExpr>(s))
+            if (product(c->getType()) || c->getConstructor()->isMoveConstructor())
+                vectorStorage |= containsVector(c->getType());
         if (auto c = dyn_cast<CXXConstructExpr>(s))
             for (unsigned i = 0; i < c->getConstructor()->getNumParams() && i < c->getNumArgs();
                  ++i)
@@ -2017,6 +2051,11 @@ class Emitter {
         if (auto assignment = dyn_cast<CXXOperatorCallExpr>(bare(e));
             assignment && assignment->getOperator() == OO_Equal && assignment->getNumArgs() == 2) {
             auto function = assignment->getDirectCallee();
+            if (family(assignment->getArg(0)->getType()) == "vector" && function &&
+                function->getNumParams() &&
+                function->getParamDecl(0)->getType()->isRValueReferenceType())
+                return "Jpp.moveAssignVectorRef(" + expr(assignment->getArg(1)) + ", " +
+                       reference(assignment->getArg(0)) + ")";
             if (function && function->getReturnType()->isReferenceType() &&
                 (!user(function) || function->isImplicit() || function->isDefaulted()))
                 return "Jpp.assignReference(" +
@@ -2960,6 +2999,12 @@ class Emitter {
         return arithmetic(expr(lhs), lhs->getType(), expr(rhs), rhs->getType(), op);
     }
     std::string construct(const CXXConstructExpr* c) {
+        auto result = constructValue(c);
+        return vectorStorage && family(c->getType()) == "vector"
+                   ? "Jpp.movableVector(" + result + ")"
+                   : result;
+    }
+    std::string constructValue(const CXXConstructExpr* c) {
         if (c->getConstructor()->isConsteval())
             fail(c, "consteval object construction needs additional constant-value lowering");
         auto t = c->getType();
@@ -2969,6 +3014,8 @@ class Emitter {
                 args.push_back(a);
         if (c->getConstructor()->isCopyOrMoveConstructor() && !args.empty()) {
             auto constructor = c->getConstructor();
+            if (family(t) == "vector" && constructor->isMoveConstructor())
+                return "Jpp.moveVector(" + expr(args[0]) + ")";
             if (product(t) && constructor->isMoveConstructor())
                 return convertProduct(expr(args[0]), args[0]->getType(), t, args[0]->getValueKind(),
                                       c->getExprLoc());
@@ -3233,6 +3280,8 @@ class Emitter {
         auto result = value(e, target);
         if (!copyType(target))
             return result;
+        if (move && family(target) == "vector")
+            return "Jpp.moveVector(" + result + ")";
         if (move && product(target))
             return convertProduct(result, e->getType(), target, e->getValueKind(), e->getExprLoc());
         if (auto r = record(target); move && r && user(r))
@@ -3425,6 +3474,11 @@ class Emitter {
             }
             if (product(ot) && n == "swap")
                 return swapProduct(m->getImplicitObjectArgument(), c->getArg(0));
+            if (family(ot) == "array" && n == "swap")
+                return swapProduct(m->getImplicitObjectArgument(), c->getArg(0));
+            if (family(ot) == "vector" && n == "swap")
+                return "Jpp.swapVectors(" + expr(obj) + (me->isArrow() ? ".get()" : "") + ", " +
+                       expr(c->getArg(0)) + ")";
             if (chrono(ot)) {
                 auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
                 if (n == "count" || n == "time_since_epoch")
@@ -3994,6 +4048,10 @@ class Emitter {
         }
         if (n == "swap" && product(c->getArg(0)->getType()))
             return swapProduct(c->getArg(0), c->getArg(1));
+        if (n == "swap" && family(c->getArg(0)->getType()) == "array")
+            return swapProduct(c->getArg(0), c->getArg(1));
+        if (n == "swap" && family(c->getArg(0)->getType()) == "vector")
+            return "Jpp.swapVectors(" + expr(c->getArg(0)) + ", " + expr(c->getArg(1)) + ")";
         if (n == "swap" && ctx.getAsArrayType(c->getArg(0)->getType()))
             return swapArrays(c->getArg(0), c->getArg(1));
         if (n == "swap" && isMap(c->getArg(0)->getType()))
@@ -4729,6 +4787,12 @@ class Emitter {
         }
         if (auto x = dyn_cast<CXXOperatorCallExpr>(e)) {
             auto op = x->getOperator();
+            if (op == OO_Equal && x->getNumArgs() == 2 &&
+                family(x->getArg(0)->getType()) == "vector" && x->getDirectCallee() &&
+                x->getDirectCallee()->getNumParams() &&
+                x->getDirectCallee()->getParamDecl(0)->getType()->isRValueReferenceType())
+                return "Jpp.moveAssignVector(" + expr(x->getArg(1)) + ", " + expr(x->getArg(0)) +
+                       ")";
             if (op == OO_Call && x->getNumArgs() &&
                 family(x->getArg(0)->getType()) == "reference_wrapper") {
                 auto object = x->getArg(0);
@@ -4940,7 +5004,9 @@ class Emitter {
             if (isVec(t)) {
                 for (auto v : x->inits())
                     a.push_back(value(v, element(t), true));
-                return "new " + type(t) + "(Arrays.asList(" + join(a) + "))";
+                auto result = "new " + type(t) + "(Arrays.asList(" + join(a) + "))";
+                return vectorStorage && family(t) == "vector" ? "Jpp.movableVector(" + result + ")"
+                                                              : result;
             }
             if (auto r = record(t)) {
                 if (x->getNumInits() == 1 &&
@@ -6206,6 +6272,14 @@ class Emitter {
         }
         for (auto v : globals)
             scan(v->getInit());
+        for (auto r : records)
+            for (auto field : r->fields())
+                if (field->hasInClassInitializer())
+                    scan(field->getInClassInitializer());
+        for (auto f : functions)
+            if (auto constructor = dyn_cast<CXXConstructorDecl>(f))
+                for (auto initializer : constructor->inits())
+                    scan(initializer->getInit());
         for (auto r : records)
             name(r);
         for (auto f : functions)
