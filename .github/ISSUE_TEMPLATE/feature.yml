@@ -1,0 +1,16 @@
+name: Compatibility request
+description: Suggest the next C++ pattern or library operation to support.
+body:
+  - type: textarea
+    attributes:
+      label: Small C++ example
+      description: Show the behavior and explain how you use it in competitive programming.
+      render: cpp
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+      description: Include an input and output that would distinguish a correct translation.
+    validations:
+      required: true

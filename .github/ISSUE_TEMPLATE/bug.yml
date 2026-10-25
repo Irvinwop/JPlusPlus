@@ -1,0 +1,29 @@
+name: Translation bug
+description: Report a small, reproducible translation or behavior failure.
+body:
+  - type: textarea
+    attributes:
+      label: Complete C++ source
+      description: Include required headers and main. Please do not share private contest solutions without permission.
+      render: cpp
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Input and expected native output
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Actual Java output or diagnostic
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Command and toolchain versions
+      description: Include j++ --version, your invocation, javac -version, and java -version.
+      render: text
+    validations:
+      required: true

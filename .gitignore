@@ -1,0 +1,6 @@
+/build*/
+/.local/
+*.class
+/Main.java
+/.cache/
+compile_commands.json
