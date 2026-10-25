@@ -607,22 +607,22 @@ static class JppDeque<T> extends AbstractList<T> implements JppAssignable<JppDeq
     public Iterator<T> iterator() {
         return data.iterator();
     }
-    void addFirst(T value) {
+    public void addFirst(T value) {
         data.add(0, value);
     }
-    void addLast(T value) {
+    public void addLast(T value) {
         data.add(size(), value);
     }
-    T getFirst() {
+    public T getFirst() {
         return get(0);
     }
-    T getLast() {
+    public T getLast() {
         return get(size() - 1);
     }
-    T removeFirst() {
+    public T removeFirst() {
         return data.remove(0);
     }
-    T removeLast() {
+    public T removeLast() {
         return data.remove(size() - 1);
     }
     void swap(JppDeque<T> other) {
