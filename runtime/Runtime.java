@@ -858,11 +858,18 @@ static class JppTreeIter<T> extends JppIter<T> {
     }
 }
 
+static class JppMapOwner<K, V> {
+    JppMap<K, V> map;
+    JppMapOwner(JppMap<K, V> value) {
+        map = value;
+    }
+}
+
 static class JppMapEntry<K, V> extends JppPair<K, V> {
-    JppMap<K, V> owner;
+    JppMapOwner<K, V> owner;
     JppMapEntry(JppMap<K, V> map, K key, V value) {
         super(key, value);
-        owner = map;
+        owner = map.ownership;
     }
 }
 
@@ -889,7 +896,7 @@ static class JppMapIter<K, V> extends JppIter<JppPair<K, V>> {
     }
     JppIter<JppPair<K, V>> plus(int offset) {
         JppMapIter<K, V> copy = new JppMapIter<K, V>(
-            current == null ? map : current.owner, current, step);
+            current == null ? map : current.owner.map, current, step);
         copy.unordered = unordered;
         copy.unorderedIndex = unorderedIndex;
         return copy.advance(offset);
@@ -898,7 +905,7 @@ static class JppMapIter<K, V> extends JppIter<JppPair<K, V>> {
         int direction = offset < 0 ? -step : step;
         for (long n = Math.abs((long)offset); n > 0; --n) {
             if (current != null)
-                map = current.owner;
+                map = current.owner.map;
             if (map.data instanceof NavigableMap) {
                 NavigableMap<K, JppMapEntry<K, V>> tree =
                     (NavigableMap<K, JppMapEntry<K, V>>)map.data;
@@ -929,7 +936,7 @@ static class JppMapIter<K, V> extends JppIter<JppPair<K, V>> {
     private int rank() {
         if (current == null)
             return step > 0 ? map.size() : -1;
-        map = current.owner;
+        map = current.owner.map;
         int index = 0;
         for (JppMapEntry<K, V> entry : map.data.values()) {
             if (entry == current)
@@ -945,6 +952,7 @@ static class JppMapIter<K, V> extends JppIter<JppPair<K, V>> {
 
 static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppMap<K, V>> {
     Map<K, JppMapEntry<K, V>> data;
+    JppMapOwner<K, V> ownership = new JppMapOwner<K, V>(this);
     final java.util.function.Supplier<V> factory;
     Comparator<? super K> comparator;
     JppMap(boolean ordered, java.util.function.Supplier<V> init) {
@@ -1002,7 +1010,7 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppM
             Map.Entry<K, JppMapEntry<K, V>> entry = entries.next();
             if (!data.containsKey(entry.getKey())) {
                 data.put(entry.getKey(), entry.getValue());
-                entry.getValue().owner = this;
+                entry.getValue().owner = ownership;
                 entries.remove();
             }
         }
@@ -1035,6 +1043,21 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppM
     }
     void clear() {
         data.clear();
+    }
+    void swap(JppMap<K, V> other) {
+        if (other == this)
+            return;
+        Map<K, JppMapEntry<K, V>> savedData = data;
+        data = other.data;
+        other.data = savedData;
+        Comparator<? super K> savedComparator = comparator;
+        comparator = other.comparator;
+        other.comparator = savedComparator;
+        JppMapOwner<K, V> savedOwner = ownership;
+        ownership = other.ownership;
+        other.ownership = savedOwner;
+        ownership.map = this;
+        other.ownership.map = other;
     }
     ArrayList<JppPair<K, V>> entries() {
         ArrayList<JppPair<K, V>> result = new ArrayList<JppPair<K, V>>();
@@ -1104,8 +1127,8 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppM
             JppMap<K, V> snapshot = source.copy();
             data = snapshot.data;
             comparator = snapshot.comparator;
-            for (JppMapEntry<K, V> entry : data.values())
-                entry.owner = this;
+            ownership = snapshot.ownership;
+            ownership.map = this;
         }
         return this;
     }
@@ -2589,6 +2612,18 @@ static class Jpp {
     static <T> JppRef<T> maxReference(JppRef<T> first, JppRef<T> second,
                                       java.util.function.BiPredicate<T, T> less) {
         return less.test(first.get(), second.get()) ? second : first;
+    }
+    static <K, V> JppMap<K, V> mapFrom(JppMap<K, V> map,
+                                       Iterable<? extends JppPair<K, V>> values) {
+        for (JppPair<K, V> value : values)
+            map.insert(value);
+        return map;
+    }
+    static <A, K, V> JppMap<K, V> mapFrom(JppMap<K, V> map, JppIter<A> first, JppIter<A> last,
+                                          java.util.function.Function<A, JppPair<K, V>> convert) {
+        for (JppIter<A> at = first.plus(0); !at.same(last); at.advance(1))
+            map.insert(convert.apply(at.get()));
+        return map;
     }
     static <T> Comparator<T> heapComparator(java.util.function.BiPredicate<? super T, ? super T> less) {
         return (a, b) -> less.test(a, b) ? 1 : less.test(b, a) ? -1 : 0;

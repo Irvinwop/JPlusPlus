@@ -48,6 +48,8 @@ Discarded-expression cases use conditional, comma, arithmetic, cast, and literal
 
 Reference-result cases mutate through direct and recursive functions, function pointers, methods, overloaded subscripts and dereference, lambdas, and `std::function`. They compare retained aliases, pointer offsets, addresses of neighboring elements, selected extrema, static storage, and conversion to value-returning callables. Side-effect counters catch repeated calls when a returned reference is used as an assignment destination; a compound-assignment result must retain the original element's address.
 
+Map-swap cases retain references to both the containers and their elements, then use existing iterators in the destination. They compare addresses, iterator movement, erasure, self-swap, stateful comparison order, and later assignment and copying. Construction cases use initializer lists and ranges with element conversions, duplicate keys, copied comparison state, and partially initialized nested pair arrays. Unordered-map checks avoid relying on an unspecified traversal order.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

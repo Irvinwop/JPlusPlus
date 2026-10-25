@@ -154,6 +154,20 @@ std::string quote(std::string_view s, bool bytes = false) {
     return r + '"';
 }
 
+std::string eraseTypeArguments(std::string_view type) {
+    std::string raw;
+    int nesting = 0;
+    for (char c : type) {
+        if (c == '<')
+            ++nesting;
+        else if (c == '>')
+            --nesting;
+        else if (!nesting)
+            raw += c;
+    }
+    return raw;
+}
+
 struct Unsupported : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -1467,7 +1481,10 @@ class Emitter {
                                                 ? newArray(elem, list->getInit(i))
                                                 : value(list->getInit(i), elem, true))
                                          : defaultValue(elem));
-                auto literal = "new " + type(t) + " {" + join(values) + "}";
+                auto javaType = type(t), rawType = eraseTypeArguments(javaType);
+                auto literal = "new " + rawType + " {" + join(values) + "}";
+                if (rawType != javaType)
+                    literal = "(" + javaType + ") " + literal;
                 if (auto ca = dyn_cast<ConstantArrayType>(a);
                     ca && ca->getSize().getZExtValue() > n)
                     return "Jpp.arrayInit(" + newArray(t, nullptr) + ", " + literal + ")";
@@ -1491,17 +1508,7 @@ class Emitter {
         }
         std::string allocation = "new " + base + dims;
         if (base.find('<') != std::string::npos) {
-            std::string raw;
-            int nesting = 0;
-            for (char c : base) {
-                if (c == '<')
-                    ++nesting;
-                else if (c == '>')
-                    --nesting;
-                else if (!nesting)
-                    raw += c;
-            }
-            allocation = "(" + type(t) + ") new " + raw + dims;
+            allocation = "(" + type(t) + ") new " + eraseTypeArguments(base) + dims;
         }
         if ((initializeObjects && part->isRecordType()) || big(part))
             return "Jpp.objects(" + allocation + ", () -> " + defaultValue(part) + ")";
@@ -2041,6 +2048,38 @@ class Emitter {
             return converted(expr(args[0]), args[0]->getType(), t);
         if (isIter(t))
             return expr(args[0]);
+        if (isMap(t)) {
+            bool range = args.size() > 1 &&
+                         (isIter(args[0]->getType()) || dataPointer(args[0]->getType()));
+            bool list = isa<CXXStdInitializerListExpr>(bare(args[0]));
+            auto comparatorIndex = range ? 2U : list ? 1U : 0U;
+            auto created = defaultValue(t);
+            if (args.size() > comparatorIndex) {
+                if (n != "map")
+                    fail(c, "unordered-map bucket, hash, and equality constructors need "
+                            "additional lowering");
+                auto comparator = args[comparatorIndex];
+                created = "new " + type(t) + "(true, () -> " + defaultValue(element(t, 1)) +
+                          ", Jpp.comparator(" +
+                          comparatorPredicate(comparator->getType(), element(t), element(t),
+                                              storedElement(comparator,
+                                                            clean(comparator->getType()), false)) +
+                          "))";
+            }
+            if (range) {
+                auto source = iteratorElement(args[0]->getType());
+                auto entry = temporary("jppEntry");
+                auto pair = "new JppPair<" + boxed(element(t)) + ", " + boxed(element(t, 1)) +
+                            ">(" + converted(entry + ".first", element(source), element(t)) +
+                            ", " + converted(entry + ".second", element(source, 1), element(t, 1)) +
+                            ")";
+                return "Jpp.mapFrom(" + created + ", " + asIterator(args[0]) + ", " +
+                       asIterator(args[1]) + ", " + entry + " -> " + pair + ")";
+            }
+            if (list)
+                return "Jpp.mapFrom(" + created + ", " + expr(args[0]) + ")";
+            return created;
+        }
         if (isSet(t)) {
             bool range = args.size() > 1 &&
                          (isIter(args[0]->getType()) || args[0]->getType()->isPointerType());
@@ -2626,6 +2665,8 @@ class Emitter {
             return "Jpp.assertFail()";
         if (n == "make_pair")
             return "new " + type(c->getType()) + "(" + arguments(c) + ")";
+        if (n == "swap" && isMap(c->getArg(0)->getType()))
+            return expr(c->getArg(0)) + ".swap(" + expr(c->getArg(1)) + ")";
         if (n == "swap" && family(c->getArg(0)->getType()) == "bitset")
             return "JppBitset.swap(" + expr(c->getArg(0)) + ", " + expr(c->getArg(1)) + ")";
         if (n == "swap")
