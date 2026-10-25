@@ -173,6 +173,8 @@ int main() {
         cases.emplace_back("calls", expressions.str());
         cases.emplace_back("standard_values", expressions.str());
         cases.emplace_back("ordering", expressions.str());
+        cases.emplace_back("stream_state", expressions.str());
+        cases.emplace_back("stream_exit", "");
         cases.emplace_back("halt", "");
         cases.emplace_back("coverage", "-19 37 5\n");
         cases.emplace_back("constants", "-17\n");
@@ -317,6 +319,7 @@ int main() {
                  p / "empty");
             must({(p / "native").string()}, p / "input");
             auto expected = read(p / "stdout");
+            auto expectedErrors = read(p / "stderr");
             std::map<std::string, std::string> expectedFiles;
             std::vector<std::string> outputNames;
             if (name == "files")
@@ -376,6 +379,10 @@ int main() {
                                                      javac + ", " + java + "\nexpected:\n" +
                                                      expected.substr(0, 1000) + "\nactual:\n" +
                                                      read(p / "stdout").substr(0, 1000));
+                        if ((name == "stream_state" || name == "stream_exit") &&
+                            read(p / "stderr") != expectedErrors)
+                            throw std::runtime_error("error output differs from native C++: " +
+                                                     name);
                         for (const auto& [file, contents] : expectedFiles)
                             if (!fs::exists(p / file) || read(p / file) != contents)
                                 throw std::runtime_error(

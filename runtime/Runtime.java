@@ -86,6 +86,10 @@ static abstract class JppRef<T> {
                             java.util.function.Consumer<T> set) {
         return of(get, set, (java.util.function.Supplier<JppPtr<T>>)null);
     }
+    static <T> JppRef<T> object(T object) {
+        return of(() -> object, value -> Jpp.assignValue(object, value),
+                  () -> Jpp.pointerValue(object));
+    }
     static <T> JppRef<T> of(java.util.function.Supplier<T> get, java.util.function.Consumer<T> set,
                             java.util.function.Supplier<JppPtr<T>> location) {
         return new JppRef<T>() {
@@ -841,13 +845,44 @@ static class JppHeap<T> implements JppCopyable<JppHeap<T>> {
     }
 }
 
-static class JppInput implements AutoCloseable {
+static class JppStreamState {
+    boolean defaultStdoutTie;
+    private JppOutput tied;
+    JppPtr<JppOutput> tie() {
+        JppOutput current = defaultStdoutTie ? jppOut : tied;
+        return current == null ? null : Jpp.pointerValue(current);
+    }
+    JppPtr<JppOutput> tie(JppPtr<JppOutput> replacement) {
+        JppPtr<JppOutput> previous = tie();
+        defaultStdoutTie = false;
+        tied = replacement == null ? null : replacement.get();
+        return previous;
+    }
+    void flushTie() {
+        JppOutput current = defaultStdoutTie ? jppOut : tied;
+        if (current != null)
+            current.flush();
+    }
+}
+
+static class JppIoState {
+    private static boolean synchronizedStdio = true;
+    static boolean sync(boolean enabled) {
+        boolean previous = synchronizedStdio;
+        // libstdc++ keeps synchronization disabled after the first disabling call.
+        synchronizedStdio &= enabled;
+        return previous;
+    }
+}
+
+static class JppInput extends JppStreamState implements AutoCloseable {
     private InputStream input;
     private final byte[] buffer = new byte[1 << 16];
     private int pos, size, saved = -2;
     boolean good = true, ended;
     JppInput() {
         this(System.in);
+        defaultStdoutTie = true;
     }
     JppInput(InputStream stream) {
         input = stream;
@@ -903,6 +938,7 @@ static class JppInput implements AutoCloseable {
         return ignore(count, -1);
     }
     JppInput ignore(long count, int delimiter) {
+        flushTie();
         if (good)
             while (count-- > 0) {
                 int c = readByte();
@@ -936,6 +972,7 @@ static class JppInput implements AutoCloseable {
         return buffer[pos++] & 255;
     }
     private int skip() {
+        flushTie();
         int c;
         do {
             c = readByte();
@@ -1129,6 +1166,7 @@ static class JppInput implements AutoCloseable {
         return line(new JppString(), '\n');
     }
     JppString line(JppString previous, int delimiter) {
+        flushTie();
         if (!good || ended) {
             good = false;
             return previous;
@@ -1337,14 +1375,26 @@ static class JppScanner {
     }
 }
 
-static class JppOutput implements AutoCloseable {
+static class JppOutput extends JppStreamState implements AutoCloseable {
     private PrintWriter output;
     int precision = 6;
     char formatMode = 'g';
-    boolean boolalpha, good = true, ended;
+    boolean boolalpha, good = true, ended, unitBuffered;
     JppOutput(OutputStream stream) {
         output = new PrintWriter(new BufferedWriter(
             new OutputStreamWriter(stream, java.nio.charset.StandardCharsets.UTF_8)));
+    }
+    JppOutput(OutputStream stream, boolean errorStream) {
+        this(stream);
+        defaultStdoutTie = errorStream;
+        unitBuffered = errorStream;
+    }
+    JppOutput(JppOutput shared) {
+        output = shared.output;
+    }
+    JppOutput unitbuf(boolean enabled) {
+        unitBuffered = enabled;
+        return this;
     }
     JppOutput(String path) {
         this(path, 16);
@@ -1389,12 +1439,15 @@ static class JppOutput implements AutoCloseable {
     JppOutput print(Object value) {
         if (!good || output == null)
             return this;
+        flushTie();
         if (value instanceof Boolean)
             output.print(boolalpha ? value : ((Boolean)value ? 1 : 0));
         else if (value instanceof Double || value instanceof Float) {
             String special = Jpp.nonfinite(((Number)value).doubleValue(), false, false, false);
             if (special != null) {
                 output.print(special);
+                if (unitBuffered)
+                    output.flush();
                 return this;
             }
             double number = ((Number)value).doubleValue();
@@ -1404,9 +1457,12 @@ static class JppOutput implements AutoCloseable {
                                       formatMode == 'a' ? -1 : precision, false));
         } else
             output.print(value);
+        if (unitBuffered)
+            output.flush();
         return this;
     }
     JppOutput flush() {
+        flushTie();
         if (output != null) {
             output.flush();
             if (output.checkError())
@@ -1584,7 +1640,9 @@ static class JppOutput implements AutoCloseable {
 }
 
 static final JppInput jppIn = new JppInput();
-static final JppOutput jppOut = new JppOutput(System.out), jppErr = new JppOutput(System.err);
+static final JppOutput jppOut = new JppOutput(System.out),
+                      jppErr = new JppOutput(System.err, true),
+                      jppLog = new JppOutput(jppErr);
 
 static class Jpp {
     static <T> JppRef<T> storeReference(T value, JppRef<T> target) {
@@ -2428,6 +2486,7 @@ static class Jpp {
     static int exit(int status) {
         jppOut.flush();
         jppErr.flush();
+        jppLog.flush();
         System.exit(status);
         return 0;
     }

@@ -32,6 +32,8 @@ Standard-value cases cover partial, nested, and zero-length `std::array` initial
 
 Ordering cases use unsigned values on both sides of the signed limit, pairs, raw arrays, range-constructed sets, initializer-list sets, map insertion, custom comparators, and min-heaps. Native output checks both ordering and comparator construction effects. Heterogeneous bounds searches use signed and unsigned elements, 64-bit keys, and descending transparent comparators; extrema and direct transparent comparisons cover C++ integer conversion rules.
 
+Stream-state cases consume input through chained `tie` and `sync_with_stdio` calls and check returned stream pointers and synchronization flags. Immediate termination distinguishes tied and unit-buffered output from pending buffered output. Standard error is compared byte for byte for the stream fixtures, including shared `cerr`/`clog` buffering and flushing a pending log on `std::exit`.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

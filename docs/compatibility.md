@@ -18,7 +18,7 @@ J++ is an experimental source transpiler for competitive programming. **It does 
 | Pointers | Address-taking, dereference, scalar and array allocation, arithmetic and differences within an allocation, pointer parameters and aliases, pointer reference parameters, member access, selected void-pointer conversions, vector data and string-buffer pointers |
 | Functions | Instantiated function templates, `std::function` with selected callable argument/return conversions, function pointers, typed lambdas with reference and value captures, generic lambdas with one concrete instantiated signature, scalar reference parameters and aliases, default arguments on direct user calls and constructors, reference range loops, translation units without main |
 | Static storage | Lazy local statics with storage per template instantiation, static references and arrays, local extern declarations, owned static/global file-stream closing on normal return and `std::exit`, immediate termination with `std::_Exit` |
-| I/O | Buffered `cin`/`cout` and error streams, file input/output streams with lexical closing, default and append file output, standard-stream `freopen` redirection, strings and C character arrays, basic stream formatting, `getline`, `ignore`, selected `scanf`/`printf` conversions including widths, precision, suppression, scansets, and character counts |
+| I/O | Buffered `cin`/`cout` and error/log streams, stream ties and receiver evaluation in chained stream-setting calls, `unitbuf`/`nounitbuf`, file input/output streams with lexical closing, default and append file output, standard-stream `freopen` redirection, strings and C character arrays, basic stream formatting, `getline`, `ignore`, selected `scanf`/`printf` conversions including widths, precision, suppression, scansets, and character counts |
 | Intrinsics | GNU popcount, parity, clz, ctz, byte swaps, expect, trap/unreachable; selected C++ bit operations including bit_ceil, bit_floor, bit_width, has_single_bit; scalar float/integer bit_cast |
 | Numeric library | Scalar numeric limits, type traits and mathematical constants; scalar constexpr/constinit initialization and consteval calls; selected math functions, C++ rounding, classification and sign tests, exponent scaling, copy-sign, decimal/scientific/hexadecimal floating output with ties-to-even formatting |
 
@@ -38,6 +38,7 @@ Implemented paths have limits. A container appearing in this table does not impl
 - GNU policy based data structures, arbitrary third-party libraries, full ranges/views, and complete C++23 library coverage.
 - Exact `long double` behavior, floating environment differences, locale-sensitive I/O, and complete C `printf`/`scanf` compatibility.
 - Complete file open-mode combinations, seeking, mixed read/write streams, and file-stream exception masks.
+- Complete synchronized C/C++ I/O interleaving and terminal-specific buffering behavior. The stream synchronization flag follows the GNU library's one-way disabling behavior; it does not create native C stream buffers.
 - Exact unsigned `__int128` wraparound and all edge cases of C++ integer promotion and conversion rules.
 
 Java's stack depth, boxing and collection memory overhead, and `BigInteger` costs differ from native C++. Passing a differential test is evidence for that tested behavior, not a full conformance claim or a time-limit guarantee.

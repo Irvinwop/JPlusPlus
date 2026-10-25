@@ -35,6 +35,8 @@ Library comparisons also need the original C++ types. Generated predicates retai
 
 Callable adapters bridge compatible C++ signatures when their Java interfaces differ. They convert parameters and results explicitly, including conversion to boolean and discarding a result for a void callback. This keeps the callable body in an ordinary translated method or lambda.
 
+Stream-setting calls retain receiver evaluation, including input expressions chained before `tie` or a static `sync_with_stdio` call. A shared stream-state base stores ties; input and output sentries flush the tied output. `cerr` and `clog` keep separate formatting state over one output buffer. The synchronization flag follows [libstdc++'s disabling behavior](https://github.com/gcc-mirror/gcc/blob/releases/gcc-13/libstdc%2B%2B-v3/src/c%2B%2B98/ios_init.cc), while native C/C++ buffer interleaving remains outside this model.
+
 The bundled support declarations live in `runtime/Runtime.java`, a source fragment embedded into the C++ binary at build time. A declaration dependency pass selects the helpers referenced by the translated program. Clang's Java formatter formats the complete output.
 
 The build embeds the fragment in bounded string chunks, avoiding a compiler's single-literal size limit as support grows.

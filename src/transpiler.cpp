@@ -254,10 +254,8 @@ std::string supportFor(const std::string& program, std::string& startup) {
     };
     std::vector<Part> parts;
     for (auto code : declarations(javaRuntime)) {
-        bool inputClass =
-            code.find("static class JppInput implements AutoCloseable {") != std::string::npos;
-        bool outputClass =
-            code.find("static class JppOutput implements AutoCloseable {") != std::string::npos;
+        bool inputClass = code.find("static class JppInput ") != std::string::npos;
+        bool outputClass = code.find("static class JppOutput ") != std::string::npos;
         if (inputClass || outputClass) {
             auto body = code.substr(code.find('{') + 1);
             body.resize(body.rfind('}'));
@@ -318,6 +316,7 @@ std::string supportFor(const std::string& program, std::string& startup) {
                 if (code.find("jppOut =") != std::string::npos) {
                     defines.insert("jppOut");
                     defines.insert("jppErr");
+                    defines.insert("jppLog");
                 }
             }
             parts.push_back({code, defines, false, false});
@@ -333,8 +332,10 @@ std::string supportFor(const std::string& program, std::string& startup) {
                 part.selected = true;
                 auto dependencies = words(part.code);
                 needed.insert(dependencies.begin(), dependencies.end());
-                if (part.defines.count("JppInput") || part.defines.count("JppOutput"))
+                if (part.defines.count("JppInput") || part.defines.count("JppOutput")) {
                     needed.insert("call:close");
+                    needed.insert("JppStreamState");
+                }
                 changed = true;
             }
     } while (changed);
@@ -348,14 +349,15 @@ std::string supportFor(const std::string& program, std::string& startup) {
                 result += p.code + '\n';
         }
     if (needed.count("JppInput")) {
-        result += "\n    static class JppInput implements AutoCloseable {\n";
+        result += "\n    static class JppInput extends JppStreamState implements AutoCloseable {\n";
         for (auto& p : parts)
             if (p.selected && p.input)
                 result += p.code + '\n';
         result += "\n    }\n";
     }
     if (needed.count("JppOutput")) {
-        result += "\n    static class JppOutput implements AutoCloseable {\n";
+        result +=
+            "\n    static class JppOutput extends JppStreamState implements AutoCloseable {\n";
         for (auto& p : parts)
             if (p.selected && p.output)
                 result += p.code + '\n';
@@ -1277,6 +1279,8 @@ class Emitter {
             return s.substr(0, s.size() - 6);
         }
         if (auto v = variableRef(e)) {
+            if (!user(v) && stream(v->getType()))
+                return "JppRef.object(" + expr(e) + ")";
             if (cell(v)) {
                 if (auto a = aliases.find(v); a != aliases.end() && a->second.ends_with(".get()"))
                     return a->second.substr(0, a->second.size() - 6);
@@ -1504,6 +1508,8 @@ class Emitter {
                 return left + ".fixed(false)";
             if (n == "boolalpha" || n == "noboolalpha")
                 return left + ".boolalpha(" + (n == "boolalpha" ? "true" : "false") + ")";
+            if (n == "unitbuf" || n == "nounitbuf")
+                return left + ".unitbuf(" + (n == "unitbuf" ? "true" : "false") + ")";
         }
         if (auto call = dyn_cast<CallExpr>(right);
             call && call->getDirectCallee() &&
@@ -2065,10 +2071,12 @@ class Emitter {
                 return object + "." + allocatedName + "(" + arguments(c, f) + ")";
             }
             auto n = me->getMemberDecl()->getNameAsString();
-            if (n == "sync_with_stdio" || (n == "tie" && stream(ot)))
-                return "Jpp.ignore()";
+            if (n == "sync_with_stdio")
+                return "Jpp.last(" + expr(obj) + ", JppIoState.sync(" + truth(c->getArg(0)) + "))";
             if (stream(ot)) {
                 auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                if (n == "tie")
+                    return object + ".tie(" + (c->getNumArgs() ? expr(c->getArg(0)) : "") + ")";
                 if (n == "operator bool")
                     return object + ".good";
                 if (n == "good")
@@ -2272,8 +2280,13 @@ class Emitter {
             }
             return prefix + name(f) + "(" + arguments(c, f) + ")";
         }
-        if (n == "sync_with_stdio")
-            return "Jpp.ignore()";
+        if (n == "sync_with_stdio") {
+            auto invocation = "JppIoState.sync(" + truth(c->getArg(0)) + ")";
+            if (auto member = dyn_cast<MemberExpr>(bare(c->getCallee()));
+                member && member->getBase()->HasSideEffects(ctx))
+                return "Jpp.last(" + expr(member->getBase()) + ", " + invocation + ")";
+            return invocation;
+        }
         if (n == "__builtin_expect" || n == "__builtin_expect_with_probability")
             return expr(c->getArg(0));
         if (n == "__builtin_unreachable" || n == "__builtin_trap")
@@ -2750,8 +2763,10 @@ class Emitter {
                     return "jppIn";
                 if (n == "cout")
                     return "jppOut";
-                if (n == "cerr" || n == "clog")
+                if (n == "cerr")
                     return "jppErr";
+                if (n == "clog")
+                    return "jppLog";
                 if (n == "npos")
                     return "-1L";
                 if (auto en = dyn_cast<EnumConstantDecl>(d))
@@ -4258,7 +4273,7 @@ class Emitter {
             line("try { status = " + name(main) + "(); }");
             line("finally {");
             ++indent;
-            line("jppOut.flush(); jppErr.flush();");
+            line("jppOut.flush(); jppErr.flush(); jppLog.flush();");
             if (!staticLocals.empty() || std::any_of(globals.begin(), globals.end(), [&](auto v) {
                     return fileStream(v->getType()) && !v->getType()->isReferenceType();
                 }))
