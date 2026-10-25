@@ -175,6 +175,8 @@ int main() {
         cases.emplace_back("ordering", expressions.str());
         cases.emplace_back("stream_state", expressions.str());
         cases.emplace_back("stream_exit", "");
+        cases.emplace_back("map_iterators", expressions.str());
+        cases.emplace_back("bindings", expressions.str());
         cases.emplace_back("halt", "");
         cases.emplace_back("coverage", "-19 37 5\n");
         cases.emplace_back("constants", "-17\n");

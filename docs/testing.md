@@ -34,6 +34,10 @@ Ordering cases use unsigned values on both sides of the signed limit, pairs, raw
 
 Stream-state cases consume input through chained `tie` and `sync_with_stdio` calls and check returned stream pointers and synchronization flags. Immediate termination distinguishes tied and unit-buffered output from pending buffered output. Standard error is compared byte for byte for the stream fixtures, including shared `cerr`/`clog` buffering and flushing a pending log on `std::exit`.
 
+Map-iterator cases retain entry, value, and address aliases across insertion and merging. They distinguish a copied pair from a live entry, mutate through `at`, insert during traversal, walk in both directions, and erase individual iterators and ranges. Duplicate-key set ranges exercise iterator distance in both directions. Assignment cases use containers constructed with different comparator state to check propagation of ordering.
+
+Binding cases mutate structs, pairs, built-in arrays, and `std::array` through structured bindings and compare addresses with the original members. A user copy constructor makes a pointer refer to the copied object's own field; mutating that binding must change the pointee while preserving the source object. Range-loop cases compare value copies with reference bindings for nested arrays.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

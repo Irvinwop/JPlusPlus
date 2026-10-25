@@ -1103,7 +1103,8 @@ class Emitter {
                     if (scalarReference(v->getType())) {
                         references.insert(v);
                         markReference(v->getInit());
-                    }
+                    } else if (v->getType()->isReferenceType())
+                        markReference(v->getInit());
                 }
         if (auto c = dyn_cast<CallExpr>(s);
             c && c->getDirectCallee() &&
@@ -1249,8 +1250,10 @@ class Emitter {
                     auto objectType = member->getBase()->getType();
                     if (objectType->isPointerType())
                         objectType = objectType->getPointeeType();
-                    if (isVec(objectType) || isString(objectType)) {
+                    if (isVec(objectType) || isString(objectType) || isMap(objectType)) {
                         auto object = expr(member->getBase()) + (member->isArrow() ? ".get()" : "");
+                        if (n == "at" && isMap(objectType))
+                            return "JppRef.mapAt(" + object + ", " + expr(c->getArg(0)) + ")";
                         if (n == "front" || n == "back")
                             return "JppRef." + n + "(" + object + ")";
                         if (n == "at" && c->getNumArgs())
@@ -1304,6 +1307,10 @@ class Emitter {
         if (auto dereference = dyn_cast<UnaryOperator>(bare(e));
             dereference && dereference->getOpcode() == UO_Deref)
             return "JppRef.at(" + expr(dereference->getSubExpr()) + ")";
+        if (auto dereference = dyn_cast<CXXOperatorCallExpr>(bare(e));
+            dereference && dereference->getOperator() == OO_Star &&
+            dereference->getNumArgs() == 1 && isIter(dereference->getArg(0)->getType()))
+            return "JppRef.at(" + expr(dereference->getArg(0)) + ")";
         if (auto m = dyn_cast<MemberExpr>(bare(e))) {
             auto base = isa<CXXThisExpr>(bare(m->getBase()))
                             ? (constructionThis.empty() ? "this" : constructionThis)
@@ -1891,7 +1898,9 @@ class Emitter {
         }
         if (n == "pair") {
             if (args.size() == 1 && family(args[0]->getType()) == "pair")
-                return converted(expr(args[0]), args[0]->getType(), t);
+                return ctx.hasSameType(clean(args[0]->getType()), clean(t))
+                           ? "jppCopy(" + expr(args[0]) + ")"
+                           : converted(expr(args[0]), args[0]->getType(), t);
             std::vector<std::string> a;
             for (unsigned i = 0; i < args.size(); ++i)
                 a.push_back(value(args[i], element(t, i), true));
@@ -2117,6 +2126,13 @@ class Emitter {
                                                                        : value(a, target, true));
             }
             auto o = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+            if (isMap(ot) && n == "erase" && c->getNumArgs()) {
+                if (c->getNumArgs() == 2)
+                    return o + ".eraseRange(" + join(args) + ")";
+                if (isIter(c->getArg(0)->getType()) &&
+                    !ctx.hasSameType(clean(c->getArg(0)->getType()), clean(element(ot))))
+                    return o + ".eraseIterator(" + join(args) + ")";
+            }
             if (n == "size" || n == "length" || n == "capacity")
                 return integerResult(c, o + "." + n + "()");
             bool deque = family(ot) == "queue" || family(ot) == "deque" || family(ot) == "stack";
@@ -2232,12 +2248,12 @@ class Emitter {
             if (n == "pop" && family(ot) == "stack")
                 return o + ".pop_back()";
             static const std::set<std::string> methods = {
-                "size",        "length", "empty",  "clear",     "front",      "back",
-                "top",         "push",   "pop",    "push_back", "push_front", "pop_back",
-                "pop_front",   "begin",  "end",    "cbegin",    "cend",       "rbegin",
-                "rend",        "erase",  "insert", "count",     "contains",   "lower_bound",
-                "upper_bound", "assign", "substr", "find",      "append",     "at",
-                "swap",        "merge"};
+                "size",        "length", "empty",      "clear",     "front",      "back",
+                "top",         "push",   "pop",        "push_back", "push_front", "pop_back",
+                "pop_front",   "begin",  "end",        "cbegin",    "cend",       "rbegin",
+                "rend",        "erase",  "insert",     "count",     "contains",   "lower_bound",
+                "upper_bound", "assign", "substr",     "find",      "append",     "at",
+                "swap",        "merge",  "equal_range"};
             if (!methods.count(n))
                 fail(c, "unsupported library member '" + n + "'");
             if (n == "cbegin")
@@ -3055,6 +3071,8 @@ class Emitter {
                 if (isIter(a->getType()))
                     return expr(a) + (x->getNumArgs() > 1 ? ".post(" : ".advance(") + delta + ")";
             }
+            if (op == OO_Arrow && x->getNumArgs() == 1 && isIter(x->getArg(0)->getType()))
+                return "Jpp.pointer(" + expr(x->getArg(0)) + ")";
             if (x->getNumArgs() == 2) {
                 if (auto f = x->getDirectCallee();
                     f && user(f) && isa<CXXMethodDecl>(f) &&
@@ -3288,6 +3306,8 @@ class Emitter {
         }
         if (scalarReference(t))
             return "final JppRef<" + boxed(t) + "> " + name(v) + " = " + reference(v->getInit());
+        if (t->isReferenceType() && cells.count(v))
+            return "final JppRef<" + boxed(t) + "> " + name(v) + " = " + reference(v->getInit());
         if (auto d = dyn_cast<DecompositionDecl>(v))
             return decomposition(d, member);
         auto init = initialValue(v);
@@ -3302,6 +3322,24 @@ class Emitter {
         }
         return type(t) + " " + name(v) + " = " + init;
     }
+    std::string bindingReference(const std::string& object, QualType t, unsigned index) {
+        t = clean(t);
+        if (ctx.getAsArrayType(t) || isVec(t))
+            return "JppRef.at(" + object + ", " + std::to_string(index) + ")";
+        std::string field;
+        if (family(t) == "pair")
+            field = index == 0 ? "first" : "second";
+        else if (auto r = record(t); r && user(r)) {
+            auto selected = r->field_begin();
+            std::advance(selected, index);
+            field = name(*selected);
+        } else
+            fail(SourceLocation(), "structured binding supports pairs, arrays, and user structs");
+        auto base = temporary("jppObject"), value = temporary("jppValue");
+        return "JppRef.member(" + object + ", " + quote(field) + ", " + base + " -> " + base + "." +
+               field + ", (" + base + ", " + value + ") -> " + base + "." + field + " = " + value +
+               ")";
+    }
     std::string decomposition(const DecompositionDecl* v, bool member) {
         if (member)
             fail(v->getLocation(), "global structured bindings are not supported");
@@ -3310,21 +3348,9 @@ class Emitter {
         std::string s = type(t) + " " + temp + " = " + value(v->getInit(), t, true);
         unsigned i = 0;
         for (auto b : v->bindings()) {
-            std::string get;
-            if (family(t) == "pair")
-                get = temp + (i == 0 ? ".first" : ".second");
-            else if (ctx.getAsArrayType(t))
-                get = temp + "[" + std::to_string(i) + "]";
-            else if (auto r = record(t); r && user(r)) {
-                auto fields = r->fields();
-                auto it = fields.begin();
-                std::advance(it, i);
-                get = temp + "." + name(*it);
-            } else
-                fail(v->getLocation(),
-                     "structured binding supports pairs, arrays, and user structs");
-            s += "; " + type(b->getType()) + " " + name(b) + " = " + get;
-            ++i;
+            s += "; final JppRef<" + boxed(b->getType()) + "> " + name(b) + " = " +
+                 bindingReference(temp, t, i++);
+            aliases[b] = name(b) + ".get()";
         }
         return s;
     }
@@ -3747,31 +3773,16 @@ class Emitter {
             }
             if (auto d = dyn_cast<DecompositionDecl>(v)) {
                 auto temp = "jppItem" + std::to_string(++serial);
-                bool mapRef = isMap(range->getType()) && v->getType()->isReferenceType();
-                auto mapName = "jppMap" + std::to_string(serial);
-                if (mapRef) {
-                    line("{");
-                    ++indent;
-                    line(type(range->getType()) + " " + mapName + " = " + expr(range) + ";");
-                }
-                line("for (" + type(d->getType()) + " " + temp + " : " +
-                     (mapRef ? mapName : expr(range)) + ")");
+                line("for (" + type(d->getType()) + " " + temp + " : " + expr(range) + ")");
                 line("{");
                 ++indent;
                 if (!v->getType()->isReferenceType())
                     line(temp + " = jppCopy(" + temp + ");");
                 unsigned k = 0;
                 for (auto b : d->bindings()) {
-                    if (mapRef && k == 1) {
-                        line("final JppRef<" + boxed(b->getType()) + "> " + name(b) +
-                             " = JppRef.at(" + mapName + ", " + temp + ".first);");
-                        aliases[b] = name(b) + ".get()";
-                    } else if (v->getType()->isReferenceType())
-                        aliases[b] = temp + (k == 0 ? ".first" : ".second");
-                    else
-                        line(type(b->getType()) + " " + name(b) + " = " + temp +
-                             (k == 0 ? ".first" : ".second") + ";");
-                    ++k;
+                    line("final JppRef<" + boxed(b->getType()) + "> " + name(b) + " = " +
+                         bindingReference(temp, d->getType(), k++) + ";");
+                    aliases[b] = name(b) + ".get()";
                 }
                 if (auto body = dyn_cast<CompoundStmt>(f->getBody()))
                     for (auto c : body->body())
@@ -3780,10 +3791,6 @@ class Emitter {
                     stmt(f->getBody());
                 --indent;
                 line("}");
-                if (mapRef) {
-                    --indent;
-                    line("}");
-                }
             } else {
                 auto initializer = bare(v->getInit());
                 auto sourceType = initializer->getType();

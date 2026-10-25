@@ -147,8 +147,11 @@ static abstract class JppRef<T> {
         return of(position::get, position::put, () -> Jpp.pointer(position));
     }
     static <K, V> JppRef<V> at(JppMap<K, V> a, K i) {
-        a.get(i);
-        return of(() -> a.get(i), v -> a.put(i, v), a, i);
+        return member(a.entry(i), "second", node -> node.second, (node, value) -> node.second = value);
+    }
+    static <K, V> JppRef<V> mapAt(JppMap<K, V> map, K key) {
+        map.at(key);
+        return at(map, key);
     }
     static JppRef<Integer> at(int[] a, int i) {
         return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
@@ -392,6 +395,12 @@ static class JppIter<T> implements JppCopyable<JppIter<T>> {
         list.set(pos, value);
         return value;
     }
+    List<T> pointerStorage() {
+        return list;
+    }
+    Object pointerIdentity() {
+        return storage;
+    }
     JppIter<T> plus(int offset) {
         return new JppIter<T>(list, pos + offset * step, step, storage);
     }
@@ -485,6 +494,12 @@ static class JppTreeIter<T> extends JppIter<T> {
             throw new NoSuchElementException();
         return key;
     }
+    List<T> pointerStorage() {
+        return Collections.singletonList(get());
+    }
+    Object pointerIdentity() {
+        return new JppAddress(tree, key);
+    }
     JppIter<T> plus(int offset) {
         JppTreeIter<T> p = new JppTreeIter<T>(tree, key, step);
         p.duplicate = duplicate;
@@ -513,54 +528,171 @@ static class JppTreeIter<T> extends JppIter<T> {
         return this;
     }
     boolean same(JppIter<?> other) {
-        return other instanceof JppTreeIter && Objects.equals(key, ((JppTreeIter<?>)other).key) &&
+        return other instanceof JppTreeIter && tree == ((JppTreeIter<?>)other).tree &&
+            Objects.equals(key, ((JppTreeIter<?>)other).key) &&
             duplicate == ((JppTreeIter<?>)other).duplicate;
+    }
+    private int rank() {
+        int index = 0;
+        for (Map.Entry<T, Integer> entry : tree.entrySet()) {
+            if (key != null && Objects.equals(key, entry.getKey()))
+                return index + duplicate;
+            index += entry.getValue();
+        }
+        if (key == null)
+            return step > 0 ? index : -1;
+        throw new NoSuchElementException();
+    }
+    int minus(JppIter<?> other) {
+        return (rank() - ((JppTreeIter<?>)other).rank()) * step;
+    }
+}
+
+static class JppMapEntry<K, V> extends JppPair<K, V> {
+    JppMap<K, V> owner;
+    JppMapEntry(JppMap<K, V> map, K key, V value) {
+        super(key, value);
+        owner = map;
+    }
+}
+
+static class JppMapIter<K, V> extends JppIter<JppPair<K, V>> {
+    JppMap<K, V> map;
+    JppMapEntry<K, V> current;
+    List<JppMapEntry<K, V>> unordered;
+    int unorderedIndex;
+    JppMapIter(JppMap<K, V> source, JppMapEntry<K, V> entry, int direction) {
+        super(null, 0, direction, source);
+        map = source;
+        current = entry;
+    }
+    JppPair<K, V> get() {
+        if (current == null)
+            throw new NoSuchElementException();
+        return current;
+    }
+    List<JppPair<K, V>> pointerStorage() {
+        return Collections.singletonList(get());
+    }
+    Object pointerIdentity() {
+        return new JppAddress(current, "");
+    }
+    JppIter<JppPair<K, V>> plus(int offset) {
+        JppMapIter<K, V> copy = new JppMapIter<K, V>(
+            current == null ? map : current.owner, current, step);
+        copy.unordered = unordered;
+        copy.unorderedIndex = unorderedIndex;
+        return copy.advance(offset);
+    }
+    JppIter<JppPair<K, V>> advance(int offset) {
+        int direction = offset < 0 ? -step : step;
+        for (long n = Math.abs((long)offset); n > 0; --n) {
+            if (current != null)
+                map = current.owner;
+            if (map.data instanceof NavigableMap) {
+                NavigableMap<K, JppMapEntry<K, V>> tree =
+                    (NavigableMap<K, JppMapEntry<K, V>>)map.data;
+                Map.Entry<K, JppMapEntry<K, V>> next =
+                    current == null ? (direction < 0 ? tree.lastEntry() : tree.firstEntry())
+                    : direction < 0 ? tree.lowerEntry(current.first)
+                                    : tree.higherEntry(current.first);
+                current = next == null ? null : next.getValue();
+            } else {
+                if (unordered == null) {
+                    unordered = new ArrayList<JppMapEntry<K, V>>(map.data.values());
+                    unorderedIndex = current == null ? (direction < 0 ? unordered.size() : -1)
+                                                     : unordered.indexOf(current);
+                }
+                unorderedIndex += direction;
+                current = unorderedIndex < 0 || unorderedIndex >= unordered.size()
+                              ? null : unordered.get(unorderedIndex);
+            }
+        }
+        return this;
+    }
+    boolean same(JppIter<?> other) {
+        if (!(other instanceof JppMapIter))
+            return false;
+        JppMapIter<?, ?> right = (JppMapIter<?, ?>)other;
+        return current == right.current && (current != null || map == right.map);
+    }
+    private int rank() {
+        if (current == null)
+            return step > 0 ? map.size() : -1;
+        map = current.owner;
+        int index = 0;
+        for (JppMapEntry<K, V> entry : map.data.values()) {
+            if (entry == current)
+                return index;
+            ++index;
+        }
+        throw new NoSuchElementException();
+    }
+    int minus(JppIter<?> other) {
+        return (rank() - ((JppMapIter<?, ?>)other).rank()) * step;
     }
 }
 
 static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppMap<K, V>> {
-    final Map<K, V> data;
+    Map<K, JppMapEntry<K, V>> data;
     final java.util.function.Supplier<V> factory;
-    final Comparator<? super K> comparator;
+    Comparator<? super K> comparator;
     JppMap(boolean ordered, java.util.function.Supplier<V> init) {
         this(ordered, init, Jpp::compare);
     }
     JppMap(boolean ordered, java.util.function.Supplier<V> init, Comparator<? super K> comparison) {
         comparator = comparison;
-        data = ordered ? new TreeMap<K, V>(comparison) : new HashMap<K, V>();
+        data = ordered ? new TreeMap<K, JppMapEntry<K, V>>(comparison)
+                       : new HashMap<K, JppMapEntry<K, V>>();
         factory = init;
     }
     V get(K key) {
-        if (!data.containsKey(key))
-            data.put(jppCopy(key), factory.get());
-        return data.get(key);
+        JppMapEntry<K, V> node = data.get(key);
+        if (node == null) {
+            K stored = jppCopy(key);
+            node = new JppMapEntry<K, V>(this, stored, factory.get());
+            data.put(stored, node);
+        }
+        return node.second;
     }
     V at(K key) {
         if (!data.containsKey(key))
             throw new NoSuchElementException();
-        return data.get(key);
+        return data.get(key).second;
     }
     V put(K key, V value) {
-        data.put(jppCopy(key), value);
+        JppMapEntry<K, V> node = data.get(key);
+        if (node == null) {
+            K stored = jppCopy(key);
+            data.put(stored, new JppMapEntry<K, V>(this, stored, value));
+        } else
+            node.second = value;
         return value;
+    }
+    JppMapEntry<K, V> entry(K key) {
+        get(key);
+        return data.get(key);
     }
     JppPair<JppIter<JppPair<K, V>>, Boolean> emplace(K key, V value) {
         boolean inserted = !data.containsKey(key);
         if (inserted)
-            data.put(jppCopy(key), value);
+            put(key, value);
         return new JppPair<JppIter<JppPair<K, V>>, Boolean>(find(key), inserted);
     }
     JppPair<JppIter<JppPair<K, V>>, Boolean> insert(JppPair<K, V> value) {
+        if (data.containsKey(value.first))
+            return new JppPair<JppIter<JppPair<K, V>>, Boolean>(find(value.first), false);
         return emplace(value.first, jppCopy(value.second));
     }
     void merge(JppMap<K, V> source) {
         if (source == this)
             return;
-        Iterator<Map.Entry<K, V>> entries = source.data.entrySet().iterator();
+        Iterator<Map.Entry<K, JppMapEntry<K, V>>> entries = source.data.entrySet().iterator();
         while (entries.hasNext()) {
-            Map.Entry<K, V> entry = entries.next();
+            Map.Entry<K, JppMapEntry<K, V>> entry = entries.next();
             if (!data.containsKey(entry.getKey())) {
                 data.put(entry.getKey(), entry.getValue());
+                entry.getValue().owner = this;
                 entries.remove();
             }
         }
@@ -574,6 +706,17 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppM
     int erase(K key) {
         return data.remove(key) == null ? 0 : 1;
     }
+    JppIter<JppPair<K, V>> eraseIterator(JppIter<JppPair<K, V>> position) {
+        JppIter<JppPair<K, V>> next = position.plus(1);
+        erase(position.get().first);
+        return next;
+    }
+    JppIter<JppPair<K, V>> eraseRange(JppIter<JppPair<K, V>> first, JppIter<JppPair<K, V>> last) {
+        JppIter<JppPair<K, V>> current = first.plus(0);
+        while (!current.same(last))
+            current = eraseIterator(current);
+        return last.plus(0);
+    }
     int size() {
         return data.size();
     }
@@ -585,44 +728,81 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppM
     }
     ArrayList<JppPair<K, V>> entries() {
         ArrayList<JppPair<K, V>> result = new ArrayList<JppPair<K, V>>();
-        for (Map.Entry<K, V> e : data.entrySet())
-            result.add(new JppPair<K, V>(e.getKey(), e.getValue()));
+        result.addAll(data.values());
         return result;
     }
     public Iterator<JppPair<K, V>> iterator() {
-        return entries().iterator();
+        return new Iterator<JppPair<K, V>>() {
+            JppIter<JppPair<K, V>> position = begin();
+            boolean pending;
+            private void prepare() {
+                if (pending) {
+                    position.advance(1);
+                    pending = false;
+                }
+            }
+            public boolean hasNext() {
+                prepare();
+                return !position.same(end());
+            }
+            public JppPair<K, V> next() {
+                prepare();
+                JppPair<K, V> value = position.get();
+                pending = true;
+                return value;
+            }
+        };
     }
     JppIter<JppPair<K, V>> begin() {
-        return Jpp.begin(entries());
+        return new JppMapIter<K, V>(this, data.isEmpty() ? null : data.values().iterator().next(), 1);
     }
     JppIter<JppPair<K, V>> end() {
-        return Jpp.end(entries());
+        return new JppMapIter<K, V>(this, null, 1);
     }
     JppIter<JppPair<K, V>> find(K key) {
-        ArrayList<JppPair<K, V>> v = entries();
-        for (int i = 0; i < v.size(); ++i)
-            if (Objects.equals(v.get(i).first, key))
-                return Jpp.begin(v).plus(i);
-        return Jpp.end(v);
+        return new JppMapIter<K, V>(this, data.get(key), 1);
+    }
+    JppIter<JppPair<K, V>> lower_bound(K key) {
+        Map.Entry<K, JppMapEntry<K, V>> at =
+            ((NavigableMap<K, JppMapEntry<K, V>>)data).ceilingEntry(key);
+        return new JppMapIter<K, V>(this, at == null ? null : at.getValue(), 1);
+    }
+    JppIter<JppPair<K, V>> upper_bound(K key) {
+        Map.Entry<K, JppMapEntry<K, V>> at =
+            ((NavigableMap<K, JppMapEntry<K, V>>)data).higherEntry(key);
+        return new JppMapIter<K, V>(this, at == null ? null : at.getValue(), 1);
+    }
+    JppPair<JppIter<JppPair<K, V>>, JppIter<JppPair<K, V>>> equal_range(K key) {
+        return new JppPair<JppIter<JppPair<K, V>>, JppIter<JppPair<K, V>>>(lower_bound(key), upper_bound(key));
+    }
+    JppIter<JppPair<K, V>> rbegin() {
+        Map.Entry<K, JppMapEntry<K, V>> at =
+            ((NavigableMap<K, JppMapEntry<K, V>>)data).lastEntry();
+        return new JppMapIter<K, V>(this, at == null ? null : at.getValue(), -1);
+    }
+    JppIter<JppPair<K, V>> rend() {
+        return new JppMapIter<K, V>(this, null, -1);
     }
     public JppMap<K, V> copy() {
         JppMap<K, V> result = new JppMap<K, V>(data instanceof TreeMap, factory, comparator);
-        for (Map.Entry<K, V> e : data.entrySet())
-            result.data.put(jppCopy(e.getKey()), jppCopy(e.getValue()));
+        for (JppMapEntry<K, V> entry : data.values())
+            result.put(entry.first, jppCopy(entry.second));
         return result;
     }
     public JppMap<K, V> jppAssignFrom(JppMap<K, V> source) {
         if (source != this) {
             JppMap<K, V> snapshot = source.copy();
-            data.clear();
-            data.putAll(snapshot.data);
+            data = snapshot.data;
+            comparator = snapshot.comparator;
+            for (JppMapEntry<K, V> entry : data.values())
+                entry.owner = this;
         }
         return this;
     }
 }
 
 static class JppSet<T> implements Iterable<T>, JppAssignable<JppSet<T>> {
-    final NavigableMap<T, Integer> data;
+    NavigableMap<T, Integer> data;
     final boolean multiple;
     int count;
     JppSet(boolean multi) {
@@ -745,6 +925,9 @@ static class JppSet<T> implements Iterable<T>, JppAssignable<JppSet<T>> {
     JppIter<T> upper_bound(T value) {
         return new JppTreeIter<T>(data, data.higherKey(value), 1);
     }
+    JppPair<JppIter<T>, JppIter<T>> equal_range(T value) {
+        return new JppPair<JppIter<T>, JppIter<T>>(lower_bound(value), upper_bound(value));
+    }
     public JppSet<T> copy() {
         JppSet<T> s = new JppSet<T>(multiple, data.comparator());
         s.data.putAll(data);
@@ -754,8 +937,7 @@ static class JppSet<T> implements Iterable<T>, JppAssignable<JppSet<T>> {
     public JppSet<T> jppAssignFrom(JppSet<T> source) {
         if (source != this) {
             JppSet<T> snapshot = source.copy();
-            data.clear();
-            data.putAll(snapshot.data);
+            data = snapshot.data;
             count = snapshot.count;
         }
         return this;
@@ -1690,7 +1872,7 @@ static class Jpp {
         return result;
     }
     static <T> JppPtr<T> pointer(JppIter<T> at) {
-        return at == null ? null : new JppPtr<T>(at.list, at.pos, at.storage);
+        return at == null ? null : new JppPtr<T>(at.pointerStorage(), at.pos, at.pointerIdentity());
     }
     static <T> JppPtr<T> address(JppRef<T> value, Object object, Object field) {
         List<T> view = new AbstractList<T>() {
