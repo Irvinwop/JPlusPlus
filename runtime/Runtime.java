@@ -45,6 +45,7 @@ static abstract class JppRef<T> {
         return of(position::get, position::put);
     }
     static <K, V> JppRef<V> at(JppMap<K, V> a, K i) {
+        a.get(i);
         return of(() -> a.get(i), v -> a.put(i, v));
     }
     static JppRef<Integer> at(int[] a, int i) {

@@ -41,6 +41,66 @@ const std::set<std::string> javaWords = {
     "while",    "true",   "false",      "null",      "_",          "var",       "yield",
     "record",   "sealed", "permits"};
 
+const std::set<std::string> javaRuntimeNames = {"Object",
+                                                "String",
+                                                "StringBuilder",
+                                                "CharSequence",
+                                                "Boolean",
+                                                "Byte",
+                                                "Short",
+                                                "Character",
+                                                "Integer",
+                                                "Long",
+                                                "Float",
+                                                "Double",
+                                                "Number",
+                                                "Math",
+                                                "StrictMath",
+                                                "System",
+                                                "Runtime",
+                                                "Thread",
+                                                "Class",
+                                                "Arrays",
+                                                "Collections",
+                                                "Comparator",
+                                                "Comparable",
+                                                "Objects",
+                                                "List",
+                                                "ArrayList",
+                                                "Collection",
+                                                "Map",
+                                                "Set",
+                                                "TreeMap",
+                                                "HashMap",
+                                                "TreeSet",
+                                                "NavigableMap",
+                                                "Iterator",
+                                                "Deque",
+                                                "ArrayDeque",
+                                                "PriorityQueue",
+                                                "InputStream",
+                                                "OutputStream",
+                                                "FileInputStream",
+                                                "FileOutputStream",
+                                                "PrintWriter",
+                                                "BufferedWriter",
+                                                "OutputStreamWriter",
+                                                "UncheckedIOException",
+                                                "IOException",
+                                                "ByteArrayOutputStream",
+                                                "Locale",
+                                                "BigInteger",
+                                                "BigDecimal",
+                                                "MathContext",
+                                                "RoundingMode",
+                                                "AutoCloseable",
+                                                "IllegalStateException",
+                                                "UnsupportedOperationException",
+                                                "IllegalArgumentException",
+                                                "IndexOutOfBoundsException",
+                                                "AssertionError",
+                                                "NumberFormatException"};
+
 std::string join(const std::vector<std::string>& a, std::string_view sep = ", ") {
     std::string s;
     for (const auto& v : a) {
@@ -338,6 +398,7 @@ class Emitter {
     std::unordered_set<const Decl*> collected;
     std::unordered_set<const FunctionDecl*> emittedFunctions;
     std::unordered_map<const ValueDecl*, std::string> aliases;
+    std::unordered_map<const OpaqueValueExpr*, std::string> opaqueValues;
     std::unordered_set<std::string> reservedNames;
     std::unordered_set<const VarDecl*> cells;
     std::unordered_set<const VarDecl*> references;
@@ -382,6 +443,8 @@ class Emitter {
         if (auto it = names.find(d); it != names.end())
             return it->second;
         std::string base = identifier(d->getNameAsString());
+        if (base == options.className)
+            base = "cpp_" + base;
         if (auto f = dyn_cast<FunctionDecl>(d)) {
             if (f->isMain())
                 base = "cppMain";
@@ -425,7 +488,7 @@ class Emitter {
                 base += "_" + std::to_string(count);
         }
         // Member/local scopes retain natural names. Java overload erasure is avoided for functions.
-        if (isa<FunctionDecl>(d) || isa<CXXRecordDecl>(d) ||
+        if (isa<FunctionDecl>(d) || isa<CXXRecordDecl>(d) || isa<EnumConstantDecl>(d) ||
             (isa<VarDecl>(d) && cast<VarDecl>(d)->isFileVarDecl())) {
             int n = ++usedNames[base];
             if (n > 1)
@@ -434,7 +497,10 @@ class Emitter {
         return names[d] = base;
     }
     static QualType clean(QualType t) {
-        return t.getNonReferenceType().getUnqualifiedType().getCanonicalType();
+        t = t.getNonReferenceType().getUnqualifiedType().getCanonicalType();
+        if (auto enumeration = t->getAs<EnumType>())
+            return enumeration->getDecl()->getIntegerType().getCanonicalType();
+        return t;
     }
     const CXXRecordDecl* record(QualType t) const {
         return clean(t)->getAsCXXRecordDecl();
@@ -556,7 +622,8 @@ class Emitter {
             return "void";
         if (t->isBooleanType())
             return "boolean";
-        if (t->isCharType() || t->isWideCharType() || t->isChar16Type())
+        if (t->isCharType() || t->isChar16Type() ||
+            (t->isWideCharType() && ctx.getTypeSize(t) <= 16))
             return "char";
         if (t->isEnumeralType())
             return "int";
@@ -565,9 +632,9 @@ class Emitter {
         if (t->isIntegerType())
             return ctx.getTypeSize(t) > 32 ? "long" : "int";
         if (t->isRealFloatingType()) {
-            if (t->isSpecificBuiltinType(BuiltinType::LongDouble))
+            if (ctx.getTypeSize(t) != 32 && ctx.getTypeSize(t) != 64)
                 fail(SourceLocation(),
-                     "long double has no exact Java equivalent; use double explicitly");
+                     "extended floating-point types need a software precision backend");
             return ctx.getTypeSize(t) <= 32 ? "float" : "double";
         }
         if (auto a = ctx.getAsArrayType(t))
@@ -713,6 +780,25 @@ class Emitter {
         return t->isIntegerType() && !big(t) && ctx.getTypeSize(t) > 32 ? "(long)(" + result + ")"
                                                                         : result;
     }
+    std::string integerLiteral(const llvm::APInt& value, QualType target) {
+        target = clean(target);
+        if (target->isBooleanType())
+            return value.isZero() ? "false" : "true";
+        if (big(target)) {
+            llvm::SmallString<40> digits;
+            value.toString(digits, 10, !target->isUnsignedIntegerType());
+            return "new BigInteger(" + quote(digits.str().str()) + ")";
+        }
+        if (ctx.getTypeSize(target) > 32)
+            return std::to_string(value.getSExtValue()) + "L";
+        if (type(target) == "char") {
+            auto mask = ctx.getTypeSize(target) == 8 ? 255 : 65535;
+            return "(char)" + std::to_string(value.getZExtValue() & mask);
+        }
+        return std::to_string(target->isUnsignedIntegerType()
+                                  ? static_cast<int32_t>(value.getZExtValue())
+                                  : static_cast<int32_t>(value.getSExtValue()));
+    }
     std::string converted(std::string s, QualType from, QualType target) {
         from = clean(from);
         target = clean(target);
@@ -724,8 +810,15 @@ class Emitter {
         }
         if (target->isBooleanType())
             return booleanValue(s, from);
+        if (from->isCharType() && ctx.getTypeSize(from) == 8)
+            s = "(char)((int)(char)(" + s + ") & 255)";
         if (from->isBooleanType() && (target->isArithmeticType() || target->isEnumeralType())) {
             s = "(" + s + " ? 1 : 0)";
+            from = ctx.IntTy;
+        }
+        if (from->isCharType() && from->isSignedIntegerType() && ctx.getTypeSize(from) == 8 &&
+            (target->isArithmeticType() || target->isEnumeralType()) && !target->isCharType()) {
+            s = "((int)(byte)(char)(" + s + "))";
             from = ctx.IntTy;
         }
         if (from->isUnsignedIntegerType() && ctx.getTypeSize(from) == 32 &&
@@ -764,6 +857,8 @@ class Emitter {
                 s = "(" + source + ")(" + s + ")";
             s = "(" + destination + ")(" + s + ")";
         }
+        if (target->isCharType() && ctx.getTypeSize(target) == 8)
+            s = "(char)((int)(" + s + ") & 255)";
         return s;
     }
     std::string value(const Expr* e, QualType target, bool copy = false) {
@@ -811,6 +906,16 @@ class Emitter {
         if (auto c = dyn_cast_or_null<ConditionalOperator>(bare(e))) {
             markReference(c->getTrueExpr());
             markReference(c->getFalseExpr());
+        }
+        if (auto c = dyn_cast_or_null<BinaryConditionalOperator>(bare(e))) {
+            markReference(c->getCommon());
+            markReference(c->getFalseExpr());
+        }
+        if (auto c = dyn_cast_or_null<CallExpr>(bare(e));
+            c && c->getDirectCallee() && !user(c->getDirectCallee())) {
+            auto n = c->getDirectCallee()->getNameAsString();
+            if ((n == "move" || n == "forward" || n == "as_const") && c->getNumArgs())
+                markReference(c->getArg(0));
         }
         if (auto v = variableRef(e); v && !v->hasGlobalStorage())
             cells.insert(v);
@@ -884,13 +989,15 @@ class Emitter {
                     if (scalarReference(prototype->getParamType(i)))
                         markReference(c->getArg(i));
         }
-        if (auto c = dyn_cast<CompoundAssignOperator>(s); c && c->getRHS()->HasSideEffects(ctx))
+        if (auto c = dyn_cast<CompoundAssignOperator>(s);
+            c && (c->getRHS()->HasSideEffects(ctx) || big(c->getLHS()->getType())))
             markReference(c->getLHS());
         if (auto b = dyn_cast<BinaryOperator>(s);
-            b && b->isAssignmentOp() && isa<ConditionalOperator>(bare(b->getLHS())))
+            b && b->isAssignmentOp() && isa<AbstractConditionalOperator>(bare(b->getLHS())))
             markReference(b->getLHS());
         if (auto u = dyn_cast<UnaryOperator>(s);
-            u && u->isIncrementDecrementOp() && isa<ConditionalOperator>(bare(u->getSubExpr())))
+            u && u->isIncrementDecrementOp() &&
+            isa<AbstractConditionalOperator>(bare(u->getSubExpr())))
             markReference(u->getSubExpr());
         if (auto u = dyn_cast<UnaryOperator>(s); u && u->getOpcode() == UO_AddrOf)
             markReference(u->getSubExpr());
@@ -900,6 +1007,8 @@ class Emitter {
             markCapturedVariables(b);
         if (auto c = dyn_cast<ConditionalOperator>(s); c && c->getType()->isVoidType())
             markCapturedVariables(c);
+        if (isa<BinaryConditionalOperator>(s) || isa<StmtExpr>(s))
+            markCapturedVariables(s);
         if (auto op = dyn_cast<CXXOperatorCallExpr>(s);
             op && op->getOperator() == OO_GreaterGreater && op->getNumArgs() == 2 &&
             stream(op->getArg(0)->getType())) {
@@ -912,6 +1021,36 @@ class Emitter {
             scan(child);
     }
     std::string reference(const Expr* e) {
+        auto wrapped = e;
+        while (true) {
+            if (auto cleanup = dyn_cast<ExprWithCleanups>(wrapped))
+                wrapped = cleanup->getSubExpr();
+            else if (auto parens = dyn_cast<ParenExpr>(wrapped))
+                wrapped = parens->getSubExpr();
+            else if (auto cast = dyn_cast<ImplicitCastExpr>(wrapped))
+                wrapped = cast->getSubExpr();
+            else
+                break;
+        }
+        if (isa<MaterializeTemporaryExpr>(wrapped))
+            return "JppRef.cell(" + expr(e) + ")";
+        if (auto c = dyn_cast<CallExpr>(bare(e));
+            c && c->getDirectCallee() && !user(c->getDirectCallee())) {
+            auto n = c->getDirectCallee()->getNameAsString();
+            if ((n == "move" || n == "forward" || n == "as_const") && c->getNumArgs())
+                return reference(c->getArg(0));
+        }
+        if (auto c = dyn_cast<BinaryConditionalOperator>(bare(e)); c && c->isLValue())
+            return supplier([&] {
+                auto common = temporary("jppSelected");
+                line("JppRef<" + boxed(c->getCommon()->getType()) + "> " + common + " = " +
+                     reference(c->getCommon()) + ";");
+                auto previous = opaqueValues;
+                opaqueValues[c->getOpaqueValue()] = common + ".get()";
+                line("return " + truth(c->getCond()) + " ? " + common + " : " +
+                     reference(c->getFalseExpr()) + ";");
+                opaqueValues = std::move(previous);
+            });
         if (auto c = dyn_cast<ConditionalOperator>(bare(e)))
             return "(" + truth(c->getCond()) + " ? " + reference(c->getTrueExpr()) + " : " +
                    reference(c->getFalseExpr()) + ")";
@@ -956,6 +1095,8 @@ class Emitter {
         t = clean(t);
         if (t->isBooleanType())
             return s;
+        if (t->isCharType() && ctx.getTypeSize(t) == 8)
+            return "(((int)(char)(" + s + ") & 255) != 0)";
         if (big(t))
             return "((" + s + ").signum() != 0)";
         if (t->isArithmeticType() || t->isEnumeralType())
@@ -1035,7 +1176,7 @@ class Emitter {
             }
             allocation = "(" + type(t) + ") new " + raw + dims;
         }
-        if (part->isRecordType())
+        if (part->isRecordType() || big(part))
             return "Jpp.objects(" + allocation + ", () -> " + defaultValue(part) + ")";
         return allocation;
     }
@@ -1153,7 +1294,7 @@ class Emitter {
         return {};
     }
     std::string assign(const Expr* lhs, const std::string& rhs) {
-        if (isa<ConditionalOperator>(bare(lhs)))
+        if (isa<AbstractConditionalOperator>(bare(lhs)))
             return reference(lhs) + ".set(" + rhs + ")";
         if (auto d = dyn_cast<DeclRefExpr>(bare(lhs));
             d && aliases.count(d->getDecl()) && aliases[d->getDecl()].ends_with(".get()"))
@@ -1175,6 +1316,9 @@ class Emitter {
                            QualType rightType, std::string op) {
         bool comparison =
             op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=";
+        if (comparison && clean(leftType)->isCharType() && ctx.getTypeSize(clean(leftType)) == 8)
+            return arithmetic(converted(lhs, leftType, ctx.IntTy), ctx.IntTy,
+                              converted(rhs, rightType, ctx.IntTy), ctx.IntTy, op);
         if (big(leftType) || big(rightType)) {
             auto l = big(leftType) ? lhs : "BigInteger.valueOf(" + lhs + ")";
             auto r = big(rightType) ? rhs : "BigInteger.valueOf(" + rhs + ")";
@@ -1193,12 +1337,19 @@ class Emitter {
             (ctx.getTypeSize(leftType) == 32 || ctx.getTypeSize(leftType) == 64))
             return "(" + std::string(unsignedLong(leftType) ? "Long" : "Integer") +
                    ".compareUnsigned(" + lhs + ", " + rhs + ") " + op + " 0)";
+        if (comparison && clean(leftType)->isBooleanType() && clean(rightType)->isBooleanType())
+            return "(Boolean.compare(" + lhs + ", " + rhs + ") " + op + " 0)";
         if ((op == "/" || op == "%") && clean(leftType)->isUnsignedIntegerType())
             return std::string(unsignedLong(leftType) ? "Long" : "Integer") + "." +
                    (op == "/" ? "divideUnsigned" : "remainderUnsigned") + "(" + lhs + ", " + rhs +
                    ")";
         if (op == ">>" && clean(leftType)->isUnsignedIntegerType())
             op = ">>>";
+        if ((op == "==" || op == "!=") &&
+            (clean(leftType)->isArithmeticType() || clean(leftType)->isEnumeralType()) &&
+            (clean(rightType)->isArithmeticType() || clean(rightType)->isEnumeralType()))
+            return "((" + type(leftType) + ")(" + lhs + ") " + op + " (" + type(rightType) + ")(" +
+                   rhs + "))";
         return "(" + lhs + " " + op + " " + rhs + ")";
     }
     bool addressHasSideEffects(const Expr* e) const {
@@ -1315,6 +1466,8 @@ class Emitter {
         return arithmetic(expr(lhs), lhs->getType(), expr(rhs), rhs->getType(), op);
     }
     std::string construct(const CXXConstructExpr* c) {
+        if (c->getConstructor()->isConsteval())
+            fail(c, "consteval object construction needs additional constant-value lowering");
         auto t = c->getType();
         std::vector<const Expr*> args;
         for (auto a : c->arguments())
@@ -1428,7 +1581,8 @@ class Emitter {
     std::string bitCast(const Expr* value, QualType target) {
         auto from = clean(value->getType());
         target = clean(target);
-        if (ctx.hasSameType(from, target))
+        if (ctx.hasSameType(from, target) &&
+            (from->isArithmeticType() || from->isEnumeralType() || from->isPointerType()))
             return expr(value);
         if (from->isSpecificBuiltinType(BuiltinType::Float) && target->isIntegerType() &&
             ctx.getTypeSize(target) == 32)
@@ -1444,8 +1598,55 @@ class Emitter {
             return "Double.longBitsToDouble(" + expr(value) + ")";
         fail(value, "this bit_cast needs a storage layout backend");
     }
+    std::string constantValue(const APValue& evaluated, QualType target) {
+        auto t = clean(target);
+        if (!t->isArithmeticType() && !t->isEnumeralType())
+            return {};
+        if (evaluated.isInt()) {
+            return integerLiteral(evaluated.getInt(), t);
+        }
+        if (evaluated.isFloat()) {
+            const auto& value = evaluated.getFloat();
+            auto destination = type(t);
+            if (destination != "float" && destination != "double")
+                return {};
+            if (value.isFinite()) {
+                llvm::SmallString<40> buffer;
+                value.toString(buffer);
+                std::string literal = buffer.str().str();
+                if (literal.find_first_of(".eE") == std::string::npos)
+                    literal += ".0";
+                return literal + (destination == "float" ? "f" : "");
+            }
+            auto bits = value.bitcastToAPInt();
+            return destination == "float"
+                       ? "Float.intBitsToFloat(" +
+                             std::to_string(static_cast<int32_t>(bits.getZExtValue())) + ")"
+                       : "Double.longBitsToDouble(" + std::to_string(bits.getSExtValue()) + "L)";
+        }
+        return {};
+    }
+    std::string constantValue(const Expr* expression, bool required = false) {
+        auto t = clean(expression->getType());
+        if (!t->isArithmeticType() && !t->isEnumeralType())
+            return {};
+        Expr::EvalResult result;
+        if (!expression->EvaluateAsRValue(result, ctx, required) || result.HasSideEffects)
+            return {};
+        return constantValue(result.Val, t);
+    }
     std::string call(const CallExpr* c) {
         auto f = c->getDirectCallee();
+        if (f && f->isConsteval()) {
+            if (auto constant = constantValue(c, true); !constant.empty())
+                return constant;
+            fail(c, "this consteval result needs additional constant-value lowering");
+        }
+        if (f && !user(f))
+            if (auto owner = dyn_cast<CXXRecordDecl>(f->getDeclContext());
+                owner && owner->getName() == "numeric_limits")
+                if (auto constant = constantValue(c); !constant.empty())
+                    return constant;
         if (auto m = dyn_cast<CXXMemberCallExpr>(c)) {
             auto me = dyn_cast<MemberExpr>(bare(m->getCallee()));
             if (!me)
@@ -1633,8 +1834,19 @@ class Emitter {
             return expr(c->getCallee()) + ".call(" + join(args) + ")";
         }
         auto n = f->getNameAsString();
-        if (user(f) && !f->getBuiltinID())
-            return name(f) + "(" + arguments(c, f) + ")";
+        if ((!user(f) || f->getBuiltinID()) &&
+            (n == "is_constant_evaluated" || n == "__builtin_is_constant_evaluated"))
+            return "false";
+        if (user(f) && !f->getBuiltinID()) {
+            std::string prefix;
+            if (auto method = dyn_cast<CXXMethodDecl>(f); method && method->isStatic()) {
+                if (auto member = dyn_cast<MemberExpr>(bare(c->getCallee())))
+                    prefix = expr(member->getBase()) + ".";
+                else
+                    prefix = name(method->getParent()) + ".";
+            }
+            return prefix + name(f) + "(" + arguments(c, f) + ")";
+        }
         if (n == "sync_with_stdio")
             return "Jpp.ignore()";
         if (n == "__builtin_expect" || n == "__builtin_expect_with_probability")
@@ -1748,6 +1960,8 @@ class Emitter {
             return expr(c->getArg(0));
         if (n == "to_string")
             return "new JppString(" + expr(c->getArg(0)) + ")";
+        if (n == "to_underlying")
+            return value(c->getArg(0), c->getType());
         if (n == "stoi" || n == "stol" || n == "stoll" || n == "stod" || n == "stof")
             return std::string(n == "stoi"   ? "Integer.parseInt"
                                : n == "stod" ? "Double.parseDouble"
@@ -2005,15 +2219,7 @@ class Emitter {
             return "";
         auto e = strip(input);
         if (auto x = dyn_cast<IntegerLiteral>(e)) {
-            auto v = x->getValue();
-            if (big(x->getType())) {
-                llvm::SmallString<40> b;
-                v.toString(b, 10, !x->getType()->isUnsignedIntegerType());
-                return "new BigInteger(" + quote(b.str().str()) + ")";
-            }
-            if (ctx.getTypeSize(x->getType()) > 32)
-                return std::to_string(v.getSExtValue()) + "L";
-            return std::to_string(static_cast<int32_t>(v.getZExtValue()));
+            return integerLiteral(x->getValue(), x->getType());
         }
         if (auto x = dyn_cast<FloatingLiteral>(e)) {
             llvm::SmallString<40> b;
@@ -2027,6 +2233,10 @@ class Emitter {
         }
         if (auto x = dyn_cast<CharacterLiteral>(e)) {
             auto c = x->getValue();
+            if (type(x->getType()) != "char")
+                return std::to_string(static_cast<int32_t>(c));
+            if (ctx.getTypeSize(x->getType()) == 8)
+                c &= 255;
             if (c == '\n')
                 return "'\\n'";
             if (c == '\r')
@@ -2065,6 +2275,11 @@ class Emitter {
                     return "-1L";
                 if (auto en = dyn_cast<EnumConstantDecl>(d))
                     return number(en->getInitVal());
+                if (auto v = dyn_cast<VarDecl>(d); v && v->isConstexpr() && v->hasInit())
+                    if (auto evaluated = v->evaluateValue())
+                        if (auto constant = constantValue(*evaluated, v->getType());
+                            !constant.empty())
+                            return constant;
                 if (auto v = dyn_cast<VarDecl>(d);
                     v && v->hasInit() &&
                     v->getQualifiedNameAsString().starts_with("std::ios_base::")) {
@@ -2076,6 +2291,11 @@ class Emitter {
             }
             if (auto v = dyn_cast<VarDecl>(d); cell(v))
                 return name(d) + ".get()";
+            if (auto v = dyn_cast<VarDecl>(d); v && v->isStaticDataMember())
+                return name(cast<CXXRecordDecl>(v->getDeclContext())) + "." + name(v);
+            if (isa<EnumConstantDecl>(d) || (isa<VarDecl>(d) && cast<VarDecl>(d)->isFileVarDecl()))
+                if (x->hasQualifier() || currentRecord)
+                    return options.className + "." + name(d);
             return name(d);
         }
         if (auto x = dyn_cast<ImplicitCastExpr>(e)) {
@@ -2114,6 +2334,54 @@ class Emitter {
         }
         if (auto x = dyn_cast<CompoundAssignOperator>(e))
             return compoundAssignment(x);
+        if (auto x = dyn_cast<OpaqueValueExpr>(e)) {
+            if (auto it = opaqueValues.find(x); it != opaqueValues.end())
+                return it->second;
+            fail(e, "an opaque GNU expression value has no binding");
+        }
+        if (auto x = dyn_cast<BinaryConditionalOperator>(e)) {
+            if (x->isLValue())
+                return reference(x) + ".get()";
+            return supplier([&] {
+                auto common = temporary("jppSelected");
+                line(type(x->getCommon()->getType()) + " " + common + " = " + expr(x->getCommon()) +
+                     ";");
+                auto previous = opaqueValues;
+                opaqueValues[x->getOpaqueValue()] = common;
+                line("return " + truth(x->getCond()) + " ? " + expr(x->getTrueExpr()) + " : " +
+                     expr(x->getFalseExpr()) + ";");
+                opaqueValues = std::move(previous);
+            });
+        }
+        if (auto x = dyn_cast<StmtExpr>(e)) {
+            std::function<void(const Stmt*, unsigned, unsigned)> validate = [&](const Stmt* s,
+                                                                                unsigned loops,
+                                                                                unsigned switches) {
+                if (!s || isa<LambdaExpr>(s))
+                    return;
+                if (isa<ReturnStmt>(s) || isa<GotoStmt>(s) || isa<IndirectGotoStmt>(s))
+                    fail(s, "control transfer out of a GNU statement expression requires "
+                            "additional lowering");
+                if ((isa<BreakStmt>(s) && !loops && !switches) || (isa<ContinueStmt>(s) && !loops))
+                    fail(s, "a GNU statement expression cannot yet break or continue an "
+                            "enclosing loop");
+                const Stmt* loopBody = nullptr;
+                if (auto loop = dyn_cast<ForStmt>(s))
+                    loopBody = loop->getBody();
+                else if (auto loop = dyn_cast<WhileStmt>(s))
+                    loopBody = loop->getBody();
+                else if (auto loop = dyn_cast<DoStmt>(s))
+                    loopBody = loop->getBody();
+                else if (auto loop = dyn_cast<CXXForRangeStmt>(s))
+                    loopBody = loop->getBody();
+                auto selection = dyn_cast<SwitchStmt>(s);
+                for (auto child : s->children())
+                    validate(child, loops + (child && child == loopBody),
+                             switches + (selection && child == selection->getBody()));
+            };
+            validate(x->getSubStmt(), 0, 0);
+            return supplier([&] { bodyStatements(x->getSubStmt(), true); });
+        }
         if (auto x = dyn_cast<BinaryOperator>(e))
             return binary(x->getLHS(), x->getRHS(), x->getOpcodeStr().str(), x->getType());
         if (auto x = dyn_cast<CXXRewrittenBinaryOperator>(e))
@@ -2130,7 +2398,7 @@ class Emitter {
                         "instead");
             if (x->isIncrementDecrementOp()) {
                 int delta = x->isIncrementOp() ? 1 : -1;
-                if (isa<ConditionalOperator>(bare(a)))
+                if (isa<AbstractConditionalOperator>(bare(a)))
                     return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
                            (x->isPostfix() ? "true" : "false") + ")";
                 if (auto d = dyn_cast<DeclRefExpr>(bare(a));
@@ -2380,11 +2648,11 @@ class Emitter {
             return decomposition(d, member);
         std::string init;
         if (auto e = v->getInit()) {
-            Expr::EvalResult evaluated;
-            if (v->isConstexpr() && clean(t)->isIntegerType() && !big(t) &&
-                e->EvaluateAsInt(evaluated, ctx))
-                init = number(evaluated.Val.getInt()) + (type(t) == "long" ? "L" : "");
-            else
+            if (clean(t)->isArithmeticType() &&
+                (v->isConstexpr() || v->hasConstantInitialization()))
+                if (auto evaluated = v->evaluateValue())
+                    init = constantValue(*evaluated, t);
+            if (init.empty())
                 init = ctx.getAsArrayType(t) ? newArray(t, e) : value(e, t, true);
         } else
             init = defaultValue(t);
@@ -2438,6 +2706,9 @@ class Emitter {
     std::string supplier(const std::function<void()>& emit) {
         auto old = out.str();
         auto oldIndent = indent;
+        auto oldEnclosing = enclosingFunctions.size();
+        if (current)
+            enclosingFunctions.push_back(current);
         out.str("");
         out.clear();
         indent = 0;
@@ -2451,6 +2722,7 @@ class Emitter {
         out.clear();
         out.seekp(0, std::ios_base::end);
         indent = oldIndent;
+        enclosingFunctions.resize(oldEnclosing);
         return "Jpp.sequence(() -> " + body + ")";
     }
     std::string sequence(const Expr* first, const Expr* second) {
@@ -2542,7 +2814,7 @@ class Emitter {
             return i->getElse() && terminates(i->getThen()) && terminates(i->getElse());
         return false;
     }
-    void bodyStatements(const CompoundStmt* body) {
+    void bodyStatements(const CompoundStmt* body, bool returnValue = false) {
         struct Exit {
             const LabelDecl* label;
             size_t begin, end;
@@ -2608,6 +2880,12 @@ class Emitter {
                 dead = false;
             if (dead)
                 continue;
+            if (returnValue && i + 1 == statements.size())
+                if (auto e = dyn_cast<Expr>(child); e && !e->getType()->isVoidType()) {
+                    line("return " + value(e, e->getType(), true) + ";");
+                    dead = true;
+                    continue;
+                }
             const Stmt* declarationStatement = child;
             while (auto label = dyn_cast<LabelStmt>(declarationStatement))
                 declarationStatement = label->getSubStmt();
@@ -2640,6 +2918,8 @@ class Emitter {
                     line(variable(v) + ";");
             }
         }
+        if (returnValue && !dead)
+            line("return null;");
         while (resources--) {
             --indent;
             line("}");
@@ -2969,6 +3249,11 @@ class Emitter {
     void function(const FunctionDecl* f) {
         if (!emittedFunctions.insert(f->getCanonicalDecl()).second)
             return;
+        if (f->isConsteval()) {
+            if (options.sourceComments)
+                line("// consteval " + f->getNameAsString() + " was evaluated during translation.");
+            return;
+        }
         if (auto m = dyn_cast<CXXMethodDecl>(f); m && m->isCopyAssignmentOperator())
             return;
         if (isa<CXXDestructorDecl>(f))
@@ -3041,6 +3326,25 @@ class Emitter {
         line("{");
         ++indent;
         std::vector<std::string> params, assignments;
+        for (auto decl : r->decls())
+            if (auto field = dyn_cast<VarDecl>(decl); field && field->isStaticDataMember()) {
+                auto definition = field->getDefinition();
+                if (definition && definition->hasInit())
+                    field = definition;
+                if (!clean(field->getType())->isArithmeticType() &&
+                    !clean(field->getType())->isEnumeralType())
+                    fail(field->getLocation(),
+                         "this static data-member type needs additional lowering");
+                if (auto initializer = field->getInit();
+                    initializer && (clean(field->getType())->isArithmeticType() ||
+                                    clean(field->getType())->isEnumeralType())) {
+                    if (constantValue(initializer).empty())
+                        fail(field->getLocation(),
+                             "dynamic static data-member initialization needs additional lowering");
+                }
+                line("static " + std::string(field->getType().isConstQualified() ? "final " : "") +
+                     variable(field, true) + ";");
+            }
         for (auto field : r->fields()) {
             if (field->isBitField())
                 fail(field->getLocation(), "bitfields require a storage layout backend");
@@ -3101,10 +3405,10 @@ class Emitter {
             name(f);
         for (auto v : globals)
             name(v);
-        bool main = false;
+        const FunctionDecl* main = nullptr;
         for (auto f : functions)
             if (f->isMain()) {
-                main = true;
+                main = f;
                 if (f->getNumParams())
                     fail(f->getLocation(), "main(argc, argv) is not supported yet; use main()");
             }
@@ -3117,7 +3421,8 @@ class Emitter {
         auto startupAt = static_cast<size_t>(out.tellp());
         for (auto en : enums)
             for (auto v : en->enumerators())
-                line("static final int " + name(v) + " = " + number(v->getInitVal()) + ";");
+                line("static final " + type(ctx.getTypeDeclType(en)) + " " + name(v) + " = " +
+                     integerLiteral(v->getInitVal(), ctx.getTypeDeclType(en)) + ";");
         for (auto v : globals) {
             source(v);
             line("static " + variable(v, true) + ";");
@@ -3164,7 +3469,7 @@ class Emitter {
             line("public static void main(String[] args) {");
             ++indent;
             line("int status;");
-            line("try { status = cppMain(); }");
+            line("try { status = " + name(main) + "(); }");
             line("finally {");
             ++indent;
             line("jppOut.flush(); jppErr.flush();");
@@ -3245,7 +3550,8 @@ std::string identifier(const std::string& s) {
         r = "anonymous";
     if (std::isdigit(static_cast<unsigned char>(r[0])))
         r = "_" + r;
-    if (javaWords.count(r) || r.starts_with("jpp") || r.starts_with("Jpp"))
+    if (javaWords.count(r) || javaRuntimeNames.count(r) || r.starts_with("jpp") ||
+        r.starts_with("Jpp"))
         r = "cpp_" + r;
     return r;
 }

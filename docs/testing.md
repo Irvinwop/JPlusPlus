@@ -14,6 +14,10 @@ Forward-jump cases compare nested exits, crossing destinations, declarations use
 
 Numeric cases compare raw IEEE bits for scalar bit casts, rounding, signed zero and NaNs, and unsigned-to-floating conversions. They include integer widening above the signed limit and values where conversion through `double` would change the result of a direct conversion to `float`. Formatting checks cover subnormals, infinities, NaNs, rounding ties, hexadecimal precision, and decimal precision beyond the shortest representation.
 
+Constant and naming cases exercise compile-time versus runtime evaluation, scalar static members, numeric limits and traits, unsigned and boolean enums, zero-initialized 128-bit arrays, signed character promotion, and C++ names that collide with Java library classes or the generated entrypoint. Numeric equality is also tested through boxed container elements and references, including integers outside the boxing cache, NaN, and signed zero.
+
+GNU expression cases compare omitted-middle conditionals with side effects, lazy fallback evaluation, lvalue assignment and increment, immediate map insertion when binding a reference, local variable shadowing, record value copies, scalar rvalue-reference aliases, and temporary materialization. Statement expressions also open and close a file before the caller reads it, so resource lifetime is part of the execution check.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

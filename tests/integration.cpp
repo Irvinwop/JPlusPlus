@@ -165,7 +165,10 @@ int main() {
         for (int i = 0; i < 48; ++i)
             expressions << (i % 8 == 0 ? 0 : r(101) - 50) << ' ' << r(17) - 8 << '\n';
         cases.emplace_back("expressions", expressions.str());
+        cases.emplace_back("gnu", expressions.str());
         cases.emplace_back("coverage", "-19 37 5\n");
+        cases.emplace_back("constants", "-17\n");
+        cases.emplace_back("names", "-19\n");
         std::ostringstream library;
         library << 70 << '\n';
         for (int i = 0; i < 70; ++i)
