@@ -3,9 +3,17 @@ interface JppCopyable<T> {
     T copy();
 }
 
+interface JppAssignable<T> extends JppCopyable<T> {
+    T jppAssignFrom(T source);
+}
+interface JppUninitialized {}
+
 static abstract class JppRef<T> {
     abstract T get();
     abstract T set(T value);
+    JppPtr<T> pointer() {
+        return Jpp.address(this, this, "");
+    }
     static <T> JppRef<T> cell(T value) {
         return new JppRef<T>() {
             T data = value;
@@ -20,6 +28,10 @@ static abstract class JppRef<T> {
     }
     static <T> JppRef<T> of(java.util.function.Supplier<T> get,
                             java.util.function.Consumer<T> set) {
+        return of(get, set, (java.util.function.Supplier<JppPtr<T>>)null);
+    }
+    static <T> JppRef<T> of(java.util.function.Supplier<T> get, java.util.function.Consumer<T> set,
+                            java.util.function.Supplier<JppPtr<T>> location) {
         return new JppRef<T>() {
             T get() {
                 return get.get();
@@ -28,46 +40,64 @@ static abstract class JppRef<T> {
                 set.accept(v);
                 return v;
             }
+            JppPtr<T> pointer() {
+                return location == null ? super.pointer() : location.get();
+            }
         };
     }
-    static <O, T> JppRef<T> member(O object, java.util.function.Function<O, T> get,
+    static <T> JppRef<T> of(java.util.function.Supplier<T> get, java.util.function.Consumer<T> set,
+                            Object object, Object field) {
+        return new JppRef<T>() {
+            T get() {
+                return get.get();
+            }
+            T set(T v) {
+                set.accept(v);
+                return v;
+            }
+            JppPtr<T> pointer() {
+                return Jpp.address(this, object, field);
+            }
+        };
+    }
+    static <O, T> JppRef<T> member(O object, String field, java.util.function.Function<O, T> get,
                                    java.util.function.BiConsumer<O, T> set) {
-        return of(() -> get.apply(object), v -> set.accept(object, v));
+        return of(() -> get.apply(object), v -> set.accept(object, v), object, field);
     }
     static <T> JppRef<T> at(List<T> a, int i) {
-        return of(() -> a.get(i), v -> a.set(i, v));
+        return of(() -> a.get(i), v -> a.set(i, v), () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static <T> JppRef<T> at(T[] a, int i) {
-        return of(() -> a[i], v -> a[i] = v);
+        return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static <T> JppRef<T> at(JppIter<T> iterator) {
         JppIter<T> position = iterator.plus(0);
-        return of(position::get, position::put);
+        return of(position::get, position::put, () -> Jpp.pointer(position));
     }
     static <K, V> JppRef<V> at(JppMap<K, V> a, K i) {
         a.get(i);
-        return of(() -> a.get(i), v -> a.put(i, v));
+        return of(() -> a.get(i), v -> a.put(i, v), a, i);
     }
     static JppRef<Integer> at(int[] a, int i) {
-        return of(() -> a[i], v -> a[i] = v);
+        return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static JppRef<Long> at(long[] a, int i) {
-        return of(() -> a[i], v -> a[i] = v);
+        return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static JppRef<Double> at(double[] a, int i) {
-        return of(() -> a[i], v -> a[i] = v);
+        return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static JppRef<Float> at(float[] a, int i) {
-        return of(() -> a[i], v -> a[i] = v);
+        return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static JppRef<Boolean> at(boolean[] a, int i) {
-        return of(() -> a[i], v -> a[i] = v);
+        return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static JppRef<Character> at(char[] a, int i) {
-        return of(() -> a[i], v -> a[i] = v);
+        return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static JppRef<Character> at(JppString a, int i) {
-        return of(() -> a.get(i), v -> a.put(i, v));
+        return of(() -> a.get(i), v -> a.put(i, v), () -> Jpp.pointer(a.begin().plus(i)));
     }
 }
 
@@ -104,7 +134,7 @@ static <T> T jppCopy(T value) {
     return value;
 }
 
-static class JppPair<A, B> implements Comparable<JppPair<A, B>>, JppCopyable<JppPair<A, B>> {
+static class JppPair<A, B> implements Comparable<JppPair<A, B>>, JppAssignable<JppPair<A, B>> {
     A first;
     B second;
     JppPair(A a, B b) {
@@ -113,6 +143,11 @@ static class JppPair<A, B> implements Comparable<JppPair<A, B>>, JppCopyable<Jpp
     }
     public JppPair<A, B> copy() {
         return new JppPair<A, B>(jppCopy(first), jppCopy(second));
+    }
+    public JppPair<A, B> jppAssignFrom(JppPair<A, B> source) {
+        first = Jpp.assignValue(first, source.first);
+        second = Jpp.assignValue(second, source.second);
+        return this;
     }
     public int compareTo(JppPair<A, B> other) {
         int c = Jpp.compare(first, other.first);
@@ -130,13 +165,15 @@ static class JppPair<A, B> implements Comparable<JppPair<A, B>>, JppCopyable<Jpp
 }
 
 static class JppString
-    implements Comparable<JppString>, Iterable<Character>, JppCopyable<JppString> {
+    implements Comparable<JppString>, Iterable<Character>, JppAssignable<JppString> {
     private final StringBuilder data;
     JppString() {
         data = new StringBuilder();
     }
     JppString(Object value) {
-        data = new StringBuilder(String.valueOf(value));
+        data = new StringBuilder(value instanceof JppIter || value instanceof char[]
+                                     ? Jpp.cString(value)
+                                     : String.valueOf(value));
     }
     JppString(int count, char value) {
         data = new StringBuilder(count);
@@ -145,6 +182,13 @@ static class JppString
     }
     public JppString copy() {
         return new JppString(data);
+    }
+    public JppString jppAssignFrom(JppString source) {
+        if (source != this) {
+            data.setLength(0);
+            data.append(source.data);
+        }
+        return this;
     }
     int size() {
         return data.length();
@@ -163,7 +207,7 @@ static class JppString
         return value;
     }
     JppString append(Object value) {
-        data.append(value);
+        data.append(Jpp.cString(value));
         return this;
     }
     void push_back(char c) {
@@ -188,24 +232,27 @@ static class JppString
         return new JppString(data.substring(start, Math.min(size(), start + length)));
     }
     long find(Object value) {
-        int n = data.indexOf(value.toString());
+        int n = data.indexOf(Jpp.cString(value));
         return n < 0 ? -1L : n;
     }
     long find(Object value, int from) {
-        int n = data.indexOf(value.toString(), from);
+        int n = data.indexOf(Jpp.cString(value), from);
         return n < 0 ? -1L : n;
     }
     JppIter<Character> begin() {
-        return new JppIter<Character>(view(), 0, 1);
+        return new JppIter<Character>(view(), 0, 1, this);
     }
     JppIter<Character> end() {
-        return new JppIter<Character>(view(), size(), 1);
+        return new JppIter<Character>(view(), size(), 1, this);
     }
     JppIter<Character> rbegin() {
-        return new JppIter<Character>(view(), size() - 1, -1);
+        return new JppIter<Character>(view(), size() - 1, -1, this);
     }
     JppIter<Character> rend() {
-        return new JppIter<Character>(view(), -1, -1);
+        return new JppIter<Character>(view(), -1, -1, this);
+    }
+    JppPtr<Character> c_str() {
+        return new JppPtr<Character>(view(), 0, this);
     }
     private List<Character> view() {
         return new AbstractList<Character>() {
@@ -213,9 +260,11 @@ static class JppString
                 return data.length();
             }
             public Character get(int i) {
-                return data.charAt(i);
+                return i == data.length() ? '\0' : data.charAt(i);
             }
             public Character set(int i, Character c) {
+                if (i == data.length() && c == '\0')
+                    return c;
                 char old = data.charAt(i);
                 data.setCharAt(i, c);
                 return old;
@@ -241,13 +290,18 @@ static class JppString
 
 static class JppIter<T> implements JppCopyable<JppIter<T>> {
     final List<T> list;
+    final Object storage;
     int pos;
     final int step;
     JppIter() {
         this(null, 0, 1);
     }
     JppIter(List<T> values, int index, int direction) {
+        this(values, index, direction, values);
+    }
+    JppIter(List<T> values, int index, int direction, Object identity) {
         list = values;
+        storage = identity;
         pos = index;
         step = direction;
     }
@@ -262,7 +316,7 @@ static class JppIter<T> implements JppCopyable<JppIter<T>> {
         return value;
     }
     JppIter<T> plus(int offset) {
-        return new JppIter<T>(list, pos + offset * step, step);
+        return new JppIter<T>(list, pos + offset * step, step, storage);
     }
     JppIter<T> advance(int offset) {
         pos += offset * step;
@@ -278,6 +332,45 @@ static class JppIter<T> implements JppCopyable<JppIter<T>> {
     }
     boolean same(JppIter<?> other) {
         return pos == other.pos;
+    }
+}
+
+static class JppAddress {
+    final Object object;
+    final Object field;
+    JppAddress(Object object, Object field) {
+        this.object = object;
+        this.field = field;
+    }
+    public boolean equals(Object other) {
+        if (!(other instanceof JppAddress))
+            return false;
+        JppAddress address = (JppAddress)other;
+        return object == address.object && Objects.equals(field, address.field);
+    }
+    public int hashCode() {
+        return 31 * System.identityHashCode(object) + Objects.hashCode(field);
+    }
+}
+
+// A typed view of existing storage. Collections remain Java's standard collections.
+static class JppPtr<T> extends JppIter<T> {
+    JppPtr(List<T> values, int index, Object identity) {
+        super(values, index, 1, identity);
+    }
+    JppPtr<T> plus(int offset) {
+        return new JppPtr<T>(list, pos + offset, storage);
+    }
+    boolean same(JppIter<?> other) {
+        if (other == null)
+            return false;
+        if (pos == other.pos && (storage == other.storage ||
+                                 (storage instanceof JppAddress && storage.equals(other.storage))))
+            return true;
+        // A method's this pointer and an array element can name the same record.
+        return list != null && other.list != null && pos >= 0 && pos < list.size() &&
+            other.pos >= 0 && other.pos < other.list.size() && get() instanceof JppCopyable &&
+            get() == other.get();
     }
 }
 
@@ -348,7 +441,7 @@ static class JppTreeIter<T> extends JppIter<T> {
     }
 }
 
-static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppCopyable<JppMap<K, V>> {
+static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppMap<K, V>> {
     final Map<K, V> data;
     final java.util.function.Supplier<V> factory;
     JppMap(boolean ordered, java.util.function.Supplier<V> init) {
@@ -433,9 +526,17 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppCopyable<JppMap
             result.data.put(jppCopy(e.getKey()), jppCopy(e.getValue()));
         return result;
     }
+    public JppMap<K, V> jppAssignFrom(JppMap<K, V> source) {
+        if (source != this) {
+            JppMap<K, V> snapshot = source.copy();
+            data.clear();
+            data.putAll(snapshot.data);
+        }
+        return this;
+    }
 }
 
-static class JppSet<T> implements Iterable<T>, JppCopyable<JppSet<T>> {
+static class JppSet<T> implements Iterable<T>, JppAssignable<JppSet<T>> {
     final NavigableMap<T, Integer> data = new TreeMap<T, Integer>(Jpp::compare);
     final boolean multiple;
     int count;
@@ -560,6 +661,15 @@ static class JppSet<T> implements Iterable<T>, JppCopyable<JppSet<T>> {
         s.data.putAll(data);
         s.count = count;
         return s;
+    }
+    public JppSet<T> jppAssignFrom(JppSet<T> source) {
+        if (source != this) {
+            JppSet<T> snapshot = source.copy();
+            data.clear();
+            data.putAll(snapshot.data);
+            count = snapshot.count;
+        }
+        return this;
     }
 }
 
@@ -1392,6 +1502,74 @@ static final JppInput jppIn = new JppInput();
 static final JppOutput jppOut = new JppOutput(System.out), jppErr = new JppOutput(System.err);
 
 static class Jpp {
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    static <T> T assignValue(T target, T source) {
+        if (target instanceof JppAssignable) {
+            ((JppAssignable)target).jppAssignFrom(source);
+            return target;
+        }
+        if (target instanceof Collection && source instanceof Collection) {
+            if (target == source)
+                return target;
+            Collection snapshot = (Collection)jppCopy(source);
+            ((Collection)target).clear();
+            ((Collection)target).addAll(snapshot);
+            return target;
+        }
+        if (target != null && source != null && target.getClass().isArray()) {
+            for (int i = 0; i < java.lang.reflect.Array.getLength(target); ++i)
+                java.lang.reflect.Array.set(target, i,
+                                            assignValue(java.lang.reflect.Array.get(target, i),
+                                                        java.lang.reflect.Array.get(source, i)));
+            return target;
+        }
+        return jppCopy(source);
+    }
+    static <T> T assignRecord(T source, JppRef<T> target) {
+        T result = assignValue(target.get(), source);
+        target.set(result);
+        return result;
+    }
+    static <T> JppPtr<T> pointer(JppIter<T> at) {
+        return at == null ? null : new JppPtr<T>(at.list, at.pos, at.storage);
+    }
+    static <T> JppPtr<T> address(JppRef<T> value, Object object, Object field) {
+        List<T> view = new AbstractList<T>() {
+            public int size() {
+                return 1;
+            }
+            public T get(int index) {
+                if (index != 0)
+                    throw new IndexOutOfBoundsException();
+                return value.get();
+            }
+            public T set(int index, T item) {
+                T old = get(index);
+                value.set(item);
+                return old;
+            }
+        };
+        return new JppPtr<T>(view, 0, new JppAddress(object, field));
+    }
+    static <T> JppPtr<T> pointerValue(T value) {
+        return address(JppRef.cell(value), value, "");
+    }
+    static <T> JppPtr<T> allocate(int count, java.util.function.IntFunction<T> initializer) {
+        ArrayList<T> storage = new ArrayList<T>(count);
+        for (int i = 0; i < count; ++i)
+            storage.add(initializer.apply(i));
+        return new JppPtr<T>(storage, 0, storage);
+    }
+    static <T> JppPtr<T> updatePointer(JppRef<JppPtr<T>> target, int amount, boolean post) {
+        JppPtr<T> old = target.get();
+        JppPtr<T> next = old.plus(amount);
+        target.set(next);
+        return post ? old : next;
+    }
+    static boolean samePointer(JppIter<?> left, JppIter<?> right) {
+        return left == null ? right == null : pointer(left).same(right);
+    }
+    static void delete(JppPtr<?> pointer) {}
     static double unsignedDouble(long value) {
         return value >= 0 ? (double)value : (double)((value >>> 1) | (value & 1)) * 2.0;
     }
@@ -1555,6 +1733,13 @@ static class Jpp {
         return Arrays.copyOf(value.toCharArray(), size);
     }
     static String cString(Object value) {
+        if (value instanceof JppIter) {
+            JppIter<?> at = ((JppIter<?>)value).plus(0);
+            StringBuilder result = new StringBuilder();
+            for (char c; (c = (Character)at.get()) != '\0'; at.advance(1))
+                result.append(c);
+            return result.toString();
+        }
         if (value instanceof char[]) {
             char[] chars = (char[])value;
             int length = 0;
@@ -1597,6 +1782,15 @@ static class Jpp {
                 target[i] = text.charAt(i);
             if (conversion != 'c')
                 target[text.length()] = '\0';
+        };
+    }
+    static JppScanTarget scanChars(JppIter<Character> target) {
+        JppIter<Character> start = target.plus(0);
+        return (text, radix, conversion) -> {
+            for (int i = 0; i < text.length(); ++i)
+                start.plus(i).put(text.charAt(i));
+            if (conversion != 'c')
+                start.plus(text.length()).put('\0');
         };
     }
     static JppInput reopenInput(JppInput stream, String path, String mode) {
@@ -1868,13 +2062,17 @@ static class Jpp {
         return (int)lcm((long)a, b);
     }
     static JppString concat(Object a, Object b) {
-        return new JppString(String.valueOf(a) + b);
+        return new JppString(cString(a) + cString(b));
     }
     static <T> JppIter<T> begin(T[] a) {
-        return new JppIter<T>(Arrays.asList(a), 0, 1);
+        return new JppIter<T>(Arrays.asList(a), 0, 1, a);
     }
     static <T> JppIter<T> end(T[] a) {
-        return new JppIter<T>(Arrays.asList(a), a.length, 1);
+        return begin(a).plus(a.length);
+    }
+    static JppIter<Character> begin(String a) {
+        JppIter<Character> characters = begin(charArray(a, a.length() + 1));
+        return new JppIter<Character>(characters.list, 0, 1, a);
     }
     @SuppressWarnings("unchecked")
     static <T> List<T> arrayView(final Object a) {
@@ -1893,19 +2091,25 @@ static class Jpp {
         };
     }
     static JppIter<Integer> begin(int[] a) {
-        return new JppIter<Integer>(Jpp.<Integer>arrayView(a), 0, 1);
+        return new JppIter<Integer>(Jpp.<Integer>arrayView(a), 0, 1, a);
     }
     static JppIter<Long> begin(long[] a) {
-        return new JppIter<Long>(Jpp.<Long>arrayView(a), 0, 1);
+        return new JppIter<Long>(Jpp.<Long>arrayView(a), 0, 1, a);
     }
     static JppIter<Double> begin(double[] a) {
-        return new JppIter<Double>(Jpp.<Double>arrayView(a), 0, 1);
+        return new JppIter<Double>(Jpp.<Double>arrayView(a), 0, 1, a);
     }
     static JppIter<Character> begin(char[] a) {
-        return new JppIter<Character>(Jpp.<Character>arrayView(a), 0, 1);
+        return new JppIter<Character>(Jpp.<Character>arrayView(a), 0, 1, a);
     }
     static JppIter<Boolean> begin(boolean[] a) {
-        return new JppIter<Boolean>(Jpp.<Boolean>arrayView(a), 0, 1);
+        return new JppIter<Boolean>(Jpp.<Boolean>arrayView(a), 0, 1, a);
+    }
+    static JppIter<Float> begin(float[] a) {
+        return new JppIter<Float>(Jpp.<Float>arrayView(a), 0, 1, a);
+    }
+    static JppIter<Float> end(float[] a) {
+        return begin(a).plus(a.length);
     }
     static JppIter<Integer> end(int[] a) {
         return begin(a).plus(a.length);
@@ -2063,7 +2267,7 @@ static class Jpp {
         return jppIn.readByte();
     }
     static int puts(Object s) {
-        jppOut.print(s).print('\n');
+        jppOut.print(cString(s)).print('\n');
         return 0;
     }
     static int ignore(Object... values) {

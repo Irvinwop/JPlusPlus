@@ -18,6 +18,10 @@ Constant and naming cases exercise compile-time versus runtime evaluation, scala
 
 GNU expression cases compare omitted-middle conditionals with side effects, lazy fallback evaluation, lvalue assignment and increment, immediate map insertion when binding a reference, local variable shadowing, record value copies, scalar rvalue-reference aliases, and temporary materialization. Statement expressions also open and close a file before the caller reads it, so resource lifetime is part of the execution check.
 
+Pointer cases compare offsets, differences, unrelated allocations, scalar and pointer reference parameters, function-address identity and indirect calls, linked nodes, member access and addresses, array allocation and partial initialization, multidimensional arrays, void-pointer round trips, string-buffer identity, and vector data. Taking an address through a reference must retain the original array position and allocation; another function then uses that pointer to access a neighboring element.
+
+Object cases retain references and pointers across assignment, including members and array elements. They compare constructor side effects, aggregate default-member initialization, self references, user copy/move constructors and assignment operators, nested self-assignment, collection aliases, and returns of void expressions. These checks distinguish constructing a copy from assigning into an existing object.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

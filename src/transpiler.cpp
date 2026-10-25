@@ -403,12 +403,19 @@ class Emitter {
     std::unordered_set<const VarDecl*> cells;
     std::unordered_set<const VarDecl*> references;
     std::unordered_set<const VarDecl*> hoistedVariables;
+    std::unordered_set<const VarDecl*> selfInitialized;
     std::unordered_map<const LabelDecl*, std::string> jumpLabels;
     std::unordered_map<const FunctionProtoType*, std::string> functionTypes;
     std::vector<std::pair<const FunctionProtoType*, std::string>> interfaces;
+    struct FunctionPointerField {
+        const FunctionDecl* declaration;
+        std::string field, javaType;
+    };
+    std::vector<FunctionPointerField> functionPointers;
     const FunctionDecl* current = nullptr;
     std::vector<const FunctionDecl*> enclosingFunctions;
     const CXXRecordDecl* currentRecord = nullptr;
+    std::string constructionThis;
 
     [[noreturn]] void fail(SourceLocation loc, const std::string& message) const {
         auto p = sm.getPresumedLoc(sm.getExpansionLoc(loc));
@@ -458,6 +465,9 @@ class Emitter {
                     break;
                 case OO_EqualEqual:
                     base = "opEquals";
+                    break;
+                case OO_Equal:
+                    base = "assign";
                     break;
                 case OO_Plus:
                     base = "opPlus";
@@ -549,6 +559,10 @@ class Emitter {
         auto n = family(t);
         return n.find("iterator") != std::string::npos || n == "__normal_iterator";
     }
+    bool dataPointer(QualType t) const {
+        t = clean(t);
+        return t->isPointerType() && !t->getPointeeType()->isFunctionType();
+    }
     bool big(QualType t) const {
         t = clean(t);
         return t->isSpecificBuiltinType(BuiltinType::Int128) ||
@@ -620,6 +634,8 @@ class Emitter {
         auto t = clean(input);
         if (t->isVoidType())
             return "void";
+        if (t->isNullPtrType())
+            return "JppPtr<?>";
         if (t->isBooleanType())
             return "boolean";
         if (t->isCharType() || t->isChar16Type() ||
@@ -643,7 +659,7 @@ class Emitter {
             auto p = t->getPointeeType();
             if (p->isFunctionType())
                 return functionType(p->getAs<FunctionProtoType>());
-            return type(p) + "[]";
+            return "JppPtr<" + (p->isVoidType() ? std::string("?") : boxed(p)) + ">";
         }
         auto n = family(t);
         if (n == "basic_ifstream" || n == "basic_istream")
@@ -690,9 +706,22 @@ class Emitter {
         interfaces.emplace_back(f, n);
         return n;
     }
+    std::string functionPointer(const FunctionDecl* f, QualType target) {
+        f = f->getCanonicalDecl();
+        if (!user(f))
+            fail(f->getLocation(), "this library function pointer needs a Java adapter");
+        for (const auto& entry : functionPointers)
+            if (entry.declaration == f)
+                return entry.field;
+        auto field = temporary("jppFunction");
+        functionPointers.push_back({f, field, type(target)});
+        return field;
+    }
     std::string defaultValue(QualType t) {
         if (t->isReferenceType())
             t = t.getNonReferenceType();
+        if (t->isNullPtrType())
+            return "null";
         if (ctx.getAsArrayType(t))
             return newArray(t, nullptr);
         auto jt = type(t);
@@ -862,6 +891,8 @@ class Emitter {
         return s;
     }
     std::string value(const Expr* e, QualType target, bool copy = false) {
+        if (dataPointer(target))
+            return "Jpp.pointer(" + expr(e) + ")";
         auto s = expr(e);
         if (isString(target) && !isString(e->getType()))
             s = "new JppString(" + s + ")";
@@ -882,7 +913,8 @@ class Emitter {
         return converted(expr(e), e->getType(), ctx.IntTy);
     }
     bool scalarReference(QualType t) const {
-        return t->isReferenceType() && (clean(t)->isArithmeticType() || clean(t)->isEnumeralType());
+        return t->isReferenceType() &&
+               (clean(t)->isArithmeticType() || clean(t)->isEnumeralType() || dataPointer(t));
     }
     std::string parameterType(QualType t) {
         return scalarReference(t) ? "JppRef<" + boxed(t) + ">" : type(t);
@@ -954,6 +986,17 @@ class Emitter {
             for (auto decl : d->decls())
                 if (auto v = dyn_cast<VarDecl>(decl)) {
                     reservedNames.insert(identifier(v->getNameAsString()));
+                    std::function<bool(const Stmt*)> refersToSelf = [&](const Stmt* s) {
+                        if (!s)
+                            return false;
+                        if (auto ref = dyn_cast<DeclRefExpr>(s); ref && ref->getDecl() == v)
+                            return true;
+                        return std::any_of(s->child_begin(), s->child_end(), refersToSelf);
+                    };
+                    if (refersToSelf(v->getInit())) {
+                        cells.insert(v);
+                        selfInitialized.insert(v);
+                    }
                     if (auto bindings = dyn_cast<DecompositionDecl>(v))
                         for (auto b : bindings->bindings())
                             reservedNames.insert(identifier(b->getNameAsString()));
@@ -990,25 +1033,39 @@ class Emitter {
                         markReference(c->getArg(i));
         }
         if (auto c = dyn_cast<CompoundAssignOperator>(s);
-            c && (c->getRHS()->HasSideEffects(ctx) || big(c->getLHS()->getType())))
+            c && (c->getRHS()->HasSideEffects(ctx) || big(c->getLHS()->getType()) ||
+                  dataPointer(c->getLHS()->getType())))
             markReference(c->getLHS());
         if (auto b = dyn_cast<BinaryOperator>(s);
             b && b->isAssignmentOp() && isa<AbstractConditionalOperator>(bare(b->getLHS())))
             markReference(b->getLHS());
         if (auto u = dyn_cast<UnaryOperator>(s);
             u && u->isIncrementDecrementOp() &&
-            isa<AbstractConditionalOperator>(bare(u->getSubExpr())))
+            (isa<AbstractConditionalOperator>(bare(u->getSubExpr())) ||
+             dataPointer(u->getSubExpr()->getType())))
             markReference(u->getSubExpr());
-        if (auto u = dyn_cast<UnaryOperator>(s); u && u->getOpcode() == UO_AddrOf)
+        if (auto u = dyn_cast<UnaryOperator>(s); u && u->getOpcode() == UO_AddrOf) {
             markReference(u->getSubExpr());
+            markCapturedVariables(u);
+        }
         if (auto b = dyn_cast<BinaryOperator>(s);
             b && b->getOpcode() == BO_Comma &&
             (b->getLHS()->getType()->isVoidType() || b->getRHS()->getType()->isVoidType()))
             markCapturedVariables(b);
         if (auto c = dyn_cast<ConditionalOperator>(s); c && c->getType()->isVoidType())
             markCapturedVariables(c);
-        if (isa<BinaryConditionalOperator>(s) || isa<StmtExpr>(s))
+        if (isa<BinaryConditionalOperator>(s) || isa<StmtExpr>(s) || isa<CXXNewExpr>(s))
             markCapturedVariables(s);
+        if (auto list = dyn_cast<InitListExpr>(s);
+            list && record(list->getType()) && user(record(list->getType())))
+            for (auto init : list->inits())
+                if (isa<CXXDefaultInitExpr>(init)) {
+                    markCapturedVariables(list);
+                    break;
+                }
+        if (auto op = dyn_cast<CXXOperatorCallExpr>(s);
+            op && op->getOperator() == OO_Equal && op->getNumArgs() == 2)
+            markReference(op->getArg(0));
         if (auto op = dyn_cast<CXXOperatorCallExpr>(s);
             op && op->getOperator() == OO_GreaterGreater && op->getNumArgs() == 2 &&
             stream(op->getArg(0)->getType())) {
@@ -1067,32 +1124,49 @@ class Emitter {
             }
             if (v->hasGlobalStorage()) {
                 auto value = temporary("jppValue");
+                auto owner = v->isStaticDataMember()
+                                 ? name(cast<CXXRecordDecl>(v->getDeclContext()))
+                                 : options.className;
                 return "JppRef.of(() -> " + expr(e) + ", " + value + " -> " + expr(e) + " = " +
-                       value + ")";
+                       value + ", " + owner + ".class, " + quote(name(v)) + ")";
             }
         }
         auto [base, index] = subscript(e);
+        if (base && dataPointer(base->getType()) && !ctx.getAsArrayType(bare(base)->getType()))
+            return "JppRef.at(" + expr(base) + ".plus(" + intArgument(index) + "))";
         if (base)
-            return "JppRef.at(" + expr(base) + ", " +
+            return "JppRef.at(" + expr(bare(base)) + ", " +
                    (isMap(base->getType()) ? expr(index) : intArgument(index)) + ")";
+        if (auto dereference = dyn_cast<UnaryOperator>(bare(e));
+            dereference && dereference->getOpcode() == UO_Deref)
+            return "JppRef.at(" + expr(dereference->getSubExpr()) + ")";
         if (auto m = dyn_cast<MemberExpr>(bare(e))) {
-            auto base = expr(m->getBase());
+            auto base = isa<CXXThisExpr>(bare(m->getBase()))
+                            ? (constructionThis.empty() ? "this" : constructionThis)
+                            : expr(m->getBase());
             if (m->isArrow() && !isa<CXXThisExpr>(bare(m->getBase()))) {
-                if (!isIter(m->getBase()->getType()))
-                    fail(e, "raw pointer member references are not supported");
                 base += ".get()";
             }
             auto object = temporary("jppObject"), value = temporary("jppValue");
             auto member = object + "." + name(m->getMemberDecl());
-            return "JppRef.member(" + base + ", " + object + " -> " + member + ", (" + object +
-                   ", " + value + ") -> " + member + " = " + value + ")";
+            return "JppRef.member(" + base + ", " + quote(name(m->getMemberDecl())) + ", " +
+                   object + " -> " + member + ", (" + object + ", " + value + ") -> " + member +
+                   " = " + value + ")";
         }
         if (e->isLValue())
             fail(e, "this reference binding is not supported");
         return "JppRef.cell(" + expr(e) + ")";
     }
+    std::string address(const Expr* e) {
+        if (auto dereference = dyn_cast<UnaryOperator>(bare(e));
+            dereference && dereference->getOpcode() == UO_Deref)
+            return "Jpp.pointer(" + expr(dereference->getSubExpr()) + ")";
+        return "(" + reference(e) + ").pointer()";
+    }
     std::string booleanValue(const std::string& s, QualType t) {
         t = clean(t);
+        if (t->isNullPtrType())
+            return "Jpp.last(" + s + ", false)";
         if (t->isBooleanType())
             return s;
         if (t->isCharType() && ctx.getTypeSize(t) == 8)
@@ -1302,13 +1376,18 @@ class Emitter {
         if (auto v = variableRef(lhs); cell(v))
             return reference(lhs) + ".set(" + rhs + ")";
         auto [base, index] = subscript(lhs);
+        if (base && dataPointer(base->getType()) && !ctx.getAsArrayType(bare(base)->getType()))
+            return expr(base) + ".plus(" + intArgument(index) + ").put(" + rhs + ")";
+        if (base && ctx.getAsArrayType(bare(base)->getType()))
+            return expr(bare(base)) + "[" + intArgument(index) + "] = " + rhs;
         if (base && isVec(base->getType()))
             return "Jpp.set(" + expr(base) + ", " + intArgument(index) + ", " + rhs + ")";
         if (base && (isMap(base->getType()) || isString(base->getType())))
             return expr(base) + ".put(" +
                    (isMap(base->getType()) ? expr(index) : intArgument(index)) + ", " + rhs + ")";
         if (auto u = dyn_cast<UnaryOperator>(bare(lhs));
-            u && u->getOpcode() == UO_Deref && isIter(u->getSubExpr()->getType()))
+            u && u->getOpcode() == UO_Deref &&
+            (isIter(u->getSubExpr()->getType()) || dataPointer(u->getSubExpr()->getType())))
             return expr(u->getSubExpr()) + ".put(" + rhs + ")";
         return expr(lhs) + " = " + rhs;
     }
@@ -1361,6 +1440,14 @@ class Emitter {
         return e->HasSideEffects(ctx);
     }
     std::string compoundAssignment(const CompoundAssignOperator* e) {
+        if (dataPointer(e->getLHS()->getType())) {
+            if (clean(e->getLHS()->getType())->getPointeeType()->isVoidType())
+                fail(e, "GNU void-pointer arithmetic needs byte-addressed storage");
+            auto left = temporary("jppPointer"), right = temporary("jppOffset");
+            return "Jpp.compound(" + intArgument(e->getRHS()) + ", " + reference(e->getLHS()) +
+                   ", (" + left + ", " + right + ") -> " + left + ".plus(" +
+                   (e->getOpcode() == BO_SubAssign ? "-(" + right + ")" : right) + "))";
+        }
         auto lhs = e->getLHS(), rhs = e->getRHS();
         auto t = clean(lhs->getType());
         if (!t->isArithmeticType() && !t->isEnumeralType())
@@ -1378,8 +1465,9 @@ class Emitter {
             dr && aliases.count(dr->getDecl()) && aliases[dr->getDecl()].ends_with(".get()");
         if (!addressHasSideEffects(lhs) && !cell(variableRef(lhs)) && !referenceAlias &&
             !rhs->HasSideEffects(ctx)) {
-            bool javaLvalue =
-                dr || isa<MemberExpr>(bare(lhs)) || isa<ArraySubscriptExpr>(bare(lhs));
+            auto indexed = dyn_cast<ArraySubscriptExpr>(bare(lhs));
+            bool javaLvalue = dr || isa<MemberExpr>(bare(lhs)) ||
+                              (indexed && ctx.getAsArrayType(bare(indexed->getBase())->getType()));
             if (javaLvalue && !t->isBooleanType() && !big(t) &&
                 ctx.hasSameType(t, clean(computeResult)) &&
                 !(t->isUnsignedIntegerType() && (op == "/" || op == "%"))) {
@@ -1395,9 +1483,12 @@ class Emitter {
                ") -> " + calculate(left, right) + ")";
     }
     std::string binary(const Expr* lhs, const Expr* rhs, std::string op, QualType result) {
-        auto position = [&](QualType t) {
-            return isIter(t) || (t->isPointerType() && t->getPointeeType()->isArithmeticType());
-        };
+        if ((op == "+" || op == "-") && ((dataPointer(lhs->getType()) &&
+                                          clean(lhs->getType())->getPointeeType()->isVoidType()) ||
+                                         (dataPointer(rhs->getType()) &&
+                                          clean(rhs->getType())->getPointeeType()->isVoidType())))
+            fail(lhs, "GNU void-pointer arithmetic needs byte-addressed storage");
+        auto position = [&](QualType t) { return isIter(t) || dataPointer(t); };
         if ((op == "+=" || op == "-=") && isIter(lhs->getType()))
             return "Jpp.advance(" + std::string(op == "-=" ? "-(" : "(") + intArgument(rhs) +
                    "), " + expr(lhs) + ")";
@@ -1408,6 +1499,9 @@ class Emitter {
             return ctx.getTypeSize(clean(result)) > 32 ? "(long)(" + difference + ")" : difference;
         }
         if (op == "=") {
+            if (clean(lhs->getType())->isRecordType())
+                return "Jpp.assignRecord(" + value(rhs, lhs->getType(), false) + ", " +
+                       reference(lhs) + ")";
             auto v = value(rhs, lhs->getType(), true);
             if (!isa<DeclRefExpr>(bare(lhs)) &&
                 (addressHasSideEffects(lhs) || rhs->HasSideEffects(ctx)))
@@ -1440,6 +1534,13 @@ class Emitter {
             return "(" + truth(lhs) + " " + op + " " + truth(rhs) + ")";
         bool comparison =
             op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=";
+        if (comparison && !isString(lhs->getType()) && !isString(rhs->getType()) &&
+            (dataPointer(lhs->getType()) || dataPointer(rhs->getType()))) {
+            if (op == "==" || op == "!=")
+                return std::string(op == "!=" ? "!" : "") + "Jpp.samePointer(" + expr(lhs) + ", " +
+                       expr(rhs) + ")";
+            return "(" + expr(lhs) + ".minus(" + expr(rhs) + ") " + op + " 0)";
+        }
         if (isIter(lhs->getType()) || isIter(rhs->getType())) {
             if (op == "==" || op == "!=")
                 return (op == "!=" ? "!" : "") + expr(lhs) + ".same(" + expr(rhs) + ")";
@@ -1458,8 +1559,8 @@ class Emitter {
             if (op == "+")
                 return "Jpp.concat(" + expr(lhs) + ", " + expr(rhs) + ")";
             if (comparison)
-                return "(" + expr(lhs) + ".toString().compareTo(" + expr(rhs) + ".toString()) " +
-                       op + " 0)";
+                return "(Jpp.cString(" + expr(lhs) + ").compareTo(Jpp.cString(" + expr(rhs) +
+                       ")) " + op + " 0)";
         }
         if (comparison && (lhs->getType()->isRecordType() || rhs->getType()->isRecordType()))
             return "(Jpp.compare(" + expr(lhs) + ", " + expr(rhs) + ") " + op + " 0)";
@@ -1473,13 +1574,18 @@ class Emitter {
         for (auto a : c->arguments())
             if (!isa<CXXDefaultArgExpr>(a))
                 args.push_back(a);
-        if (c->getConstructor()->isCopyOrMoveConstructor() && !args.empty())
+        if (c->getConstructor()->isCopyOrMoveConstructor() && !args.empty()) {
+            auto constructor = c->getConstructor();
+            if (user(constructor) && !constructor->isImplicit() && !constructor->isDefaulted())
+                return "new " + type(t) + "(" + expr(args[0]) +
+                       (constructor->isMoveConstructor() ? ", true" : "") + ")";
             return "jppCopy(" + expr(args[0]) + ")";
+        }
         if (args.empty())
             return defaultValue(t);
         auto n = family(t);
         if (fileStream(t)) {
-            std::vector<std::string> a = {expr(args[0]) + ".toString()"};
+            std::vector<std::string> a = {"Jpp.cString(" + expr(args[0]) + ")"};
             if (args.size() > 1)
                 a.push_back(expr(args[1]));
             return "new " + type(t) + "(" + join(a) + ")";
@@ -1537,12 +1643,8 @@ class Emitter {
         return "new " + type(t) + "(" + join(a) + ")";
     }
     std::string asIterator(const Expr* e) {
-        e = strip(e);
-        auto b = bare(e);
-        if (ctx.getAsArrayType(b->getType()))
-            return "Jpp.begin(" + expr(b) + ")";
-        if (e->getType()->isPointerType() && !isIter(b->getType()) && isa<DeclRefExpr>(b))
-            return "Jpp.begin(" + expr(b) + ")";
+        if (ctx.getAsArrayType(e->getType()))
+            return "Jpp.begin(" + expr(e) + ")";
         return expr(e);
     }
     std::string elementConstruction(QualType target, const std::vector<const Expr*>& args) {
@@ -1659,7 +1761,7 @@ class Emitter {
             if (n == "sync_with_stdio" || (n == "tie" && stream(ot)))
                 return "Jpp.ignore()";
             if (stream(ot)) {
-                auto object = expr(obj);
+                auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
                 if (n == "operator bool")
                     return object + ".good";
                 if (n == "good")
@@ -1673,7 +1775,7 @@ class Emitter {
                 if (n == "close" || n == "is_open")
                     return object + "." + n + "()";
                 if (n == "open") {
-                    auto path = expr(c->getArg(0)) + ".toString()";
+                    auto path = "Jpp.cString(" + expr(c->getArg(0)) + ")";
                     if (c->getNumArgs() > 1 && !isa<CXXDefaultArgExpr>(c->getArg(1)))
                         path += ", " + expr(c->getArg(1));
                     return object + ".open(" + path + ")";
@@ -1699,7 +1801,7 @@ class Emitter {
                 args.push_back(f && user(f) && scalarReference(target) ? reference(a)
                                                                        : value(a, target, true));
             }
-            auto o = expr(obj);
+            auto o = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
             if (n == "size" || n == "length" || n == "capacity")
                 return integerResult(c, o + "." + n + "()");
             bool deque = family(ot) == "queue" || family(ot) == "deque" || family(ot) == "stack";
@@ -1801,7 +1903,9 @@ class Emitter {
                 }
             }
             if (n == "c_str" && isString(ot))
-                return o + ".toString()";
+                return o + ".c_str()";
+            if (n == "data" && isVec(ot))
+                return "Jpp.pointer(Jpp.begin(" + o + "))";
             if (n == "pop" && family(ot) == "stack")
                 return o + ".pop_back()";
             if (user(me->getMemberDecl()))
@@ -1896,16 +2000,23 @@ class Emitter {
                     address && address->getOpcode() == UO_AddrOf)
                     destination = address->getSubExpr();
                 auto array = ctx.getAsArrayType(arg->getType());
-                auto target = destination ? destination->getType()
-                              : array     ? array->getElementType()
-                                          : QualType();
+                auto target = destination                   ? destination->getType()
+                              : array                       ? array->getElementType()
+                              : dataPointer(arg->getType()) ? arg->getType()->getPointeeType()
+                                                            : QualType();
                 if (target.isNull())
                     fail(arg, "scanf destination needs an address or an array");
                 if (array && target->isCharType()) {
                     a.push_back("Jpp.scanChars(" + expr(arg) + ")");
                     continue;
                 }
-                auto ref = destination ? reference(destination) : "JppRef.at(" + expr(arg) + ", 0)";
+                if (!destination && target->isCharType()) {
+                    a.push_back("Jpp.scanChars(" + expr(arg) + ")");
+                    continue;
+                }
+                auto ref = destination ? reference(destination)
+                           : array     ? "JppRef.at(" + expr(arg) + ", 0)"
+                                       : "JppRef.at(" + expr(arg) + ")";
                 auto jt = type(target);
                 if (jt == "char")
                     a.push_back("Jpp.scanChar(" + ref + ")");
@@ -1932,8 +2043,8 @@ class Emitter {
                        (streamName == "stdin"    ? "jppIn"
                         : streamName == "stdout" ? "jppOut"
                                                  : "jppErr") +
-                       ", " + expr(c->getArg(0)) + ".toString(), " + expr(c->getArg(1)) +
-                       ".toString())";
+                       ", Jpp.cString(" + expr(c->getArg(0)) + "), Jpp.cString(" +
+                       expr(c->getArg(1)) + "))";
             fail(c, "freopen needs a supported C standard stream");
         }
         if (n == "puts" || n == "putchar" || n == "getchar")
@@ -2301,10 +2412,13 @@ class Emitter {
         if (auto x = dyn_cast<ImplicitCastExpr>(e)) {
             auto sub = x->getSubExpr();
             switch (x->getCastKind()) {
+            case CK_ArrayToPointerDecay:
+                return "Jpp.pointer(Jpp.begin(" + expr(sub) + "))";
+            case CK_NullToPointer:
+                return sub->HasSideEffects(ctx) ? "Jpp.last(" + expr(sub) + ", null)" : "null";
             case CK_FunctionToPointerDecay:
                 if (auto d = dyn_cast<DeclRefExpr>(bare(sub)); d && isa<FunctionDecl>(d->getDecl()))
-                    return "(" + type(x->getType()) + ") (" + options.className +
-                           "::" + name(d->getDecl()) + ")";
+                    return functionPointer(cast<FunctionDecl>(d->getDecl()), x->getType());
                 return expr(sub);
             case CK_IntegralToBoolean:
             case CK_FloatingToBoolean:
@@ -2322,6 +2436,21 @@ class Emitter {
         if (auto x = dyn_cast<BuiltinBitCastExpr>(e))
             return bitCast(x->getSubExpr(), x->getType());
         if (auto x = dyn_cast<ExplicitCastExpr>(e)) {
+            if (x->getCastKind() == CK_NullToPointer)
+                return x->getSubExpr()->HasSideEffects(ctx)
+                           ? "Jpp.last(" + expr(x->getSubExpr()) + ", null)"
+                           : "null";
+            if (x->getCastKind() == CK_IntegralToPointer)
+                fail(e, "integer-derived pointer addresses need additional storage lowering");
+            if (x->getCastKind() == CK_PointerToIntegral)
+                fail(e, "converting pointer addresses to integers needs byte-addressed storage");
+            if (x->getCastKind() == CK_BitCast && dataPointer(x->getType()) &&
+                dataPointer(x->getSubExpr()->getType())) {
+                auto from = clean(x->getSubExpr()->getType()->getPointeeType());
+                auto to = clean(x->getType()->getPointeeType());
+                if (!from->isVoidType() && !to->isVoidType() && !ctx.hasSameType(from, to))
+                    fail(e, "pointer reinterpretation between element types needs byte storage");
+            }
             if (x->getType()->isVoidType() && x->getSubExpr()->getType()->isVoidType())
                 return expr(x->getSubExpr());
             if (x->getType()->isVoidType())
@@ -2391,13 +2520,27 @@ class Emitter {
             auto s = expr(a);
             if (x->getOpcode() == UO_LNot)
                 return "(!" + truth(a) + ")";
-            if (x->getOpcode() == UO_Deref && isIter(a->getType()))
-                return s + ".get()";
+            if (x->getOpcode() == UO_Deref && a->getType()->isFunctionPointerType())
+                return s;
+            if (x->getOpcode() == UO_Deref && (isIter(a->getType()) || dataPointer(a->getType())))
+                return isa<CXXThisExpr>(bare(a))
+                           ? (constructionThis.empty() ? "this" : constructionThis)
+                           : s + ".get()";
+            if (x->getOpcode() == UO_AddrOf && a->getType()->isFunctionType()) {
+                if (auto d = dyn_cast<DeclRefExpr>(bare(a)))
+                    return functionPointer(cast<FunctionDecl>(d->getDecl()), x->getType());
+                return expr(a);
+            }
             if (x->getOpcode() == UO_AddrOf)
-                fail(e, "address-taking requires a pointer backend; pass containers by reference "
-                        "instead");
+                return address(a);
             if (x->isIncrementDecrementOp()) {
                 int delta = x->isIncrementOp() ? 1 : -1;
+                if (dataPointer(a->getType())) {
+                    if (clean(a->getType())->getPointeeType()->isVoidType())
+                        fail(e, "GNU void-pointer arithmetic needs byte-addressed storage");
+                    return "Jpp.updatePointer(" + reference(a) + ", " + std::to_string(delta) +
+                           ", " + (x->isPostfix() ? "true" : "false") + ")";
+                }
                 if (isa<AbstractConditionalOperator>(bare(a)))
                     return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
                            (x->isPostfix() ? "true" : "false") + ")";
@@ -2411,9 +2554,17 @@ class Emitter {
                 if (isIter(a->getType()))
                     return s + (x->isPostfix() ? ".post(" : ".advance(") + std::to_string(delta) +
                            ")";
+                if (auto dereference = dyn_cast<UnaryOperator>(bare(a));
+                    dereference && dereference->getOpcode() == UO_Deref &&
+                    (dataPointer(dereference->getSubExpr()->getType()) ||
+                     isIter(dereference->getSubExpr()->getType())))
+                    return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
+                           (x->isPostfix() ? "true" : "false") + ")";
                 if (auto [base, index] = subscript(a);
                     base &&
-                    (isVec(base->getType()) || isMap(base->getType()) || isString(base->getType())))
+                    (isVec(base->getType()) || isMap(base->getType()) ||
+                     isString(base->getType()) ||
+                     (dataPointer(base->getType()) && !ctx.getAsArrayType(bare(base)->getType()))))
                     return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
                            (x->isPostfix() ? "true" : "false") + ")";
                 if (big(a->getType())) {
@@ -2449,15 +2600,16 @@ class Emitter {
         if (auto x = dyn_cast<ArraySubscriptExpr>(e)) {
             auto index = intArgument(x->getIdx());
             if (isa<StringLiteral>(bare(x->getBase())))
-                return expr(x->getBase()) + ".charAt(" + index + ")";
-            return expr(x->getBase()) + "[" + index + "]";
+                return expr(bare(x->getBase())) + ".charAt(" + index + ")";
+            if (ctx.getAsArrayType(bare(x->getBase())->getType()))
+                return expr(bare(x->getBase())) + "[" + index + "]";
+            return expr(x->getBase()) + ".plus(" + index + ").get()";
         }
         if (auto x = dyn_cast<MemberExpr>(e)) {
             if (isa<CXXThisExpr>(bare(x->getBase())))
-                return "this." + name(x->getMemberDecl());
+                return (constructionThis.empty() ? "this" : constructionThis) + "." +
+                       name(x->getMemberDecl());
             auto base = expr(x->getBase());
-            if (x->isArrow() && !isIter(x->getBase()->getType()))
-                fail(e, "raw pointer member access is not supported");
             if (x->isArrow())
                 base += ".get()";
             if (!user(x->getMemberDecl())) {
@@ -2503,7 +2655,8 @@ class Emitter {
             }
             if (x->getNumArgs() == 2) {
                 if (auto f = x->getDirectCallee();
-                    f && user(f) && isa<CXXMethodDecl>(f) && op != OO_Equal)
+                    f && user(f) && isa<CXXMethodDecl>(f) &&
+                    (op != OO_Equal || (!f->isImplicit() && !f->isDefaulted())))
                     return expr(x->getArg(0)) + "." + name(f) + "(" + expr(x->getArg(1)) + ")";
                 return binary(x->getArg(0), x->getArg(1), getOperatorSpelling(op), x->getType());
             }
@@ -2513,6 +2666,28 @@ class Emitter {
         }
         if (auto x = dyn_cast<CallExpr>(e))
             return call(x);
+        if (auto x = dyn_cast<CXXNewExpr>(e)) {
+            if (x->getNumPlacementArgs())
+                fail(e, "placement new needs additional object lifetime lowering");
+            auto allocated = x->getAllocatedType();
+            auto count = x->isArray() ? intArgument(*x->getArraySize()) : "1";
+            auto index = temporary("jppIndex");
+            std::string init = defaultValue(allocated);
+            if (auto initializer = x->getInitializer()) {
+                if (x->isArray()) {
+                    auto list = dyn_cast<InitListExpr>(bare(initializer));
+                    if (!list)
+                        fail(e, "this array new initializer needs additional lowering");
+                    for (unsigned i = list->getNumInits(); i-- > 0;)
+                        init = "(" + index + " == " + std::to_string(i) + " ? " +
+                               value(list->getInit(i), allocated, true) + " : " + init + ")";
+                } else
+                    init = value(initializer, allocated, true);
+            }
+            return "Jpp.allocate(" + count + ", " + index + " -> " + init + ")";
+        }
+        if (auto x = dyn_cast<CXXDeleteExpr>(e))
+            return "Jpp.delete(" + expr(x->getArgument()) + ")";
         if (auto x = dyn_cast<CXXConstructExpr>(e))
             return construct(x);
         if (auto x = dyn_cast<CXXScalarValueInitExpr>(e))
@@ -2530,6 +2705,31 @@ class Emitter {
                 return "new " + type(t) + "(Arrays.asList(" + join(a) + "))";
             }
             if (auto r = record(t)) {
+                if (x->getNumInits() == 1 &&
+                    ctx.hasSameType(clean(x->getInit(0)->getType()), clean(t)))
+                    return "jppCopy(" + expr(x->getInit(0)) + ")";
+                if (user(r) && r->isAggregate() &&
+                    std::any_of(x->inits().begin(), x->inits().end(),
+                                [](const Expr* init) { return isa<CXXDefaultInitExpr>(init); }))
+                    return supplier([&] {
+                        auto object = temporary("jppAggregate");
+                        line(type(t) + " " + object + " = new " + type(t) +
+                             "((JppUninitialized)null);");
+                        unsigned i = 0;
+                        for (auto field : r->fields()) {
+                            auto init = i < x->getNumInits() ? x->getInit(i) : nullptr;
+                            auto previous = constructionThis;
+                            if (init && isa<CXXDefaultInitExpr>(init))
+                                constructionThis = object;
+                            line(object + "." + name(field) + " = " +
+                                 (init ? value(init, field->getType(), true)
+                                       : defaultValue(field->getType())) +
+                                 ";");
+                            constructionThis = std::move(previous);
+                            ++i;
+                        }
+                        line("return " + object + ";");
+                    });
                 unsigned i = 0;
                 for (auto field : r->fields()) {
                     a.push_back(i < x->getNumInits() ? value(x->getInit(i), field->getType(), true)
@@ -2569,7 +2769,8 @@ class Emitter {
         if (auto x = dyn_cast<TypeTraitExpr>(e))
             return x->getValue() ? "true" : "false";
         if (isa<CXXThisExpr>(e))
-            return "this";
+            return "Jpp.pointerValue(" + (constructionThis.empty() ? "this" : constructionThis) +
+                   ")";
         if (auto x = dyn_cast<LambdaExpr>(e))
             return lambda(x);
         if (auto x = dyn_cast<SubstNonTypeTemplateParmExpr>(e))
@@ -2657,7 +2858,8 @@ class Emitter {
         } else
             init = defaultValue(t);
         if (cells.count(v)) {
-            if (v->getInit() && (family(t) == "function" || (record(t) && record(t)->isLambda())))
+            if (v->getInit() && (selfInitialized.count(v) || family(t) == "function" ||
+                                 (record(t) && record(t)->isLambda())))
                 return "final JppRef<" + boxed(t) + "> " + name(v) + " = JppRef.cell(null); " +
                        name(v) + ".set(" + init + ")";
             return "final JppRef<" + boxed(t) + "> " + name(v) + " = JppRef.cell(" + init + ")";
@@ -2951,7 +3153,8 @@ class Emitter {
                     if (!hoistedVariables.count(v))
                         line(variable(v) + ";");
                 } else if (isa<TypedefNameDecl>(decl) || isa<UsingDecl>(decl) ||
-                           isa<UsingDirectiveDecl>(decl) || isa<StaticAssertDecl>(decl))
+                           isa<UsingDirectiveDecl>(decl) || isa<StaticAssertDecl>(decl) ||
+                           isa<CXXRecordDecl>(decl) || isa<EnumDecl>(decl))
                     continue;
                 else
                     fail(s, "unsupported local declaration");
@@ -2976,7 +3179,11 @@ class Emitter {
         if (auto r = dyn_cast<ReturnStmt>(s)) {
             if (!r->getRetValue())
                 line("return;");
-            else
+            else if (r->getRetValue()->getType()->isVoidType()) {
+                expressionStatement(r->getRetValue());
+                if (!terminates(bare(r->getRetValue())))
+                    line("return;");
+            } else
                 line("return " +
                      value(r->getRetValue(),
                            current ? current->getReturnType() : r->getRetValue()->getType(), true) +
@@ -3207,8 +3414,10 @@ class Emitter {
             }
             if (auto td = dyn_cast<FunctionTemplateDecl>(d)) {
                 for (auto f : td->specializations())
-                    if (f->hasBody() && collected.insert(f->getCanonicalDecl()).second)
+                    if (f->hasBody() && collected.insert(f->getCanonicalDecl()).second) {
                         functions.push_back(f);
+                        collect(f);
+                    }
                 continue;
             }
             if (auto td = dyn_cast<ClassTemplateDecl>(d)) {
@@ -3231,8 +3440,10 @@ class Emitter {
             if (auto f = dyn_cast<FunctionDecl>(d)) {
                 if (f->doesThisDeclarationHaveABody() && !f->isImplicit() &&
                     !f->getDescribedFunctionTemplate() &&
-                    collected.insert(f->getCanonicalDecl()).second)
+                    collected.insert(f->getCanonicalDecl()).second) {
                     functions.push_back(f);
+                    collect(f);
+                }
                 continue;
             }
             if (auto v = dyn_cast<VarDecl>(d)) {
@@ -3254,12 +3465,14 @@ class Emitter {
                 line("// consteval " + f->getNameAsString() + " was evaluated during translation.");
             return;
         }
-        if (auto m = dyn_cast<CXXMethodDecl>(f); m && m->isCopyAssignmentOperator())
+        if (auto m = dyn_cast<CXXMethodDecl>(f);
+            m && m->isCopyAssignmentOperator() && (m->isImplicit() || m->isDefaulted()))
             return;
         if (isa<CXXDestructorDecl>(f))
             fail(f->getLocation(),
                  "user-defined destructors require deterministic lifetime support");
-        if (auto c = dyn_cast<CXXConstructorDecl>(f); c && c->isCopyOrMoveConstructor())
+        if (auto c = dyn_cast<CXXConstructorDecl>(f);
+            c && c->isCopyOrMoveConstructor() && (c->isImplicit() || c->isDefaulted()))
             return;
         current = f;
         source(f);
@@ -3270,15 +3483,28 @@ class Emitter {
                              (cells.count(p) && !references.count(p) ? "jppParam_" : "") + name(p));
         }
         if (auto ctor = dyn_cast<CXXConstructorDecl>(f)) {
+            if (ctor->isMoveConstructor())
+                params.push_back("boolean " + temporary("jppMove"));
             line(name(ctor->getParent()) + "(" + join(params) + ")");
             line("{");
             ++indent;
-            for (auto init : ctor->inits()) {
+            for (auto p : f->parameters())
+                if (cells.count(p) && !references.count(p))
+                    line("final JppRef<" + boxed(p->getType()) + "> " + name(p) +
+                         " = JppRef.cell(jppParam_" + name(p) + ");");
+            for (auto init : ctor->inits())
                 if (!init->isMemberInitializer())
                     fail(f->getLocation(),
                          "base and delegating constructors are not supported yet");
-                line("this." + name(init->getMember()) + " = " +
-                     value(init->getInit(), init->getMember()->getType(), true) + ";");
+            for (auto field : ctor->getParent()->fields()) {
+                const Expr* initializer = nullptr;
+                for (auto init : ctor->inits())
+                    if (init->getMember() == field)
+                        initializer = init->getInit();
+                line("this." + name(field) + " = " +
+                     (initializer ? value(initializer, field->getType(), true)
+                                  : defaultValue(field->getType())) +
+                     ";");
             }
             if (auto b = dyn_cast<CompoundStmt>(f->getBody()))
                 bodyStatements(b);
@@ -3321,11 +3547,11 @@ class Emitter {
                 lt = m;
             }
         auto n = name(r);
-        line("static class " + n + " implements JppCopyable<" + n + ">" +
+        line("static class " + n + " implements JppAssignable<" + n + ">" +
              (less ? ", Comparable<" + n + ">" : ""));
         line("{");
         ++indent;
-        std::vector<std::string> params, assignments;
+        std::vector<std::string> params, assignments, defaults;
         for (auto decl : r->decls())
             if (auto field = dyn_cast<VarDecl>(decl); field && field->isStaticDataMember()) {
                 auto definition = field->getDefinition();
@@ -3351,12 +3577,19 @@ class Emitter {
             auto init = field->hasInClassInitializer()
                             ? value(field->getInClassInitializer(), field->getType(), true)
                             : defaultValue(field->getType());
-            line(type(field->getType()) + " " + name(field) + " = " + init + ";");
+            line(type(field->getType()) + " " + name(field) + ";");
+            defaults.push_back("this." + name(field) + " = " + init + ";");
             params.push_back(type(field->getType()) + " " + name(field));
             assignments.push_back("this." + name(field) + " = " + name(field) + ";");
         }
         if (r->isAggregate()) {
-            line(n + "() {}");
+            line(n + "(JppUninitialized " + temporary("jppUninitialized") + ") {}");
+            line(n + "() {");
+            ++indent;
+            for (auto d : defaults)
+                line(d);
+            --indent;
+            line("}");
             if (!params.empty()) {
                 line(n + "(" + join(params) + ") {");
                 ++indent;
@@ -3366,13 +3599,56 @@ class Emitter {
                 line("}");
             }
         }
-        line(n + "(" + n + " other) {");
+        const CXXConstructorDecl* customCopy = nullptr;
+        const CXXMethodDecl* customAssignment = nullptr;
+        bool emittedDefault = r->isAggregate();
+        for (auto method : r->methods()) {
+            if (method->isCopyAssignmentOperator() && !method->isImplicit() &&
+                !method->isDefaulted() && method->hasBody())
+                customAssignment = method;
+            if (auto constructor = dyn_cast<CXXConstructorDecl>(method)) {
+                if (constructor->isCopyConstructor() && !constructor->isImplicit() &&
+                    !constructor->isDefaulted() && constructor->hasBody()) {
+                    if (customCopy)
+                        fail(r->getLocation(),
+                             "multiple copy constructors need distinct Java signatures");
+                    customCopy = constructor;
+                }
+                if (constructor->getNumParams() == 0 && constructor->hasBody())
+                    emittedDefault = true;
+            }
+        }
+        if (!emittedDefault && !r->hasUserDeclaredConstructor()) {
+            line(n + "() {");
+            ++indent;
+            for (auto d : defaults)
+                line(d);
+            --indent;
+            line("}");
+        }
+        if (!customCopy) {
+            line(n + "(" + n + " other) {");
+            ++indent;
+            for (auto field : r->fields())
+                line("this." + name(field) + " = jppCopy(other." + name(field) + ");");
+            --indent;
+            line("}");
+        }
+        line("public " + n + " copy() { return new " + n + "(this); }");
+        line("public " + n + " jppAssignFrom(" + n + " other) {");
         ++indent;
-        for (auto field : r->fields())
-            line("this." + name(field) + " = jppCopy(other." + name(field) + ");");
+        if (customAssignment)
+            line(name(customAssignment) + "(other);");
+        else
+            for (auto field : r->fields())
+                line("this." + name(field) + " = " +
+                     (copyType(field->getType())
+                          ? "Jpp.assignValue(this." + name(field) + ", other." + name(field) + ")"
+                          : "jppCopy(other." + name(field) + ")") +
+                     ";");
+        line("return this;");
         --indent;
         line("}");
-        line("public " + n + " copy() { return new " + n + "(this); }");
         if (less)
             line("public int compareTo(" + n + " other) { return " + name(lt) +
                  "(other) ? -1 : other." + name(lt) + "(this) ? 1 : 0; }");
@@ -3484,6 +3760,15 @@ class Emitter {
         }
         line();
         auto program = out.str();
+        std::string pointerFields;
+        for (const auto& entry : functionPointers) {
+            auto owner = isa<CXXMethodDecl>(entry.declaration)
+                             ? name(cast<CXXMethodDecl>(entry.declaration)->getParent())
+                             : options.className;
+            pointerFields += "static final " + entry.javaType + " " + entry.field + " = " + owner +
+                             "::" + name(entry.declaration) + ";\n";
+        }
+        program.insert(startupAt, pointerFields);
         std::string startup;
         auto support = supportFor(program, startup);
         program.insert(startupAt, startup);

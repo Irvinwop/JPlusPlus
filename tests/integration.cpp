@@ -166,6 +166,8 @@ int main() {
             expressions << (i % 8 == 0 ? 0 : r(101) - 50) << ' ' << r(17) - 8 << '\n';
         cases.emplace_back("expressions", expressions.str());
         cases.emplace_back("gnu", expressions.str());
+        cases.emplace_back("pointers", expressions.str());
+        cases.emplace_back("objects", expressions.str());
         cases.emplace_back("coverage", "-19 37 5\n");
         cases.emplace_back("constants", "-17\n");
         cases.emplace_back("names", "-19\n");
