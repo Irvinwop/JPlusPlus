@@ -174,6 +174,7 @@ int main() {
         cases.emplace_back("gnu", expressions.str());
         cases.emplace_back("pointers", expressions.str());
         cases.emplace_back("memory", expressions.str());
+        cases.emplace_back("chrono", expressions.str());
         cases.emplace_back("objects", expressions.str());
         cases.emplace_back("statics", expressions.str());
         cases.emplace_back("calls", expressions.str());

@@ -62,6 +62,7 @@ const std::set<std::string> javaRuntimeNames = {
     "System",
     "Runtime",
     "OutOfMemoryError",
+    "InterruptedException",
     "Thread",
     "Class",
     "Arrays",
@@ -630,6 +631,26 @@ class Emitter {
     std::string targetLittleEndian() const {
         return ctx.getTargetInfo().isBigEndian() ? "false" : "true";
     }
+    bool chrono(QualType t) const {
+        return family(t) == "duration" || family(t) == "time_point";
+    }
+    std::string chronoPeriod(QualType t) {
+        if (family(t) == "time_point")
+            t = element(t, 1);
+        auto rep = clean(element(t));
+        if (!rep->isSignedIntegerType() || ctx.getTypeSize(rep) != 64)
+            fail(SourceLocation(),
+                 "this chrono representation needs additional arithmetic lowering");
+        auto ratio = templateArgs(element(t, 1));
+        return number(ratio[0].getAsIntegral()) + "L, " + number(ratio[1].getAsIntegral()) + "L";
+    }
+    std::string chronoValue(QualType t, const std::string& value, bool duration = false,
+                            const std::string& rounding = "cast") {
+        auto result =
+            duration ? "(" + value + ").convert(" + chronoPeriod(t) + ", " + quote(rounding) + ")"
+                     : "new JppDuration(" + value + ", " + chronoPeriod(t) + ")";
+        return family(t) == "time_point" ? "new JppTimePoint(" + result + ")" : result;
+    }
     bool big(QualType t) const {
         t = clean(t);
         return t->isSpecificBuiltinType(BuiltinType::Int128) ||
@@ -731,6 +752,10 @@ class Emitter {
             return "JppPtr<" + (p->isVoidType() ? std::string("?") : boxed(p)) + ">";
         }
         auto n = family(t);
+        if (chrono(t)) {
+            chronoPeriod(t);
+            return n == "duration" ? "JppDuration" : "JppTimePoint";
+        }
         if (n == "basic_ifstream" || n == "basic_istream")
             return "JppInput";
         if (n == "basic_ofstream" || n == "basic_ostream")
@@ -851,6 +876,8 @@ class Emitter {
             return mtEngine(t);
         if (family(t) == "seed_seq")
             return "new JppSeedSeq()";
+        if (chrono(t))
+            return chronoValue(t, "0L");
         if (family(t) == "less" || family(t) == "greater")
             return element(t)->isVoidType()
                        ? "(" + jt + ") ((a, b) -> Jpp.compare(a, b) " +
@@ -1665,6 +1692,8 @@ class Emitter {
         auto t = op->getArg(1)->getType();
         if (family(t) == "mersenne_twister_engine")
             fail(op, "Mersenne Twister stream serialization needs additional lowering");
+        if (family(t) == "time_point")
+            fail(op, "calendar and time-point text output needs additional lowering");
         if (t->isPointerType() && t->getPointeeType()->isCharType())
             s = "Jpp.cString(" + s + ")";
         else if (unsignedLong(t))
@@ -1912,6 +1941,50 @@ class Emitter {
                ") -> " + calculate(left, right) + ")";
     }
     std::string binary(const Expr* lhs, const Expr* rhs, std::string op, QualType result) {
+        if ((chrono(lhs->getType()) || chrono(rhs->getType())) && op != "=" && op != ",") {
+            bool leftPoint = family(lhs->getType()) == "time_point";
+            bool rightPoint = family(rhs->getType()) == "time_point";
+            bool leftDuration = family(lhs->getType()) == "duration";
+            bool rightDuration = family(rhs->getType()) == "duration";
+            auto left = expr(lhs), right = expr(rhs);
+            bool comparison =
+                op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=";
+            if (comparison && ((leftPoint && rightPoint) || (leftDuration && rightDuration)))
+                return "(" + left + ".compare(" + right + ") " + op + " 0)";
+            if ((op == "+=" || op == "-=") && rightDuration) {
+                return std::string(leftPoint ? "JppTimePoint.shiftAssign("
+                                             : "JppDuration.addAssign(") +
+                       right + ", " + left + ", " + (op == "-=" ? "true" : "false") + ")";
+            }
+            if (leftDuration && (op == "*=" || op == "/=" || op == "%="))
+                return "JppDuration.scaleAssign(" + value(rhs, ctx.LongLongTy) + ", " + left +
+                       ", " + quote(op.substr(0, 1)) + ")";
+            if (leftDuration && rightDuration) {
+                if (op == "+" || op == "-")
+                    return left + ".add(" + right + ", " + (op == "-" ? "true" : "false") + ", " +
+                           chronoPeriod(result) + ")";
+                if (op == "/")
+                    return converted(left + ".quotient(" + right + ")", ctx.LongLongTy, result);
+                if (op == "%")
+                    return left + ".remainder(" + right + ", " + chronoPeriod(result) + ")";
+            }
+            if (leftPoint && rightPoint && op == "-")
+                return left + ".difference(" + right + ", " + chronoPeriod(result) + ")";
+            if (leftPoint && rightDuration && (op == "+" || op == "-"))
+                return left + ".shift(" + right + ", " + (op == "-" ? "true" : "false") + ", " +
+                       chronoPeriod(result) + ")";
+            if (leftDuration && rightPoint && op == "+")
+                return right + ".shift(" + left + ", false, " + chronoPeriod(result) + ")";
+            if (leftDuration && !chrono(rhs->getType()) && (op == "*" || op == "/" || op == "%")) {
+                chronoPeriod(result);
+                return left + ".scale(" + value(rhs, ctx.LongLongTy) + ", " + quote(op) + ")";
+            }
+            if (!chrono(lhs->getType()) && rightDuration && op == "*") {
+                chronoPeriod(result);
+                return right + ".scale(" + value(lhs, ctx.LongLongTy) + ", \"*\")";
+            }
+            fail(lhs, "this chrono operator needs additional lowering");
+        }
         if ((op == "+" || op == "-") && ((dataPointer(lhs->getType()) &&
                                           clean(lhs->getType())->getPointeeType()->isVoidType()) ||
                                          (dataPointer(rhs->getType()) &&
@@ -2035,6 +2108,16 @@ class Emitter {
         if (args.empty())
             return defaultValue(t);
         auto n = family(t);
+        if (chrono(t)) {
+            if (args.size() != 1)
+                fail(c, "this chrono constructor needs additional lowering");
+            auto source = expr(args[0]);
+            if (family(args[0]->getType()) == "time_point")
+                source += ".time_since_epoch()";
+            return chronoValue(t,
+                               chrono(args[0]->getType()) ? source : value(args[0], ctx.LongLongTy),
+                               chrono(args[0]->getType()));
+        }
         if (n == "mersenne_twister_engine") {
             if (args.size() == 1 && family(args[0]->getType()) == "seed_seq")
                 return mtEngine(t, expr(args[0]));
@@ -2378,6 +2461,39 @@ class Emitter {
                     return "Jpp.last(" + expr(member->getBase()) + ", " + result + ")";
                 return result;
             }
+        if (f && !user(f))
+            if (auto owner = dyn_cast<CXXRecordDecl>(f->getDeclContext())) {
+                auto clock = owner->getNameAsString(), method = f->getNameAsString();
+                if ((clock == "system_clock" || clock == "steady_clock") && method == "now")
+                    return chronoPeriod(c->getType()) == "1L, 1000000000L"
+                               ? "JppTimePoint.now(" +
+                                     std::string(clock == "steady_clock" ? "true" : "false") + ")"
+                               : chronoValue(
+                                     c->getType(),
+                                     "JppTimePoint.now(" +
+                                         std::string(clock == "steady_clock" ? "true" : "false") +
+                                         ").time_since_epoch()",
+                                     true);
+                if (clock == "system_clock" && method == "from_time_t")
+                    return chronoValue(c->getType(),
+                                       "new JppDuration(" + value(c->getArg(0), ctx.LongLongTy) +
+                                           ", 1L, 1L)",
+                                       true);
+                if (clock == "system_clock" && method == "to_time_t")
+                    return converted(expr(c->getArg(0)) +
+                                         ".time_since_epoch().convert(1L, 1L, \"cast\").count()",
+                                     ctx.LongLongTy, c->getType());
+                if (chrono(ctx.getRecordType(owner)) &&
+                    (method == "zero" || method == "min" || method == "max")) {
+                    auto result = chronoValue(c->getType(), method == "zero"  ? "0L"
+                                                            : method == "min" ? "Long.MIN_VALUE"
+                                                                              : "Long.MAX_VALUE");
+                    if (auto member = dyn_cast<MemberExpr>(bare(c->getCallee()));
+                        member && member->getBase()->HasSideEffects(ctx))
+                        result = "Jpp.last(" + expr(member->getBase()) + ", " + result + ")";
+                    return result;
+                }
+            }
         if (auto m = dyn_cast<CXXMemberCallExpr>(c)) {
             auto me = dyn_cast<MemberExpr>(bare(m->getCallee()));
             if (!me)
@@ -2393,6 +2509,12 @@ class Emitter {
                 return object + "." + allocatedName + "(" + arguments(c, f) + ")";
             }
             auto n = me->getMemberDecl()->getNameAsString();
+            if (chrono(ot)) {
+                auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                if (n == "count" || n == "time_since_epoch")
+                    return object + "." + n + "()";
+                fail(c, "unsupported chrono member " + n);
+            }
             if (family(ot) == "mersenne_twister_engine") {
                 auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
                 if (n == "operator()")
@@ -2705,6 +2827,33 @@ class Emitter {
             return prefix + name(f) + "(" + arguments(c, f) + ")";
         }
         auto memoryOperation = n.starts_with("__builtin_") ? n.substr(10) : n;
+        if (isa<UserDefinedLiteral>(c) && family(c->getType()) == "duration" &&
+            c->getNumArgs() == 1)
+            return chronoValue(c->getType(), value(c->getArg(0), ctx.LongLongTy));
+        if (isa<UserDefinedLiteral>(c) && family(c->getType()) == "duration") {
+            Expr::EvalResult evaluated;
+            if (c->EvaluateAsRValue(evaluated, ctx) && evaluated.Val.isStruct() &&
+                evaluated.Val.getStructNumFields() == 1 && evaluated.Val.getStructField(0).isInt())
+                return chronoValue(
+                    c->getType(),
+                    integerLiteral(evaluated.Val.getStructField(0).getInt(), ctx.LongLongTy));
+            fail(c, "this duration literal needs additional constant-value lowering");
+        }
+        if (c->getNumArgs() && chrono(c->getArg(0)->getType())) {
+            auto source = expr(c->getArg(0));
+            if (n == "sleep_for" &&
+                f->getQualifiedNameAsString().find("this_thread") != std::string::npos)
+                return "JppTimePoint.sleep(" + source + ")";
+            if (n == "abs" && family(c->getArg(0)->getType()) == "duration")
+                return source + ".absolute()";
+            if (n == "duration_cast" || n == "time_point_cast" || n == "floor" || n == "ceil" ||
+                n == "round") {
+                if (family(c->getArg(0)->getType()) == "time_point")
+                    source += ".time_since_epoch()";
+                return chronoValue(c->getType(), source, true,
+                                   n == "floor" || n == "ceil" || n == "round" ? n : "cast");
+            }
+        }
         if (memoryOperation == "memcpy" || memoryOperation == "memmove" ||
             memoryOperation == "memcmp")
             return "Jpp." + memoryOperation + "(" + expr(c->getArg(0)) + ", " + expr(c->getArg(1)) +
@@ -3520,6 +3669,16 @@ class Emitter {
                 return outputChain(x);
             if (op == OO_GreaterGreater && x->getNumArgs() == 2 && stream(x->getArg(0)->getType()))
                 return inputExpression(x);
+            if (x->getNumArgs() && family(x->getArg(0)->getType()) == "duration") {
+                auto object = expr(x->getArg(0));
+                if (op == OO_Minus && x->getNumArgs() == 1)
+                    return object + ".negate()";
+                if (op == OO_Plus && x->getNumArgs() == 1)
+                    return "jppCopy(" + object + ")";
+                if (op == OO_PlusPlus || op == OO_MinusMinus)
+                    return object + ".update(" + (op == OO_PlusPlus ? "1" : "-1") + ", " +
+                           (x->getNumArgs() > 1 ? "true" : "false") + ")";
+            }
             if (x->getNumArgs() && bitReference(x->getArg(0)->getType())) {
                 if (op == OO_Equal && x->getNumArgs() == 2)
                     return "JppBitRef.assign(" + expr(x->getArg(1)) + ", " + expr(x->getArg(0)) +

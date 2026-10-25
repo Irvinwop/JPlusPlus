@@ -1072,6 +1072,200 @@ static class JppString
     }
 }
 
+static class JppDuration implements JppAssignable<JppDuration>, Comparable<JppDuration> {
+    long ticks;
+    final long numerator, denominator;
+    JppDuration(long ticks, long numerator, long denominator) {
+        this.ticks = ticks;
+        long divisor = Jpp.gcd(numerator, denominator);
+        this.numerator = numerator / divisor;
+        this.denominator = denominator / divisor;
+    }
+    long count() {
+        return ticks;
+    }
+    public JppDuration copy() {
+        return new JppDuration(ticks, numerator, denominator);
+    }
+    public JppDuration jppAssignFrom(JppDuration source) {
+        ticks = source.convert(numerator, denominator, "cast").ticks;
+        return this;
+    }
+    JppDuration convert(long targetNumerator, long targetDenominator, String rounding) {
+        BigInteger top = BigInteger.valueOf(ticks)
+                             .multiply(BigInteger.valueOf(numerator))
+                             .multiply(BigInteger.valueOf(targetDenominator));
+        BigInteger bottom =
+            BigInteger.valueOf(denominator).multiply(BigInteger.valueOf(targetNumerator));
+        BigInteger[] division = top.divideAndRemainder(bottom);
+        BigInteger result = division[0];
+        int sign = division[1].signum();
+        if ((rounding.equals("floor") && sign < 0) || (rounding.equals("ceil") && sign > 0))
+            result = result.add(BigInteger.valueOf(sign));
+        if (rounding.equals("round")) {
+            int comparison = division[1].abs().shiftLeft(1).compareTo(bottom);
+            if (comparison > 0 || (comparison == 0 && result.testBit(0)))
+                result = result.add(BigInteger.valueOf(sign));
+        }
+        return new JppDuration(result.longValue(), targetNumerator, targetDenominator);
+    }
+    JppDuration add(JppDuration other, boolean subtract, long targetNumerator,
+                    long targetDenominator) {
+        long left = convert(targetNumerator, targetDenominator, "cast").ticks;
+        long right = other.convert(targetNumerator, targetDenominator, "cast").ticks;
+        return new JppDuration(subtract ? left - right : left + right, targetNumerator,
+                               targetDenominator);
+    }
+    JppDuration scale(long value, String operation) {
+        return new JppDuration(operation.equals("*")   ? ticks * value
+                               : operation.equals("/") ? ticks / value
+                                                       : ticks % value,
+                               numerator, denominator);
+    }
+    JppDuration remainder(JppDuration other, long numerator, long denominator) {
+        long left = convert(numerator, denominator, "cast").ticks;
+        long right = other.convert(numerator, denominator, "cast").ticks;
+        return new JppDuration(left % right, numerator, denominator);
+    }
+    long quotient(JppDuration other) {
+        long numerator = Jpp.gcd(this.numerator, other.numerator);
+        long denominator =
+            BigInteger.valueOf(this.denominator)
+                .divide(BigInteger.valueOf(Jpp.gcd(this.denominator, other.denominator)))
+                .multiply(BigInteger.valueOf(other.denominator))
+                .longValueExact();
+        return convert(numerator, denominator, "cast").ticks /
+            other.convert(numerator, denominator, "cast").ticks;
+    }
+    static JppDuration addAssign(JppDuration right, JppDuration left, boolean subtract) {
+        return left.jppAssignFrom(left.add(right, subtract, left.numerator, left.denominator));
+    }
+    static JppDuration scaleAssign(long right, JppDuration left, String operation) {
+        return left.jppAssignFrom(left.scale(right, operation));
+    }
+    JppDuration negate() {
+        return new JppDuration(-ticks, numerator, denominator);
+    }
+    JppDuration absolute() {
+        return ticks < 0 ? negate() : copy();
+    }
+    JppDuration update(int increment, boolean post) {
+        JppDuration previous = post ? copy() : this;
+        ticks += increment;
+        return previous;
+    }
+    int compare(JppDuration other) {
+        BigInteger left = BigInteger.valueOf(ticks)
+                              .multiply(BigInteger.valueOf(numerator))
+                              .multiply(BigInteger.valueOf(other.denominator));
+        BigInteger right = BigInteger.valueOf(other.ticks)
+                               .multiply(BigInteger.valueOf(other.numerator))
+                               .multiply(BigInteger.valueOf(denominator));
+        return left.compareTo(right);
+    }
+    public int compareTo(JppDuration other) {
+        return compare(other);
+    }
+    String suffix() {
+        if (numerator == 1) {
+            long[] divisors = {1000000000000000000L,
+                               1000000000000000L,
+                               1000000000000L,
+                               1000000000L,
+                               1000000L,
+                               1000L,
+                               100L,
+                               10L,
+                               1L};
+            String[] names = {"as", "fs", "ps", "ns", "us", "ms", "cs", "ds", "s"};
+            for (int i = 0; i < divisors.length; ++i)
+                if (denominator == divisors[i])
+                    return names[i];
+        }
+        if (denominator == 1) {
+            long[] multiples = {10L,
+                                100L,
+                                1000L,
+                                1000000L,
+                                1000000000L,
+                                1000000000000L,
+                                1000000000000000L,
+                                1000000000000000000L,
+                                60L,
+                                3600L,
+                                86400L};
+            String[] names = {"das", "hs", "ks", "Ms", "Gs", "Ts", "Ps", "Es", "min", "h", "d"};
+            for (int i = 0; i < multiples.length; ++i)
+                if (numerator == multiples[i])
+                    return names[i];
+        }
+        return "[" + numerator + (denominator == 1 ? "" : "/" + denominator) + "]s";
+    }
+    public String toString() {
+        return Long.toString(ticks) + suffix();
+    }
+}
+
+static class JppTimePoint implements JppAssignable<JppTimePoint>, Comparable<JppTimePoint> {
+    final JppDuration elapsed;
+    JppTimePoint(JppDuration duration) {
+        elapsed = duration.copy();
+    }
+    public JppTimePoint copy() {
+        return new JppTimePoint(elapsed);
+    }
+    public JppTimePoint jppAssignFrom(JppTimePoint source) {
+        elapsed.jppAssignFrom(source.elapsed);
+        return this;
+    }
+    JppDuration time_since_epoch() {
+        return elapsed.copy();
+    }
+    JppTimePoint shift(JppDuration amount, boolean subtract, long numerator, long denominator) {
+        return new JppTimePoint(elapsed.add(amount, subtract, numerator, denominator));
+    }
+    JppDuration difference(JppTimePoint other, long numerator, long denominator) {
+        return elapsed.add(other.elapsed, true, numerator, denominator);
+    }
+    static JppTimePoint shiftAssign(JppDuration right, JppTimePoint left, boolean subtract) {
+        left.elapsed.jppAssignFrom(
+            left.elapsed.add(right, subtract, left.elapsed.numerator, left.elapsed.denominator));
+        return left;
+    }
+    int compare(JppTimePoint other) {
+        return elapsed.compare(other.elapsed);
+    }
+    public int compareTo(JppTimePoint other) {
+        return compare(other);
+    }
+    static JppTimePoint now(boolean steady) {
+        long nanoseconds;
+        if (steady)
+            nanoseconds = System.nanoTime();
+        else {
+            java.time.Instant instant = java.time.Instant.now();
+            nanoseconds = instant.getEpochSecond() * 1000000000L + instant.getNano();
+        }
+        return new JppTimePoint(new JppDuration(nanoseconds, 1L, 1000000000L));
+    }
+    static void sleep(JppDuration duration) {
+        if (duration.ticks <= 0)
+            return;
+        BigInteger nanos = BigInteger.valueOf(duration.ticks)
+                               .multiply(BigInteger.valueOf(duration.numerator))
+                               .multiply(BigInteger.valueOf(1000000000L))
+                               .add(BigInteger.valueOf(duration.denominator - 1))
+                               .divide(BigInteger.valueOf(duration.denominator));
+        BigInteger[] parts = nanos.divideAndRemainder(BigInteger.valueOf(1000000L));
+        try {
+            Thread.sleep(parts[0].longValueExact(), parts[1].intValue());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interrupted);
+        }
+    }
+}
+
 static class JppIter<T> implements JppCopyable<JppIter<T>> {
     final List<T> list;
     final Object storage;

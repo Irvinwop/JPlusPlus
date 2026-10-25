@@ -58,6 +58,8 @@ Deque cases grow and wrap the buffer, retain element references and pointers, an
 
 Byte-memory cases compare partial copies between unlike element widths, byte stores through field and local aliases, both directions of overlapping moves, and return-address identity. The native oracle also checks short signedness, 128-bit representations, allocation zeroing and resize preservation, string-buffer terminators, unsigned byte comparisons and searches, quiet-NaN payloads, signed zero, and overlapping transfers larger than the scratch buffer. Ordinary Java array and field accesses must observe mutations made through byte pointers.
 
+Chrono cases compare positive and negative duration casts, half-way rounding, mixed rational periods, arithmetic, comparisons, sorting, independent copies, assignment through retained references, time-point casts, epoch conversions, literals, and duration suffixes. Live readings must advance after a timed wait and fall within the expected Unix-epoch range. These properties catch constant clock stubs and incorrect timestamp units without comparing nondeterministic readings from separate executions.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:
