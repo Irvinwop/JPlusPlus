@@ -2943,7 +2943,10 @@ class Emitter {
                 return truth(x->getSubExpr());
             if (x->getType()->isArithmeticType() || x->getType()->isEnumeralType())
                 return value(x->getSubExpr(), x->getType());
-            return "(" + type(x->getType()) + ")(" + expr(x->getSubExpr()) + ")";
+            if (clean(x->getType())->isRecordType() &&
+                ctx.hasSameType(clean(x->getType()), clean(x->getSubExpr()->getType())))
+                return expr(x->getSubExpr());
+            return "((" + type(x->getType()) + ")(" + expr(x->getSubExpr()) + "))";
         }
         if (auto x = dyn_cast<CompoundAssignOperator>(e))
             return compoundAssignment(x);

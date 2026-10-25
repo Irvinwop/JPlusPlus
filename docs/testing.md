@@ -40,6 +40,8 @@ Binding cases mutate structs, pairs, built-in arrays, and `std::array` through s
 
 Bitset cases instantiate sizes 0, 1, 16, 63, 64, 65, and 129. They compare word-boundary and oversized shifts, masked complements, numeric and string construction, string prefixes with custom digits, unsigned conversion, GNU bit searches, and hashed keys copied before mutation. Proxy copies remain aliases across assignment and swap. Sequencing cases mutate an index or source bit during assignment so reading a proxy at the wrong time changes the result.
 
+Cast regressions chain methods after temporary construction and mutate arrays through explicitly cast pointers. These check that a Java cast applies to its operand before a following member access or subscript.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

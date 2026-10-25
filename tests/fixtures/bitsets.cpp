@@ -74,6 +74,12 @@ int main() {
         unsigned long long amount = (shift & 256) ? (1ULL << 32) + shift % 140 : shift % 140;
         BitSet named{shift};
         cout << named.count((unsigned)value) << '\n';
+        cout << bitset<16>(value).to_string().substr(3) << '\n';
+        int numbers[3]{(int)shift, (int)value, 7};
+        void* raw = numbers;
+        static_cast<int*>(raw)[1] ^= numbers[0];
+        ((int*)raw)[2] = numbers[1] & 0x7fff;
+        cout << numbers[1] << ' ' << numbers[2] << ' ' << ((int*)raw)[1] << '\n';
         exercise<0>(value, amount, shift);
         exercise<1>(value, amount, shift);
         exercise<16>(value, amount, shift);
