@@ -8,6 +8,7 @@
 #include <map>
 #include <random>
 #include <regex>
+#include <set>
 #include <signal.h>
 #include <sstream>
 #include <stdexcept>
@@ -289,8 +290,20 @@ int main() {
             compilerVersions[tool] = version(tool, true);
         for (auto& tool : javas)
             runtimeVersions[tool] = version(tool, false);
+        std::set<std::string> selected;
+        if (const char* selection = std::getenv("JPP_TEST_CASES"); selection && *selection) {
+            for (const auto& name : configured("JPP_TEST_CASES", "")) {
+                if (name != "cli" &&
+                    std::none_of(cases.begin(), cases.end(),
+                                 [&](const auto& test) { return test.first == name; }))
+                    throw std::runtime_error("unknown test case: " + name);
+                selected.insert(name);
+            }
+        }
         std::string cxx = std::getenv("CXX") ? std::getenv("CXX") : "g++";
         for (const auto& [name, input] : cases) {
+            if (!selected.empty() && !selected.count(name))
+                continue;
             auto source = (fs::path(JPP_SOURCE) / "tests/fixtures" / (name + ".cpp")).string();
             write(p / "input", input);
             write(p / "jpp-redirect.in", input);
@@ -370,6 +383,10 @@ int main() {
                 }
             }
             std::cout << "PASS " << name << std::endl;
+        }
+        if (!selected.empty() && !selected.count("cli")) {
+            std::cout << checks << " compiler/runtime differential checks passed\n";
+            return 0;
         }
         // Rejection must preserve an existing submission, including across a failed --check.
         write(p / "bad.cpp", "int main(){ asm volatile(\"nop\"); }\n");

@@ -10,6 +10,7 @@ int freeDefault(int amount = next(), int& target = shared) {
     return target;
 }
 struct Methods {
+    static const int scale = 7;
     int value;
     Methods(int amount = next(), int& target = shared) : value(amount) {
         target -= amount;
@@ -24,7 +25,7 @@ struct Methods {
         return value - amount;
     }
     int capacity(int amount) {
-        return value * amount;
+        return value * amount + scale;
     }
     int sync_with_stdio(int amount) {
         value += amount;

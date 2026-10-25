@@ -48,6 +48,8 @@ The local torture matrix has been exercised with these independent compilers and
 
 Set `JPP_TEST_JAVACS` and `JPP_TEST_JAVAS` to colon-separated executable paths. The harness skips releases that a selected compiler or runtime cannot support. ECJ is capped at release 17 for compatibility with Ubuntu's packaged version.
 
+`JPP_TEST_CASES` selects colon-separated fixture names, such as `calls:statics:switches`. Include `cli` to run the CLI checks. Leaving it unset runs the entire suite. Each harness process uses its own temporary directory, so disjoint selections can run concurrently.
+
 When the selected runtime is Java 8, Ubuntu's ECJ may itself need a newer JVM. Use `tests/ecj.sh` as the compiler path and set `JPP_ECJ_JAVA` to a current Java executable. This separates the JVM running the compiler from the JVM running the generated program.
 
 The source corpus used to guide development is private and is not distributed. A corpus compile check means only that generated output compiles. Behavioral claims come from programs executed against the native oracle. Incomplete sources, missing headers, and native frontend failures must not be counted as successful translations. A valid library file without `main` can count toward compile coverage; execution requires a driver.

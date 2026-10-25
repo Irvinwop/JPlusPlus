@@ -2543,12 +2543,12 @@ class Emitter {
                 }
                 fail(e, "unsupported library value '" + d->getQualifiedNameAsString() + "'");
             }
+            if (auto v = dyn_cast<VarDecl>(d); v && v->isStaticDataMember())
+                return name(cast<CXXRecordDecl>(v->getDeclContext())) + "." + name(v);
             if (auto v = dyn_cast<VarDecl>(d); v && (v->isFileVarDecl() || v->hasExternalStorage()))
                 return options.className + "." + name(v) + (cell(v) ? ".get()" : "");
             if (auto v = dyn_cast<VarDecl>(d); cell(v))
                 return name(d) + ".get()";
-            if (auto v = dyn_cast<VarDecl>(d); v && v->isStaticDataMember())
-                return name(cast<CXXRecordDecl>(v->getDeclContext())) + "." + name(v);
             if (isa<EnumConstantDecl>(d))
                 return options.className + "." + name(d);
             return name(d);
