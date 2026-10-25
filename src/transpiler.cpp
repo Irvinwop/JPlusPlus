@@ -422,6 +422,9 @@ class Emitter {
     std::unordered_map<const FunctionDecl*, std::map<std::string, int>> localNames;
     std::vector<const FunctionDecl*> functions;
     std::vector<const CXXRecordDecl*> records;
+    std::vector<const CXXMethodDecl*> defaultedMoves;
+    std::unordered_set<const CXXMethodDecl*> requiredDefaultedMoves;
+    std::vector<std::pair<const CXXRecordDecl*, size_t>> recordOperationsAt;
     std::vector<const VarDecl*> globals;
     std::vector<const EnumDecl*> enums;
     std::unordered_set<const Decl*> collected;
@@ -816,19 +819,48 @@ class Emitter {
     bool tupleLike(QualType t) const {
         return product(t) || family(t) == "array";
     }
-    bool containsVector(QualType t) {
+    bool containsVector(QualType t, std::unordered_set<const Type*>& visited) {
+        if (t->isReferenceType() || t->isPointerType())
+            return false;
         t = clean(t);
+        if (!visited.insert(t.getTypePtr()).second)
+            return false;
         if (family(t) == "vector")
             return true;
         if (family(t) == "array")
-            return containsVector(element(t));
+            return containsVector(element(t), visited);
         if (auto array = ctx.getAsArrayType(t))
-            return containsVector(array->getElementType());
+            return containsVector(array->getElementType(), visited);
         if (product(t))
             for (auto item : productTypes(t))
-                if (containsVector(item))
+                if (containsVector(item, visited))
+                    return true;
+        if (auto r = record(t); r && user(r))
+            for (auto field : r->fields())
+                if (containsVector(field->getType(), visited))
                     return true;
         return false;
+    }
+    bool containsVector(QualType t) {
+        std::unordered_set<const Type*> visited;
+        return containsVector(t, visited);
+    }
+    bool defaultedMove(const FunctionDecl* function) const {
+        auto method = dyn_cast_or_null<CXXMethodDecl>(function);
+        if (!method || !user(method) || (!method->isImplicit() && !method->isDefaulted()))
+            return false;
+        auto constructor = dyn_cast<CXXConstructorDecl>(method);
+        return constructor ? constructor->isMoveConstructor() : method->isMoveAssignmentOperator();
+    }
+    void requireDefaultedMove(const CXXMethodDecl* method) {
+        method = method->getCanonicalDecl();
+        if (requiredDefaultedMoves.insert(method).second)
+            defaultedMoves.push_back(method);
+    }
+    DeclContext* semanticContext() const {
+        if (current)
+            return const_cast<FunctionDecl*>(current);
+        return ctx.getTranslationUnitDecl();
     }
     std::vector<QualType> productTypes(QualType t) {
         std::vector<QualType> types;
@@ -941,15 +973,15 @@ class Emitter {
         return expression;
     }
     Expr* resolveConstruction(QualType t, std::vector<Expr*> arguments, SourceLocation loc) {
-        Sema::ContextRAII context(sema, ctx.getTranslationUnitDecl());
+        Sema::ContextRAII context(sema, semanticContext());
         auto result = sema.BuildCXXTypeConstructExpr(ctx.getTrivialTypeSourceInfo(t, loc), loc,
                                                      arguments, loc, false);
         if (result.isInvalid())
-            fail(loc, "cannot resolve this tuple element construction");
+            fail(loc, "cannot resolve this element construction");
         return result.get();
     }
     Expr* resolveSwap(Expr* left, Expr* right, SourceLocation loc) {
-        Sema::ContextRAII context(sema, ctx.getTranslationUnitDecl());
+        Sema::ContextRAII context(sema, semanticContext());
         NamespaceDecl* standard = nullptr;
         for (auto declaration : ctx.getTranslationUnitDecl()->lookup(&ctx.Idents.get("std")))
             if (auto ns = dyn_cast<NamespaceDecl>(declaration))
@@ -977,6 +1009,82 @@ class Emitter {
         return mappedValue(elementType, kind, productRead(object, t, index),
                            productReference(object, t, index), loc);
     }
+    std::string constructElement(QualType target, const Expr* source) {
+        if (auto array = ctx.getAsArrayType(target.getNonReferenceType())) {
+            auto sourceArray = ctx.getAsArrayType(source->getType());
+            auto elementRef = temporary("jppElement");
+            auto item = sourceArray->getElementType();
+            auto opaque = mappedValue(item, source->getValueKind(), elementRef + ".get()",
+                                      elementRef, source->getExprLoc());
+            auto javaType = type(target), raw = eraseTypeArguments(javaType);
+            auto dimension = raw.find("[]");
+            auto allocated = "new " + raw.substr(0, dimension) + "[" + arrayBound(array) + "]" +
+                             raw.substr(dimension + 2);
+            if (javaType != raw)
+                allocated = "(" + javaType + ") " + allocated;
+            return "Jpp.constructArray(" + allocated + ", " + expr(source) + ", (JppRef<" +
+                   boxed(item) + "> " + elementRef + ") -> " +
+                   constructElement(array->getElementType(), opaque) + ")";
+        }
+        return expr(resolveConstruction(target, {const_cast<Expr*>(source)}, source->getExprLoc()));
+    }
+    std::string moveStandardArray(const Expr* source, QualType target) {
+        if (templateArgs(target)[1].getAsIntegral().isZero())
+            return "new " + type(target) + "(" + expr(source) + ")";
+        auto elementRef = temporary("jppElement");
+        auto item = element(source->getType());
+        if (source->getType().isConstQualified())
+            item = ctx.getConstType(item);
+        auto opaque =
+            mappedValue(item, VK_XValue, elementRef + ".get()", elementRef, source->getExprLoc());
+        return "Jpp.constructStandardArray(" + expr(source) + ", (JppRef<" + boxed(item) + "> " +
+               elementRef + ") -> " + constructElement(element(target), opaque) + ")";
+    }
+    std::string assignElement(const Expr* target, const Expr* source) {
+        if (auto array = ctx.getAsArrayType(target->getType())) {
+            auto sourceArray = ctx.getAsArrayType(source->getType());
+            auto a = temporary("jppSourceElement"), b = temporary("jppTargetElement");
+            auto from = sourceArray->getElementType(), to = array->getElementType();
+            auto right =
+                mappedValue(from, source->getValueKind(), a + ".get()", a, source->getExprLoc());
+            auto left = mappedValue(to, VK_LValue, b + ".get()", b, target->getExprLoc());
+            return "Jpp.assignArray(" + expr(source) + ", " + expr(target) + ", (JppRef<" +
+                   boxed(from) + "> " + a + ", JppRef<" + boxed(to) + "> " + b + ") -> { " +
+                   assignElement(left, right) + "; })";
+        }
+        Sema::ContextRAII context(sema, semanticContext());
+        auto assignment = sema.BuildBinOp(nullptr, target->getExprLoc(), BO_Assign,
+                                          const_cast<Expr*>(target), const_cast<Expr*>(source));
+        if (assignment.isInvalid())
+            fail(target, "cannot resolve this element assignment");
+        return statementValue(assignment.get());
+    }
+    std::string assignStandardArray(const Expr* target, const Expr* source,
+                                    bool asReference = false) {
+        if (templateArgs(target->getType())[1].getAsIntegral().isZero())
+            return "Jpp.last(" + expr(source) + ", " +
+                   (asReference ? reference(target) : expr(target)) + ")";
+        auto from = element(source->getType()), to = element(target->getType());
+        if (source->getType().isConstQualified())
+            from = ctx.getConstType(from);
+        auto a = temporary("jppSourceElement"), b = temporary("jppTargetElement");
+        auto right =
+            mappedValue(from, source->getValueKind(), a + ".get()", a, source->getExprLoc());
+        auto left = mappedValue(to, VK_LValue, b + ".get()", b, target->getExprLoc());
+        return std::string(asReference ? "Jpp.assignStandardArrayRef("
+                                       : "Jpp.assignStandardArray(") +
+               expr(source) + ", " + (asReference ? reference(target) : expr(target)) +
+               ", (JppRef<" + boxed(from) + "> " + a + ", JppRef<" + boxed(to) + "> " + b +
+               ") -> { " + assignElement(left, right) + "; })";
+    }
+    std::string assignDefaultedMove(const CXXMethodDecl* method, const Expr* target,
+                                    const Expr* source, bool asReference = false) {
+        requireDefaultedMove(method);
+        auto a = temporary("jppSource"), b = temporary("jppTarget");
+        return std::string(asReference ? "Jpp.assignUsingRef(" : "Jpp.assignUsing(") +
+               expr(source) + ", " + (asReference ? reference(target) : expr(target)) + ", (" + a +
+               ", " + b + ") -> " + b + "." + name(method) + "(" + a + "))";
+    }
     bool referenceMember(const Expr* e) const {
         auto member = dyn_cast_or_null<MemberExpr>(bare(e));
         if (!member)
@@ -1002,9 +1110,9 @@ class Emitter {
                                      : productReference(sourceName, from, i));
             else {
                 auto item =
-                    clean(target)->isRecordType()
-                        ? expr(resolveConstruction(
-                              target, {productElement(sourceName, from, i, category, loc)}, loc))
+                    copyType(target)
+                        ? constructElement(target,
+                                           productElement(sourceName, from, i, category, loc))
                         : converted(productRead(sourceName, from, i), sourceTypes[i], target);
                 values.push_back(item);
             }
@@ -1013,6 +1121,8 @@ class Emitter {
                productConstruct(to, values) + ")";
     }
     std::string assignProduct(const Expr* target, const Expr* source) {
+        if (family(target->getType()) == "array")
+            return assignStandardArray(target, source);
         auto from = source->getType(), to = target->getType();
         auto sourceTypes = productTypes(from), targetTypes = productTypes(to);
         if (sourceTypes.size() != targetTypes.size())
@@ -1026,7 +1136,7 @@ class Emitter {
                 auto left = productElement(b, to, i, VK_LValue, target->getExprLoc());
                 auto right =
                     productElement(a, from, i, source->getValueKind(), source->getExprLoc());
-                Sema::ContextRAII context(sema, ctx.getTranslationUnitDecl());
+                Sema::ContextRAII context(sema, semanticContext());
                 auto assignment =
                     sema.BuildBinOp(nullptr, target->getExprLoc(), BO_Assign, left, right);
                 if (assignment.isInvalid())
@@ -1455,6 +1565,8 @@ class Emitter {
         }
         if (family(t) == "array") {
             auto a = templateArgs(t);
+            if (a[1].getAsIntegral().isZero())
+                return "new " + jt + "()";
             return "Jpp.vectorDefault(" + number(a[1].getAsIntegral()) + ", () -> " +
                    defaultValue(element(t)) + ")";
         }
@@ -2016,11 +2128,17 @@ class Emitter {
         if (auto call = dyn_cast<CallExpr>(bare(e)); call && productGet(call))
             return productReference(expr(call->getArg(0)), call->getArg(0)->getType(),
                                     productIndex(call));
+        if (auto element = standardArrayElementReference(bare(e)); !element.empty())
+            return element;
         if (auto call = dyn_cast<CXXMemberCallExpr>(bare(e));
             call && family(call->getImplicitObjectArgument()->getType()) == "reference_wrapper" &&
             (call->getMethodDecl()->getNameAsString() == "get" ||
              isa<CXXConversionDecl>(call->getMethodDecl())))
             return expr(call->getImplicitObjectArgument());
+        if (auto assignment = dyn_cast<CXXOperatorCallExpr>(bare(e));
+            assignment && assignment->getOperator() == OO_Equal && assignment->getNumArgs() == 2 &&
+            family(assignment->getArg(0)->getType()) == "array")
+            return assignStandardArray(assignment->getArg(0), assignment->getArg(1), true);
         if (auto assignment = dyn_cast<CXXOperatorCallExpr>(bare(e));
             assignment && assignment->getOperator() == OO_Equal && assignment->getNumArgs() == 2 &&
             product(assignment->getArg(0)->getType()))
@@ -2051,6 +2169,9 @@ class Emitter {
         if (auto assignment = dyn_cast<CXXOperatorCallExpr>(bare(e));
             assignment && assignment->getOperator() == OO_Equal && assignment->getNumArgs() == 2) {
             auto function = assignment->getDirectCallee();
+            if (defaultedMove(function))
+                return assignDefaultedMove(cast<CXXMethodDecl>(function), assignment->getArg(0),
+                                           assignment->getArg(1), true);
             if (family(assignment->getArg(0)->getType()) == "vector" && function &&
                 function->getNumParams() &&
                 function->getParamDecl(0)->getType()->isRValueReferenceType())
@@ -2062,6 +2183,11 @@ class Emitter {
                        value(assignment->getArg(1), assignment->getArg(0)->getType()) + ", " +
                        reference(assignment->getArg(0)) + ")";
         }
+        if (auto call = dyn_cast<CallExpr>(bare(e));
+            call && call->getDirectCallee() &&
+            call->getDirectCallee()->getReturnType()->isReferenceType())
+            if (auto r = record(call->getType()); r && (user(r) || isVec(call->getType())))
+                return "JppRef.object(" + expr(call) + ")";
         if (auto c = dyn_cast<CallExpr>(bare(e));
             c && c->getDirectCallee() && !user(c->getDirectCallee())) {
             auto n = c->getDirectCallee()->getNameAsString();
@@ -2204,11 +2330,41 @@ class Emitter {
             return javaArray(indexed->getBase());
         return isa<MemberExpr>(e) || isa<InitListExpr>(e) || isa<StringLiteral>(e);
     }
+    std::string standardArrayElementReference(const Expr* e) {
+        if (!e || !primitiveArray(e->getType()))
+            return {};
+        std::string location;
+        if (auto index = dyn_cast<CXXOperatorCallExpr>(e);
+            index && index->getOperator() == OO_Subscript && index->getNumArgs() == 2 &&
+            family(index->getArg(0)->getType()) == "array")
+            location =
+                "JppRef.at(" + expr(index->getArg(0)) + ", " + intArgument(index->getArg(1)) + ")";
+        if (auto call = dyn_cast<CXXMemberCallExpr>(e)) {
+            auto argument = call->getImplicitObjectArgument();
+            auto owner = clean(argument->getType());
+            bool pointer = owner->isPointerType();
+            if (pointer)
+                owner = owner->getPointeeType();
+            if (family(owner) == "array") {
+                auto method = call->getMethodDecl()->getNameAsString();
+                auto object = expr(argument) + (pointer ? ".get()" : "");
+                if (method == "at" || method == "operator[]")
+                    location = "JppRef.at(" + object + ", " + intArgument(call->getArg(0)) + ")";
+                else if (method == "front" || method == "back")
+                    location = "JppRef." + method + "(" + object + ")";
+            }
+        }
+        return location.empty() ? ""
+                                : "Jpp.arrayReference(" + location + ", " +
+                                      memoryType(e->getType()) + ", " + targetLittleEndian() + ")";
+    }
     std::string arrayLocation(const Expr* input) {
         auto e = bare(input);
         if (auto opaque = dyn_cast_or_null<OpaqueValueExpr>(e);
             opaque && opaqueReferences.count(opaque))
             return "(" + opaqueReferences.at(opaque) + ").pointer()";
+        if (auto element = standardArrayElementReference(e); !element.empty())
+            return "(" + element + ").pointer()";
         if (auto literal = dyn_cast<StringLiteral>(e)) {
             auto element = ctx.getAsArrayType(e->getType())->getElementType();
             if (!element->isCharType())
@@ -3016,9 +3172,15 @@ class Emitter {
             auto constructor = c->getConstructor();
             if (family(t) == "vector" && constructor->isMoveConstructor())
                 return "Jpp.moveVector(" + expr(args[0]) + ")";
+            if (family(t) == "array" && constructor->isMoveConstructor())
+                return moveStandardArray(args[0], t);
             if (product(t) && constructor->isMoveConstructor())
                 return convertProduct(expr(args[0]), args[0]->getType(), t, args[0]->getValueKind(),
                                       c->getExprLoc());
+            if (defaultedMove(constructor)) {
+                requireDefaultedMove(constructor);
+                return "new " + type(t) + "(" + expr(args[0]) + ", (JppMove)null)";
+            }
             if (user(constructor) && !constructor->isImplicit() && !constructor->isDefaulted()) {
                 std::vector<std::string> bound;
                 for (unsigned i = 0; i < args.size(); ++i) {
@@ -3027,7 +3189,7 @@ class Emitter {
                                                          : value(args[i], target, true));
                 }
                 if (constructor->isMoveConstructor())
-                    bound.push_back("true");
+                    bound.push_back("(JppMove)null");
                 return "new " + type(t) + "(" + join(bound) + ")";
             }
             return "jppCopy(" + expr(args[0]) + ")";
@@ -3277,20 +3439,11 @@ class Emitter {
         return "new " + type(t) + "(" + join(a) + ")";
     }
     std::string storedElement(const Expr* e, QualType target, bool move) {
-        auto result = value(e, target);
         if (!copyType(target))
-            return result;
-        if (move && family(target) == "vector")
-            return "Jpp.moveVector(" + result + ")";
-        if (move && product(target))
-            return convertProduct(result, e->getType(), target, e->getValueKind(), e->getExprLoc());
-        if (auto r = record(target); move && r && user(r))
-            for (auto constructor : r->ctors())
-                if (constructor->isMoveConstructor() && !constructor->isImplicit() &&
-                    !constructor->isDefaulted() && !constructor->isDeleted() &&
-                    constructor->hasBody())
-                    return "new " + type(target) + "(" + result + ", true)";
-        return "jppCopy(" + result + ")";
+            return value(e, target);
+        if (move)
+            return constructElement(target, e);
+        return "jppCopy(" + value(e, target) + ")";
     }
     std::string asIterator(const Expr* e) {
         if (primitiveArray(e->getType()))
@@ -3459,6 +3612,8 @@ class Emitter {
                 ot = ot->getPointeeType();
             if (f && user(f)) {
                 auto method = cast<CXXMethodDecl>(f);
+                if (defaultedMove(method) && c->getNumArgs() == 1)
+                    requireDefaultedMove(method);
                 auto allocatedName = method->getParent()->isLambda() ? "call" : name(f);
                 auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
                 return object + "." + allocatedName + "(" + arguments(c, f) + ")";
@@ -4809,8 +4964,11 @@ class Emitter {
                     fail(x, "cannot resolve this reference-wrapper invocation");
                 return expression(invocation.get());
             }
-            if (op == OO_Equal && x->getNumArgs() == 2 && product(x->getArg(0)->getType()))
+            if (op == OO_Equal && x->getNumArgs() == 2 && tupleLike(x->getArg(0)->getType()))
                 return assignProduct(x->getArg(0), x->getArg(1));
+            if (op == OO_Equal && x->getNumArgs() == 2 && defaultedMove(x->getDirectCallee()))
+                return assignDefaultedMove(cast<CXXMethodDecl>(x->getDirectCallee()), x->getArg(0),
+                                           x->getArg(1));
             if (op == OO_Equal && x->getNumArgs() == 2 &&
                 family(x->getArg(0)->getType()) == "_Swallow_assign")
                 return "Jpp.last(" + expr(x->getArg(1)) + ", " + expr(x->getArg(0)) + ")";
@@ -4987,6 +5145,8 @@ class Emitter {
                 return productConstruct(t, a);
             }
             if (family(t) == "array") {
+                if (templateArgs(t)[1].getAsIntegral().isZero())
+                    return defaultValue(t);
                 const InitListExpr* elements = x;
                 if (x->getNumInits() == 1)
                     if (auto nested = dyn_cast<InitListExpr>(bare(x->getInit(0)));
@@ -6044,7 +6204,8 @@ class Emitter {
             return;
         }
         if (auto m = dyn_cast<CXXMethodDecl>(f);
-            m && m->isCopyAssignmentOperator() && (m->isImplicit() || m->isDefaulted()))
+            m && (m->isCopyAssignmentOperator() || m->isMoveAssignmentOperator()) &&
+            (m->isImplicit() || m->isDefaulted()))
             return;
         if (isa<CXXDestructorDecl>(f))
             fail(f->getLocation(),
@@ -6063,7 +6224,7 @@ class Emitter {
         }
         if (auto ctor = dyn_cast<CXXConstructorDecl>(f)) {
             if (ctor->isMoveConstructor())
-                params.push_back("boolean " + temporary("jppMove"));
+                params.push_back("JppMove " + temporary("jppMove"));
             line(name(ctor->getParent()) + "(" + join(params) + ")");
             line("{");
             ++indent;
@@ -6115,6 +6276,67 @@ class Emitter {
         line();
         current = nullptr;
         arrayBounds = std::move(previousBounds);
+    }
+    Expr* recordField(Expr* object, const FieldDecl* field, SourceLocation loc) {
+        Sema::ContextRAII context(sema, semanticContext());
+        auto result = sema.BuildFieldReferenceExpr(
+            object, false, loc, CXXScopeSpec(), const_cast<FieldDecl*>(field),
+            DeclAccessPair::make(const_cast<FieldDecl*>(field), field->getAccess()),
+            DeclarationNameInfo(field->getDeclName(), loc));
+        if (result.isInvalid())
+            fail(loc, "cannot resolve this defaulted member operation");
+        return result.get();
+    }
+    std::map<const CXXRecordDecl*, std::string> defaultedMoveDefinitions() {
+        std::map<const CXXRecordDecl*, std::string> definitions;
+        auto previous = out.str();
+        auto previousIndent = indent;
+        out.str("");
+        out.clear();
+        indent = 2;
+        // Resolving one member can select another record's implicit move. Keep
+        // processing those selections before inserting methods in their classes.
+        for (size_t i = 0; i < defaultedMoves.size(); ++i) {
+            auto method = defaultedMoves[i];
+            auto r = method->getParent();
+            current = method;
+            currentRecord = r;
+            auto start = static_cast<size_t>(out.tellp());
+            auto parameter = method->getParamDecl(0);
+            auto other = parameter->getIdentifier() ? name(parameter) : "other";
+            auto loc = method->getLocation();
+            auto from = mappedValue(parameter->getType().getNonReferenceType(), VK_XValue, other,
+                                    "JppRef.object(" + other + ")", loc);
+            auto to =
+                mappedValue(ctx.getRecordType(r), VK_LValue, "this", "JppRef.object(this)", loc);
+            auto constructor = dyn_cast<CXXConstructorDecl>(method);
+            auto n = name(r);
+            line(constructor
+                     ? n + "(" + n + " " + other + ", JppMove " + temporary("jppMove") + ") {"
+                     : n + " " + name(method) + "(" + n + " " + other + ") {");
+            ++indent;
+            for (auto field : r->fields()) {
+                auto source = recordField(from, field, loc);
+                if (constructor)
+                    line("this." + name(field) + " = " +
+                         constructElement(field->getType(), source) + ";");
+                else
+                    line(assignElement(recordField(to, field, loc), source) + ";");
+            }
+            if (!constructor)
+                line("return this;");
+            --indent;
+            line("}");
+            line();
+            definitions[r] += out.str().substr(start);
+        }
+        current = nullptr;
+        currentRecord = nullptr;
+        indent = previousIndent;
+        out.str(previous);
+        out.clear();
+        out.seekp(0, std::ios_base::end);
+        return definitions;
     }
     void emitRecord(const CXXRecordDecl* r) {
         if (r->isUnion())
@@ -6248,6 +6470,7 @@ class Emitter {
         for (auto f : functions)
             if (f->getDeclContext() == r)
                 function(f);
+        recordOperationsAt.emplace_back(r, static_cast<size_t>(out.tellp()));
         --indent;
         line("}");
         line();
@@ -6315,6 +6538,7 @@ class Emitter {
         for (auto f : functions)
             if (!isa<CXXMethodDecl>(f))
                 function(f);
+        auto moveDefinitions = defaultedMoveDefinitions();
         for (size_t i = 0; i < interfaces.size(); ++i) {
             auto [f, n] = interfaces[i];
             std::vector<std::string> p;
@@ -6370,6 +6594,8 @@ class Emitter {
         }
         line();
         auto program = out.str();
+        for (auto entry = recordOperationsAt.rbegin(); entry != recordOperationsAt.rend(); ++entry)
+            program.insert(entry->second, moveDefinitions[entry->first]);
         std::string pointerFields;
         for (const auto& entry : functionPointers) {
             auto owner = isa<CXXMethodDecl>(entry.declaration)

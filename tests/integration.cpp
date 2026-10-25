@@ -172,6 +172,9 @@ int main() {
         cases.emplace_back("map_swap", expressions.str());
         cases.emplace_back("vector_swap", expressions.str());
         cases.emplace_back("vector_moves", expressions.str());
+        cases.emplace_back("array_moves", expressions.str());
+        cases.emplace_back("record_moves", expressions.str());
+        cases.emplace_back("empty_arrays", "");
         cases.emplace_back("deques", expressions.str());
         cases.emplace_back("gnu", expressions.str());
         cases.emplace_back("pointers", expressions.str());

@@ -7,6 +7,7 @@ interface JppAssignable<T> extends JppCopyable<T> {
     T jppAssignFrom(T source);
 }
 interface JppUninitialized {}
+interface JppMove {}
 
 interface JppListOwner<T> {
     List<T> jppStorage();
@@ -1498,9 +1499,10 @@ static class JppPtr<T> extends JppIter<T> {
         if (pos == other.pos && (storage == other.storage ||
                                  (storage instanceof JppAddress && storage.equals(other.storage))))
             return true;
-        // A method's this pointer and an array element can name the same record.
+        // A returned object reference and a stored element can name the same C++ object.
         return list != null && other.list != null && pos >= 0 && pos < list.size() &&
-            other.pos >= 0 && other.pos < other.list.size() && get() instanceof JppCopyable &&
+            other.pos >= 0 && other.pos < other.list.size() &&
+            (get() instanceof JppCopyable || get() instanceof Collection) &&
             get() == other.get();
     }
 }
@@ -3161,6 +3163,63 @@ static final JppOutput jppOut = new JppOutput(System.out),
                       jppLog = new JppOutput(jppErr);
 
 static class Jpp {
+    static <T> T assignUsing(T source, T target, java.util.function.BiConsumer<T, T> assign) {
+        assign.accept(source, target);
+        return target;
+    }
+    static <T> JppRef<T> assignUsingRef(T source, JppRef<T> target,
+            java.util.function.BiConsumer<T, T> assign) {
+        assign.accept(source, target.get());
+        return target;
+    }
+    static <T> List<T> reflectedArray(Object source) {
+        return new AbstractList<T>() {
+            public int size() { return java.lang.reflect.Array.getLength(source); }
+            public T get(int index) { return (T)java.lang.reflect.Array.get(source, index); }
+            public T set(int index, T value) {
+                T previous = get(index);
+                java.lang.reflect.Array.set(source, index, value);
+                return previous;
+            }
+        };
+    }
+    static <A, T> A constructArray(A destination, A source,
+            java.util.function.Function<JppRef<T>, T> construct) {
+        List<T> elements = reflectedArray(source);
+        for (int i = 0; i < elements.size(); ++i) {
+            JppRef<T> element = JppRef.at(new JppPtr<T>(elements, i, source));
+            java.lang.reflect.Array.set(destination, i, construct.apply(element));
+        }
+        return destination;
+    }
+    static <A, S, T> A assignArray(A source, A target,
+            java.util.function.BiConsumer<JppRef<S>, JppRef<T>> assign) {
+        List<S> from = reflectedArray(source);
+        List<T> to = reflectedArray(target);
+        for (int i = 0; i < to.size(); ++i)
+            assign.accept(JppRef.at(new JppPtr<S>(from, i, source)),
+                          JppRef.at(new JppPtr<T>(to, i, target)));
+        return target;
+    }
+    static <S, T> ArrayList<T> assignStandardArray(ArrayList<S> source, ArrayList<T> target,
+            java.util.function.BiConsumer<JppRef<S>, JppRef<T>> assign) {
+        for (int i = 0; i < target.size(); ++i)
+            assign.accept(JppRef.at(source, i), JppRef.at(target, i));
+        return target;
+    }
+    static <S, T> JppRef<ArrayList<T>> assignStandardArrayRef(ArrayList<S> source,
+            JppRef<ArrayList<T>> target,
+            java.util.function.BiConsumer<JppRef<S>, JppRef<T>> assign) {
+        assignStandardArray(source, target.get(), assign);
+        return target;
+    }
+    static <S, T> ArrayList<T> constructStandardArray(ArrayList<S> source,
+            java.util.function.Function<JppRef<S>, T> construct) {
+        ArrayList<T> result = new ArrayList<T>(source.size());
+        for (int i = 0; i < source.size(); ++i)
+            result.add(construct.apply(JppRef.at(source, i)));
+        return result;
+    }
     static <T> ArrayList<T> movableVector(ArrayList<T> values) {
         return values instanceof JppVector ? values : new JppVector<T>(values);
     }
