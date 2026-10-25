@@ -125,6 +125,10 @@ static abstract class JppRef<T> {
         return of(() -> get.apply(object), v -> set.accept(object, v), object, field);
     }
     static <T> JppRef<T> at(List<T> a, int i) {
+        if (a instanceof JppDeque)
+            return ((JppDeque<T>)a).data.reference(i);
+        if (a instanceof JppDequeStorage)
+            return ((JppDequeStorage<T>)a).reference(i);
         return of(() -> a.get(i), v -> a.set(i, v), () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static <T> JppRef<T> front(List<T> values) {
@@ -143,6 +147,8 @@ static abstract class JppRef<T> {
         return of(() -> a[i], v -> a[i] = v, () -> Jpp.pointer(Jpp.begin(a).plus(i)));
     }
     static <T> JppRef<T> at(JppIter<T> iterator) {
+        if (iterator.list instanceof JppDequeStorage)
+            return ((JppDequeStorage<T>)iterator.list).reference(iterator.index());
         JppIter<T> position = iterator.plus(0);
         return of(position::get, position::put, () -> Jpp.pointer(position));
     }
@@ -465,6 +471,206 @@ static class JppBitRef implements JppCopyable<JppBitRef> {
     }
     public JppBitRef copy() {
         return new JppBitRef(owner, index);
+    }
+}
+
+static class JppDequeStorage<T> extends AbstractList<T> implements RandomAccess {
+    ArrayList<T> ring = new ArrayList<T>(Collections.nCopies(16, (T)null));
+    int head, count;
+    long first;
+    public int size() {
+        return count;
+    }
+    private int slot(int index) {
+        return index >= ring.size() - head ? index - (ring.size() - head) : head + index;
+    }
+    private void check(int index) {
+        if (index < 0 || index >= count)
+            throw new IndexOutOfBoundsException();
+    }
+    public T get(int index) {
+        check(index);
+        return ring.get(slot(index));
+    }
+    public T set(int index, T value) {
+        check(index);
+        return ring.set(slot(index), value);
+    }
+    private void grow() {
+        if (count < ring.size())
+            return;
+        int capacity =
+            ring.size() <= (Integer.MAX_VALUE - 8) / 2 ? ring.size() * 2 : Integer.MAX_VALUE - 8;
+        if (capacity <= count)
+            throw new OutOfMemoryError("deque exceeds Java's indexing limit");
+        ArrayList<T> next = new ArrayList<T>(Collections.nCopies(capacity, (T)null));
+        for (int i = 0; i < count; ++i)
+            next.set(i, get(i));
+        ring = next;
+        head = 0;
+    }
+    public void add(int index, T value) {
+        if (index < 0 || index > count)
+            throw new IndexOutOfBoundsException();
+        grow();
+        if (index == 0) {
+            head = head == 0 ? ring.size() - 1 : head - 1;
+            --first;
+        } else
+            for (int i = count; i > index; --i)
+                ring.set(slot(i), ring.get(slot(i - 1)));
+        ring.set(slot(index), value);
+        ++count;
+        ++modCount;
+    }
+    public T remove(int index) {
+        T old = get(index);
+        removeRange(index, index + 1);
+        return old;
+    }
+    protected void removeRange(int begin, int end) {
+        if (begin < 0 || end < begin || end > count)
+            throw new IndexOutOfBoundsException();
+        int removed = end - begin;
+        if (removed == 0)
+            return;
+        if (begin == 0 || begin < count - end) {
+            for (int i = begin - 1; i >= 0; --i)
+                ring.set(slot(i + removed), ring.get(slot(i)));
+            for (int i = 0; i < removed; ++i)
+                ring.set(slot(i), null);
+            head = slot(removed);
+            first += removed;
+        } else {
+            for (int i = end; i < count; ++i)
+                ring.set(slot(i - removed), ring.get(slot(i)));
+            for (int i = count - removed; i < count; ++i)
+                ring.set(slot(i), null);
+        }
+        count -= removed;
+        ++modCount;
+    }
+    public void clear() {
+        for (int i = 0; i < count; ++i)
+            ring.set(slot(i), null);
+        first += count;
+        head = count = 0;
+        ++modCount;
+    }
+    JppRef<T> reference(int index) {
+        check(index);
+        final long address = first + index;
+        return JppRef.of(()
+                             -> get((int)(address - first)),
+                         value -> set((int)(address - first), value), this, address);
+    }
+    public Iterator<T> iterator() {
+        return new Iterator<T>() {
+            long next = first;
+            public boolean hasNext() {
+                return Long.compareUnsigned(next - first, count) < 0;
+            }
+            public T next() {
+                if (!hasNext())
+                    throw new NoSuchElementException();
+                return get((int)(next++ - first));
+            }
+        };
+    }
+}
+
+static class JppDeque<T> extends AbstractList<T> implements JppAssignable<JppDeque<T>> {
+    JppDequeStorage<T> data = new JppDequeStorage<T>();
+    JppDeque() {}
+    JppDeque(Collection<? extends T> values) {
+        for (T value : values)
+            addLast(jppCopy(value));
+    }
+    public int size() {
+        return data.size();
+    }
+    public T get(int index) {
+        return data.get(index);
+    }
+    public T set(int index, T value) {
+        return data.set(index, value);
+    }
+    public void add(int index, T value) {
+        data.add(index, value);
+    }
+    public T remove(int index) {
+        return data.remove(index);
+    }
+    public void clear() {
+        data.clear();
+    }
+    public Iterator<T> iterator() {
+        return data.iterator();
+    }
+    void addFirst(T value) {
+        data.add(0, value);
+    }
+    void addLast(T value) {
+        data.add(size(), value);
+    }
+    T getFirst() {
+        return get(0);
+    }
+    T getLast() {
+        return get(size() - 1);
+    }
+    T removeFirst() {
+        return data.remove(0);
+    }
+    T removeLast() {
+        return data.remove(size() - 1);
+    }
+    void swap(JppDeque<T> other) {
+        JppDequeStorage<T> saved = data;
+        data = other.data;
+        other.data = saved;
+    }
+    public JppDeque<T> copy() {
+        return new JppDeque<T>(this);
+    }
+    public JppDeque<T> jppAssignFrom(JppDeque<T> other) {
+        if (other != this)
+            data = other.copy().data;
+        return this;
+    }
+}
+
+static class JppDequeIter<T> extends JppIter<T> {
+    final JppDequeStorage<T> deque;
+    long address;
+    JppDequeIter(JppDequeStorage<T> storage, long address, int direction) {
+        super(storage, (int)(address - storage.first), direction, storage);
+        deque = storage;
+        this.address = address;
+    }
+    int index() {
+        return (int)(address - deque.first);
+    }
+    T get() {
+        return deque.get(index());
+    }
+    T put(T value) {
+        deque.set(index(), value);
+        return value;
+    }
+    JppIter<T> plus(int offset) {
+        return new JppDequeIter<T>(deque, address + (long)offset * step, step);
+    }
+    JppIter<T> advance(int offset) {
+        address += (long)offset * step;
+        return this;
+    }
+    int minus(JppIter<?> other) {
+        return (int)((address - ((JppDequeIter<?>)other).address) * step);
+    }
+    boolean same(JppIter<?> other) {
+        return other instanceof JppDequeIter && deque == ((JppDequeIter<?>)other).deque &&
+            address == ((JppDequeIter<?>)other).address;
     }
 }
 
@@ -888,6 +1094,9 @@ static class JppIter<T> implements JppCopyable<JppIter<T>> {
     }
     T get() {
         return list.get(pos);
+    }
+    int index() {
+        return pos;
     }
     T put(T value) {
         list.set(pos, value);
@@ -1462,55 +1671,6 @@ static class JppSet<T> implements Iterable<T>, JppAssignable<JppSet<T>> {
             count = snapshot.count;
         }
         return this;
-    }
-}
-
-static class JppDeque<T> implements Iterable<T>, JppCopyable<JppDeque<T>> {
-    final ArrayDeque<T> data = new ArrayDeque<T>();
-    void push(T value) {
-        data.addLast(jppCopy(value));
-    }
-    void push_back(T value) {
-        push(value);
-    }
-    void push_front(T value) {
-        data.addFirst(jppCopy(value));
-    }
-    void pop() {
-        data.removeFirst();
-    }
-    void pop_front() {
-        data.removeFirst();
-    }
-    void pop_back() {
-        data.removeLast();
-    }
-    T front() {
-        return data.getFirst();
-    }
-    T back() {
-        return data.getLast();
-    }
-    T top() {
-        return data.getLast();
-    }
-    int size() {
-        return data.size();
-    }
-    boolean empty() {
-        return data.isEmpty();
-    }
-    void clear() {
-        data.clear();
-    }
-    public Iterator<T> iterator() {
-        return data.iterator();
-    }
-    public JppDeque<T> copy() {
-        JppDeque<T> d = new JppDeque<T>();
-        for (T v : data)
-            d.push(v);
-        return d;
     }
 }
 
@@ -2404,6 +2564,8 @@ static class Jpp {
         return result;
     }
     static <T> JppPtr<T> pointer(JppIter<T> at) {
+        if (at != null && at.list instanceof JppDequeStorage)
+            return ((JppDequeStorage<T>)at.list).reference(at.index()).pointer();
         return at == null ? null : new JppPtr<T>(at.pointerStorage(), at.pos, at.pointerIdentity());
     }
     static <T> JppPtr<T> address(JppRef<T> value, Object object, Object field) {
@@ -2854,41 +3016,76 @@ static class Jpp {
         a.set(i, value);
         return value;
     }
-    static <T> void resizeDefault(ArrayList<T> a, int n, java.util.function.Supplier<T> factory) {
+    static <T> JppDeque<T> dequeDefault(int n, java.util.function.Supplier<T> factory) {
+        JppDeque<T> result = new JppDeque<T>();
+        resizeDefault(result, n, factory);
+        return result;
+    }
+    static <T> JppDeque<T> dequeFill(int n, T value) {
+        return dequeDefault(n, () -> jppCopy(value));
+    }
+    static <A, T> JppDeque<T> dequeFrom(JppIter<A> first, JppIter<A> last,
+                                        java.util.function.Function<A, T> convert) {
+        JppDeque<T> result = new JppDeque<T>();
+        for (JppIter<A> at = first.plus(0); !at.same(last); at.advance(1))
+            result.addLast(jppCopy(convert.apply(at.get())));
+        return result;
+    }
+    static <T> List<T> listStorage(List<T> values) {
+        return values instanceof JppDeque ? ((JppDeque<T>)values).data : values;
+    }
+    static <T> void resizeDefault(List<T> a, int n, java.util.function.Supplier<T> factory) {
         if (n < a.size())
             a.subList(n, a.size()).clear();
         while (a.size() < n)
             a.add(factory.get());
     }
-    static <T> void resize(ArrayList<T> a, int n, T value) {
+    static <T> void resize(List<T> a, int n, T value) {
         resizeDefault(a, n, () -> jppCopy(value));
     }
-    static <T> void assign(ArrayList<T> a, int n, T value) {
+    static <T> void assign(List<T> a, int n, T value) {
         a.clear();
         resizeDefault(a, n, () -> jppCopy(value));
     }
-    static <T> JppIter<T> erase(ArrayList<T> a, JppIter<T> first, JppIter<T> last) {
-        a.subList(first.pos, last.pos).clear();
-        return first;
+    static <T> JppIter<T> erase(List<T> a, JppIter<T> first, JppIter<T> last) {
+        int index = first.index();
+        listStorage(a).subList(index, last.index()).clear();
+        return begin(a).plus(index);
     }
-    static <T> JppIter<T> erase(ArrayList<T> a, JppIter<T> at) {
-        a.remove(at.pos);
-        return at;
+    static <T> JppIter<T> erase(List<T> a, JppIter<T> at) {
+        int index = at.index();
+        listStorage(a).remove(index);
+        return begin(a).plus(index);
     }
-    static <T> JppIter<T> insert(ArrayList<T> a, JppIter<T> at, T value) {
-        a.add(at.pos, jppCopy(value));
-        return at;
+    static <T> JppIter<T> insert(List<T> a, JppIter<T> at, T value) {
+        int index = at.index();
+        listStorage(a).add(index, jppCopy(value));
+        return begin(a).plus(index);
     }
     static <T> JppIter<T> begin(List<T> a) {
+        if (a instanceof JppDeque) {
+            JppDequeStorage<T> data = ((JppDeque<T>)a).data;
+            return new JppDequeIter<T>(data, data.first, 1);
+        }
         return new JppIter<T>(a, 0, 1);
     }
     static <T> JppIter<T> end(List<T> a) {
+        if (a instanceof JppDeque)
+            return begin(a).plus(a.size());
         return new JppIter<T>(a, a.size(), 1);
     }
     static <T> JppIter<T> rbegin(List<T> a) {
+        if (a instanceof JppDeque) {
+            JppDequeStorage<T> data = ((JppDeque<T>)a).data;
+            return new JppDequeIter<T>(data, data.first + data.size() - 1, -1);
+        }
         return new JppIter<T>(a, a.size() - 1, -1);
     }
     static <T> JppIter<T> rend(List<T> a) {
+        if (a instanceof JppDeque) {
+            JppDequeStorage<T> data = ((JppDeque<T>)a).data;
+            return new JppDequeIter<T>(data, data.first - 1, -1);
+        }
         return new JppIter<T>(a, -1, -1);
     }
     static <T> T arrayInit(T a, T initial) {
@@ -3089,19 +3286,19 @@ static class Jpp {
     static <T> void sort(JppIter<T> first, JppIter<T> last,
                          java.util.function.BiPredicate<? super T, ? super T> less) {
         ArrayList<T> values = new ArrayList<T>();
-        for (int i = first.pos; i != last.pos; i += first.step)
+        for (int i = first.index(); i != last.index(); i += first.step)
             values.add(first.list.get(i));
         values.sort((a, b) -> less.test(a, b) ? -1 : less.test(b, a) ? 1 : 0);
-        for (int i = 0, p = first.pos; i < values.size(); ++i, p += first.step)
+        for (int i = 0, p = first.index(); i < values.size(); ++i, p += first.step)
             first.list.set(p, values.get(i));
     }
     static <T> void reverse(JppIter<T> first, JppIter<T> last) {
-        for (int l = first.pos, r = last.pos - first.step; (r - l) * first.step > 0;
+        for (int l = first.index(), r = last.index() - first.step; (r - l) * first.step > 0;
              l += first.step, r -= first.step)
             Collections.swap(first.list, l, r);
     }
     static <T> void fill(JppIter<T> first, JppIter<T> last, T value) {
-        for (int i = first.pos; i != last.pos; i += first.step)
+        for (int i = first.index(); i != last.index(); i += first.step)
             first.list.set(i, assignValue(first.list.get(i), value));
     }
     static <T> void fill(List<T> values, T value) {
@@ -3161,13 +3358,13 @@ static class Jpp {
     static <T> JppIter<T> unique(JppIter<T> first, JppIter<T> last) {
         if (first.same(last))
             return last;
-        int out = first.pos;
-        for (int i = first.pos + first.step; i != last.pos; i += first.step)
+        int out = first.index();
+        for (int i = first.index() + first.step; i != last.index(); i += first.step)
             if (compare(first.list.get(out), first.list.get(i)) != 0) {
                 out += first.step;
                 first.list.set(out, jppCopy(first.list.get(i)));
             }
-        return new JppIter<T>(first.list, out + first.step, first.step);
+        return first.plus((out - first.index()) * first.step + 1);
     }
     static <T> JppIter<T> find(JppIter<T> first, JppIter<T> last, T value) {
         JppIter<T> p = first.plus(0);
@@ -3197,26 +3394,26 @@ static class Jpp {
         return best;
     }
     static <T extends Number> long accumulate(JppIter<T> first, JppIter<T> last, long init) {
-        for (int i = first.pos; i != last.pos; i += first.step)
+        for (int i = first.index(); i != last.index(); i += first.step)
             init += first.list.get(i).longValue();
         return init;
     }
     static <T extends Number> int accumulate(JppIter<T> first, JppIter<T> last, int init) {
-        for (int i = first.pos; i != last.pos; i += first.step)
+        for (int i = first.index(); i != last.index(); i += first.step)
             init += first.list.get(i).intValue();
         return init;
     }
     static <T extends Number> double accumulate(JppIter<T> first, JppIter<T> last, double init) {
-        for (int i = first.pos; i != last.pos; i += first.step)
+        for (int i = first.index(); i != last.index(); i += first.step)
             init += first.list.get(i).doubleValue();
         return init;
     }
     static void iota(JppIter<Integer> first, JppIter<Integer> last, int value) {
-        for (int i = first.pos; i != last.pos; i += first.step)
+        for (int i = first.index(); i != last.index(); i += first.step)
             first.list.set(i, value++);
     }
     static void iota(JppIter<Long> first, JppIter<Long> last, long value) {
-        for (int i = first.pos; i != last.pos; i += first.step)
+        for (int i = first.index(); i != last.index(); i += first.step)
             first.list.set(i, value++);
     }
     static <T> boolean next_permutation(JppIter<T> first, JppIter<T> last) {
@@ -3230,7 +3427,7 @@ static class Jpp {
         int j = n - 1;
         while (compare(first.plus(i).get(), first.plus(j).get()) >= 0)
             --j;
-        Collections.swap(first.list, first.plus(i).pos, first.plus(j).pos);
+        Collections.swap(first.list, first.plus(i).index(), first.plus(j).index());
         reverse(first.plus(i + 1), last);
         return true;
     }

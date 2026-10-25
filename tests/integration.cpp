@@ -170,6 +170,7 @@ int main() {
         cases.emplace_back("heaps", expressions.str());
         cases.emplace_back("reference_returns", expressions.str());
         cases.emplace_back("map_swap", expressions.str());
+        cases.emplace_back("deques", expressions.str());
         cases.emplace_back("gnu", expressions.str());
         cases.emplace_back("pointers", expressions.str());
         cases.emplace_back("objects", expressions.str());

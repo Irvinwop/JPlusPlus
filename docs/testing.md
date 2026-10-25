@@ -54,6 +54,8 @@ Random-engine cases compare native `mt19937`, `mt19937_64`, an explicitly 32-bit
 
 Seed-sequence cases use empty, initializer-list, signed-integer range, and character range construction. Generation lengths cross the 7-, 39-, 68-, and 623-word mixing thresholds and include zero-length and single-element destinations. Guard elements detect writes outside a requested subrange. Native output checks wider destination types, repeated generation, parameter output through an insertion iterator, both standard Mersenne Twister engines, reseeding, and the zero-state safeguard in a two-bit configuration. Signed `labs`/`llabs` cases retain exact integer magnitudes above floating-point precision.
 
+Deque cases grow and wrap the buffer, retain element references and pointers, and keep an iterator across front and back removals. Container swaps distinguish references to the deques from aliases to their elements. Sorting, unique/erase, insertion, prefix and middle range erasure, resizing, unsigned comparisons, value copies, and record-member aliases are compared with native C++. Range construction checks that later source mutation does not affect stored values.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

@@ -740,7 +740,9 @@ class Emitter {
             return "JppMap<" + boxed(element(t)) + ", " + boxed(element(t, 1)) + ">";
         if (isSet(t))
             return "JppSet<" + boxed(element(t)) + ">";
-        if (n == "queue" || n == "deque" || n == "stack")
+        if (n == "deque")
+            return "JppDeque<" + boxed(element(t)) + ">";
+        if (n == "queue" || n == "stack")
             return "ArrayDeque<" + boxed(element(t)) + ">";
         if (n == "priority_queue")
             return "PriorityQueue<" + boxed(element(t)) + ">";
@@ -1366,7 +1368,8 @@ class Emitter {
                     auto objectType = member->getBase()->getType();
                     if (objectType->isPointerType())
                         objectType = objectType->getPointeeType();
-                    if (isVec(objectType) || isString(objectType) || isMap(objectType)) {
+                    if (isVec(objectType) || isString(objectType) || isMap(objectType) ||
+                        family(objectType) == "deque") {
                         auto object = expr(member->getBase()) + (member->isArrow() ? ".get()" : "");
                         if (n == "at" && isMap(objectType))
                             return "JppRef.mapAt(" + object + ", " + expr(c->getArg(0)) + ")";
@@ -1672,7 +1675,7 @@ class Emitter {
             return expr(base) + ".plus(" + intArgument(index) + ").put(" + rhs + ")";
         if (base && ctx.getAsArrayType(bare(base)->getType()))
             return expr(bare(base)) + "[" + intArgument(index) + "] = " + rhs;
-        if (base && isVec(base->getType()))
+        if (base && (isVec(base->getType()) || family(base->getType()) == "deque"))
             return "Jpp.set(" + expr(base) + ", " + intArgument(index) + ", " + rhs + ")";
         if (base && (isMap(base->getType()) || isString(base->getType())))
             return expr(base) + ".put(" +
@@ -1763,7 +1766,8 @@ class Emitter {
                                          element(rightType, 1));
             return "(" + first + " || (!" + reverse + " && " + second + "))";
         }
-        if (isVec(leftType) && isVec(rightType))
+        if ((isVec(leftType) || family(leftType) == "deque") &&
+            (isVec(rightType) || family(rightType) == "deque"))
             return "Jpp.lexicographicalLess(" + left + ", " + right + ", " +
                    comparisonPredicate(element(leftType), element(rightType)) + ", " +
                    comparisonPredicate(element(rightType), element(leftType)) + ")";
@@ -1970,6 +1974,11 @@ class Emitter {
             return std::string(op == "!=" ? "!" : "") + expr(lhs) + ".equals(" + expr(rhs) + ")";
         if ((op == "==" || op == "!=") && family(lhs->getType()) == "mersenne_twister_engine")
             return std::string(op == "!=" ? "!" : "") + expr(lhs) + ".sameState(" + expr(rhs) + ")";
+        if ((op == "<" || op == ">") &&
+            (isVec(lhs->getType()) || family(lhs->getType()) == "deque") &&
+            (isVec(rhs->getType()) || family(rhs->getType()) == "deque"))
+            return op == "<" ? lessExpression(expr(lhs), lhs->getType(), expr(rhs), rhs->getType())
+                             : lessExpression(expr(rhs), rhs->getType(), expr(lhs), lhs->getType());
         if (comparison && (lhs->getType()->isRecordType() || rhs->getType()->isRecordType()))
             return "(Jpp.compare(" + expr(lhs) + ", " + expr(rhs) + ") " + op + " 0)";
         return arithmetic(expr(lhs), lhs->getType(), expr(rhs), rhs->getType(), op);
@@ -2086,6 +2095,22 @@ class Emitter {
                 return "Jpp.vector(" + intArgument(args[0]) + ", " +
                        value(args[1], element(t), false) + ")";
             return "Jpp.vectorDefault(" + intArgument(args[0]) + ", () -> " +
+                   defaultValue(element(t)) + ")";
+        }
+        if (n == "deque") {
+            if (isa<CXXStdInitializerListExpr>(bare(args[0])))
+                return "new " + type(t) + "(" + expr(args[0]) + ")";
+            if (args.size() >= 2 &&
+                (isIter(args[0]->getType()) || dataPointer(args[0]->getType()))) {
+                auto word = temporary("jppValue");
+                return "Jpp.dequeFrom(" + asIterator(args[0]) + ", " + asIterator(args[1]) + ", " +
+                       word + " -> " +
+                       converted(word, iteratorElement(args[0]->getType()), element(t)) + ")";
+            }
+            if (args.size() == 2)
+                return "Jpp.dequeFill(" + intArgument(args[0]) + ", " + value(args[1], element(t)) +
+                       ")";
+            return "Jpp.dequeDefault(" + intArgument(args[0]) + ", () -> " +
                    defaultValue(element(t)) + ")";
         }
         if (n == "pair") {
@@ -2531,8 +2556,9 @@ class Emitter {
             }
             if (n == "push_back" && isVec(ot))
                 return o + ".add(" + join(args) + ")";
-            if (isVec(ot) && (n == "begin" || n == "end" || n == "cbegin" || n == "cend" ||
-                              n == "rbegin" || n == "rend"))
+            if ((isVec(ot) || family(ot) == "deque") &&
+                (n == "begin" || n == "end" || n == "cbegin" || n == "cend" || n == "rbegin" ||
+                 n == "rend"))
                 return "Jpp." +
                        std::string(n == "cbegin" ? "begin"
                                    : n == "cend" ? "end"
@@ -2544,7 +2570,8 @@ class Emitter {
                 return o + ".get(" + o + ".size() - 1)";
             if (isVec(ot) && n == "pop_back")
                 return o + ".remove(" + o + ".size() - 1)";
-            if (isVec(ot) && (n == "erase" || n == "insert" || n == "assign")) {
+            if ((isVec(ot) || family(ot) == "deque") &&
+                (n == "erase" || n == "insert" || n == "assign")) {
                 if (n == "assign" && !args.empty() && !isIter(c->getArg(0)->getType()))
                     args[0] = intArgument(c->getArg(0));
                 return "Jpp." + n + "(" + o + ", " + join(args) + ")";
@@ -2555,7 +2582,7 @@ class Emitter {
                     return o + ".add(new " + type(et) + "(" + join(args) + "))";
                 return o + ".add(" + join(args) + ")";
             }
-            if (n == "resize" && isVec(ot)) {
+            if (n == "resize" && (isVec(ot) || family(ot) == "deque")) {
                 if (c->getNumArgs() > 1 && !isa<CXXDefaultArgExpr>(c->getArg(1)))
                     return "Jpp.resize(" + o + ", " + intArgument(c->getArg(0)) + ", " +
                            value(c->getArg(1), element(ot), false) + ")";
@@ -2574,7 +2601,7 @@ class Emitter {
                 return "Jpp.ignore(" + o + ", " + expr(c->getArg(0)) + ")";
             if (n == "fill" && family(ot) == "array")
                 return "Jpp.fill(" + o + ", " + args[0] + ")";
-            if (n == "at" && (isVec(ot) || isString(ot)))
+            if (n == "at" && (isVec(ot) || isString(ot) || family(ot) == "deque"))
                 return o + ".get(" + intArgument(c->getArg(0)) + ")";
             if (isString(ot) && (n == "append" || n == "assign")) {
                 for (unsigned i = 0; i < args.size(); ++i) {
@@ -2767,6 +2794,8 @@ class Emitter {
         if (n == "make_pair")
             return "new " + type(c->getType()) + "(" + arguments(c) + ")";
         if (n == "swap" && isMap(c->getArg(0)->getType()))
+            return expr(c->getArg(0)) + ".swap(" + expr(c->getArg(1)) + ")";
+        if (n == "swap" && family(c->getArg(0)->getType()) == "deque")
             return expr(c->getArg(0)) + ".swap(" + expr(c->getArg(1)) + ")";
         if (n == "swap" && family(c->getArg(0)->getType()) == "bitset")
             return "JppBitset.swap(" + expr(c->getArg(0)) + ", " + expr(c->getArg(1)) + ")";
@@ -3335,8 +3364,8 @@ class Emitter {
                            (x->isPostfix() ? "true" : "false") + ")";
                 if (auto [base, index] = subscript(a);
                     base &&
-                    (isVec(base->getType()) || isMap(base->getType()) ||
-                     isString(base->getType()) ||
+                    (isVec(base->getType()) || family(base->getType()) == "deque" ||
+                     isMap(base->getType()) || isString(base->getType()) ||
                      (dataPointer(base->getType()) && !ctx.getAsArrayType(bare(base)->getType()))))
                     return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
                            (x->isPostfix() ? "true" : "false") + ")";
@@ -4182,7 +4211,7 @@ class Emitter {
             auto range = f->getRangeInit();
             if (v->getType()->isReferenceType() && !isa<DecompositionDecl>(v) &&
                 (isVec(range->getType()) || ctx.getAsArrayType(range->getType()) ||
-                 isString(range->getType()))) {
+                 isString(range->getType()) || family(range->getType()) == "deque")) {
                 references.insert(v);
                 auto seq = "jppRange" + std::to_string(++serial),
                      index = "jppIndex" + std::to_string(serial);
