@@ -38,6 +38,8 @@ Map-iterator cases retain entry, value, and address aliases across insertion and
 
 Binding cases mutate structs, pairs, built-in arrays, and `std::array` through structured bindings and compare addresses with the original members. A user copy constructor makes a pointer refer to the copied object's own field; mutating that binding must change the pointee while preserving the source object. Range-loop cases compare value copies with reference bindings for nested arrays.
 
+Bitset cases instantiate sizes 0, 1, 16, 63, 64, 65, and 129. They compare word-boundary and oversized shifts, masked complements, numeric and string construction, string prefixes with custom digits, unsigned conversion, GNU bit searches, and hashed keys copied before mutation. Proxy copies remain aliases across assignment and swap. Sequencing cases mutate an index or source bit during assignment so reading a proxy at the wrong time changes the result.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

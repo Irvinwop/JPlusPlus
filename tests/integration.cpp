@@ -258,6 +258,7 @@ int main() {
             unsignedCases << (i % 9 == 0 ? 0xffffffffU : static_cast<unsigned>(random())) << ' '
                           << (i < boundaries.size() ? boundaries[i] : random()) << '\n';
         cases.emplace_back("unsigned_conversions", unsignedCases.str());
+        cases.emplace_back("bitsets", unsignedCases.str());
         auto switchBoundaries = boundaries;
         switchBoundaries.insert(
             switchBoundaries.end(),

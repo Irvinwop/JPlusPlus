@@ -239,6 +239,235 @@ static class JppPair<A, B> implements Comparable<JppPair<A, B>>, JppAssignable<J
     }
 }
 
+static class JppBitset implements JppAssignable<JppBitset> {
+    final int length;
+    final BitSet bits;
+    JppBitset(int size) {
+        length = size;
+        bits = new BitSet(size);
+    }
+    JppBitset(int size, long value) {
+        length = size;
+        bits = BitSet.valueOf(new long[] {value});
+        if (bits.length() > size)
+            bits.clear(size, bits.length());
+    }
+    JppBitset(int size, String text, long position, long count, char zero, char one) {
+        this(size);
+        if (Long.compareUnsigned(position, text.length()) > 0)
+            throw new IndexOutOfBoundsException();
+        int start = (int)position, available = text.length() - start;
+        int selected = Long.compareUnsigned(count, available) < 0 ? (int)count : available;
+        for (int i = 0; i < selected; ++i) {
+            char c = text.charAt(start + i);
+            if (c != zero && c != one)
+                throw new IllegalArgumentException("invalid bitset character");
+        }
+        int used = Math.min(size, selected);
+        for (int i = 0; i < used; ++i)
+            if (text.charAt(start + used - i - 1) != zero)
+                bits.set(i);
+    }
+    int index(long position) {
+        if (Long.compareUnsigned(position, length) >= 0)
+            throw new IndexOutOfBoundsException();
+        return (int)position;
+    }
+    boolean get(long position) {
+        return bits.get(index(position));
+    }
+    boolean test(long position) {
+        return get(position);
+    }
+    JppBitRef ref(long position) {
+        return new JppBitRef(this, index(position));
+    }
+    int size() {
+        return length;
+    }
+    int count() {
+        return bits.cardinality();
+    }
+    int findFirst() {
+        int result = bits.nextSetBit(0);
+        return result < 0 ? length : result;
+    }
+    int findNext(long position) {
+        long start = position + 1;
+        if (Long.compareUnsigned(start, length) >= 0)
+            return length;
+        int result = bits.nextSetBit((int)start);
+        return result < 0 ? length : result;
+    }
+    boolean any() {
+        return !bits.isEmpty();
+    }
+    boolean none() {
+        return bits.isEmpty();
+    }
+    boolean all() {
+        return bits.nextClearBit(0) >= length;
+    }
+    JppBitset set() {
+        bits.set(0, length);
+        return this;
+    }
+    JppBitset set(long position) {
+        return set(position, true);
+    }
+    JppBitset set(long position, boolean value) {
+        bits.set(index(position), value);
+        return this;
+    }
+    JppBitset reset() {
+        bits.clear();
+        return this;
+    }
+    JppBitset reset(long position) {
+        return set(position, false);
+    }
+    JppBitset flip() {
+        bits.flip(0, length);
+        return this;
+    }
+    JppBitset flip(long position) {
+        bits.flip(index(position));
+        return this;
+    }
+    long toLong(int width) {
+        if (bits.nextSetBit(width) >= 0)
+            throw new ArithmeticException("bitset integer overflow");
+        long[] words = bits.toLongArray();
+        return words.length == 0 ? 0 : words[0];
+    }
+    JppString to_string(char zero, char one) {
+        StringBuilder text = new StringBuilder(length);
+        for (int i = length; i-- > 0;)
+            text.append(bits.get(i) ? one : zero);
+        return new JppString(text);
+    }
+    public String toString() {
+        return to_string('0', '1').toString();
+    }
+    public boolean equals(Object other) {
+        return other instanceof JppBitset && length == ((JppBitset)other).length &&
+            bits.equals(((JppBitset)other).bits);
+    }
+    public int hashCode() {
+        return 31 * length + bits.hashCode();
+    }
+    public JppBitset copy() {
+        JppBitset result = new JppBitset(length);
+        result.bits.or(bits);
+        return result;
+    }
+    public JppBitset jppAssignFrom(JppBitset source) {
+        if (source != this) {
+            bits.clear();
+            bits.or(source.bits);
+        }
+        return this;
+    }
+    static void swap(JppBitset left, JppBitset right) {
+        JppBitset temporary = left.copy();
+        left.jppAssignFrom(right);
+        right.jppAssignFrom(temporary);
+    }
+    static JppBitset andAssign(JppBitset source, JppBitset target) {
+        target.bits.and(source.bits);
+        return target;
+    }
+    static JppBitset orAssign(JppBitset source, JppBitset target) {
+        target.bits.or(source.bits);
+        return target;
+    }
+    static JppBitset xorAssign(JppBitset source, JppBitset target) {
+        target.bits.xor(source.bits);
+        return target;
+    }
+    JppBitset and(JppBitset other) {
+        return andAssign(other, copy());
+    }
+    JppBitset or(JppBitset other) {
+        return orAssign(other, copy());
+    }
+    JppBitset xor(JppBitset other) {
+        return xorAssign(other, copy());
+    }
+    JppBitset complement() {
+        return copy().flip();
+    }
+    private JppBitset shift(long amount, boolean left) {
+        if (Long.compareUnsigned(amount, length) >= 0) {
+            bits.clear();
+            return this;
+        }
+        if (amount == 0 || bits.isEmpty())
+            return this;
+        long[] source = bits.toLongArray();
+        long[] result = new long[(int)((length + 63L) / 64)];
+        int words = (int)(amount >>> 6), remainder = (int)(amount & 63);
+        for (int i = left ? 0 : words; i < source.length; ++i) {
+            int target = left ? i + words : i - words;
+            if (target < result.length)
+                result[target] |= left ? source[i] << remainder : source[i] >>> remainder;
+            int carry = target + (left ? 1 : -1);
+            if (remainder != 0 && carry >= 0 && carry < result.length)
+                result[carry] |= left ? source[i] >>> (64 - remainder)
+                                     : source[i] << (64 - remainder);
+        }
+        if ((length & 63) != 0)
+            result[result.length - 1] &= (1L << (length & 63)) - 1;
+        bits.clear();
+        bits.or(BitSet.valueOf(result));
+        return this;
+    }
+    JppBitset shiftLeft(long amount) {
+        return copy().shift(amount, true);
+    }
+    JppBitset shiftRight(long amount) {
+        return copy().shift(amount, false);
+    }
+    static JppBitset shiftLeftAssign(long amount, JppBitset target) {
+        return target.shift(amount, true);
+    }
+    static JppBitset shiftRightAssign(long amount, JppBitset target) {
+        return target.shift(amount, false);
+    }
+}
+
+static class JppBitRef implements JppCopyable<JppBitRef> {
+    final JppBitset owner;
+    final int index;
+    JppBitRef(JppBitset value, int position) {
+        owner = value;
+        index = position;
+    }
+    boolean get() {
+        return owner.bits.get(index);
+    }
+    JppBitRef assign(boolean value) {
+        owner.bits.set(index, value);
+        return this;
+    }
+    JppBitRef assign(JppBitRef other) {
+        return assign(other.get());
+    }
+    static JppBitRef assign(boolean value, JppBitRef target) {
+        return target.assign(value);
+    }
+    static JppBitRef assign(JppBitRef source, JppBitRef target) {
+        return target.assign(source);
+    }
+    JppBitRef flip() {
+        owner.bits.flip(index);
+        return this;
+    }
+    public JppBitRef copy() {
+        return new JppBitRef(owner, index);
+    }
+}
+
 static class JppString
     implements Comparable<JppString>, Iterable<Character>, JppAssignable<JppString> {
     private final StringBuilder data;

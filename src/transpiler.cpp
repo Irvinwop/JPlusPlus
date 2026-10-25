@@ -100,6 +100,10 @@ const std::set<std::string> javaRuntimeNames = {
     "UnsupportedOperationException",
     "IllegalArgumentException",
     "IndexOutOfBoundsException",
+    "BitSet",
+    "ArithmeticException",
+    "AbstractList",
+    "NoSuchElementException",
     "AssertionError",
     "NumberFormatException"};
 
@@ -554,6 +558,19 @@ class Emitter {
     bool isString(QualType t) const {
         return family(t) == "basic_string" || family(t) == "basic_string_view";
     }
+    bool bitReference(QualType t) const {
+        auto r = record(t);
+        if (!r || user(r) || r->getName() != "reference")
+            return false;
+        auto owner = dyn_cast<CXXRecordDecl>(r->getDeclContext());
+        return owner && !user(owner) && owner->getName() == "bitset";
+    }
+    std::string bitsetSize(QualType t) {
+        auto bound = templateArgs(t)[0].getAsIntegral();
+        if (bound.getActiveBits() > 31)
+            fail(SourceLocation(), "bitset bound exceeds Java's indexed collection limit");
+        return number(bound);
+    }
     bool fileStream(QualType t) const {
         auto n = family(t);
         return n == "basic_ifstream" || n == "basic_ofstream";
@@ -687,6 +704,10 @@ class Emitter {
             return functionType(lambdaOperator(r)->getType()->getAs<FunctionProtoType>());
         if (isString(t))
             return "JppString";
+        if (family(t) == "bitset")
+            return "JppBitset";
+        if (bitReference(t))
+            return "JppBitRef";
         if (isVec(t))
             return "ArrayList<" + boxed(element(t)) + ">";
         if (n == "pair")
@@ -765,6 +786,8 @@ class Emitter {
             return "new " + type(t) + "((String)null)";
         if (t->isPointerType() || family(t) == "function")
             return "null";
+        if (family(t) == "bitset")
+            return "new JppBitset(" + bitsetSize(t) + ")";
         if (family(t) == "less" || family(t) == "greater")
             return element(t)->isVoidType()
                        ? "(" + jt + ") ((a, b) -> Jpp.compare(a, b) " +
@@ -1833,6 +1856,8 @@ class Emitter {
                 return "(Jpp.cString(" + expr(lhs) + ").compareTo(Jpp.cString(" + expr(rhs) +
                        ")) " + op + " 0)";
         }
+        if ((op == "==" || op == "!=") && family(lhs->getType()) == "bitset")
+            return std::string(op == "!=" ? "!" : "") + expr(lhs) + ".equals(" + expr(rhs) + ")";
         if (comparison && (lhs->getType()->isRecordType() || rhs->getType()->isRecordType()))
             return "(Jpp.compare(" + expr(lhs) + ", " + expr(rhs) + ") " + op + " 0)";
         return arithmetic(expr(lhs), lhs->getType(), expr(rhs), rhs->getType(), op);
@@ -1863,6 +1888,21 @@ class Emitter {
         if (args.empty())
             return defaultValue(t);
         auto n = family(t);
+        if (n == "bitset") {
+            if (args[0]->getType()->isArithmeticType() || args[0]->getType()->isEnumeralType())
+                return "new JppBitset(" + bitsetSize(t) + ", " +
+                       value(args[0], ctx.UnsignedLongLongTy) + ")";
+            bool string = isString(args[0]->getType());
+            auto position =
+                string && args.size() > 1 ? value(args[1], ctx.UnsignedLongLongTy) : "0L";
+            unsigned countIndex = string ? 2 : 1;
+            auto count =
+                args.size() > countIndex ? value(args[countIndex], ctx.UnsignedLongLongTy) : "-1L";
+            auto zero = args.size() > countIndex + 1 ? expr(args[countIndex + 1]) : "'0'";
+            auto one = args.size() > countIndex + 2 ? expr(args[countIndex + 2]) : "'1'";
+            return "new JppBitset(" + bitsetSize(t) + ", Jpp.cString(" + expr(args[0]) + "), " +
+                   position + ", " + count + ", " + zero + ", " + one + ")";
+        }
         if (fileStream(t)) {
             std::vector<std::string> a = {"Jpp.cString(" + expr(args[0]) + ")"};
             if (args.size() > 1)
@@ -2080,6 +2120,46 @@ class Emitter {
                 return object + "." + allocatedName + "(" + arguments(c, f) + ")";
             }
             auto n = me->getMemberDecl()->getNameAsString();
+            if (bitReference(ot)) {
+                auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                if (n == "operator bool")
+                    return object + ".get()";
+                if (n == "operator~")
+                    return "!" + object + ".get()";
+                if (n == "flip")
+                    return object + ".flip()";
+                fail(c, "unsupported bitset reference operation " + n);
+            }
+            if (family(ot) == "bitset") {
+                auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                if (n == "count" || n == "size")
+                    return integerResult(c, object + "." + n + "()");
+                if (n == "_Find_first")
+                    return integerResult(c, object + ".findFirst()");
+                if (n == "_Find_next")
+                    return integerResult(c, object + ".findNext(" +
+                                                value(c->getArg(0), ctx.UnsignedLongLongTy) + ")");
+                if (n == "any" || n == "all" || n == "none")
+                    return object + "." + n + "()";
+                if (n == "to_ulong" || n == "to_ullong")
+                    return converted(object + ".toLong(" +
+                                         std::to_string(ctx.getTypeSize(c->getType())) + ")",
+                                     ctx.UnsignedLongLongTy, c->getType());
+                if (n == "set" || n == "reset" || n == "flip" || n == "test") {
+                    std::vector<std::string> args;
+                    for (unsigned i = 0; i < c->getNumArgs(); ++i)
+                        if (!isa<CXXDefaultArgExpr>(c->getArg(i)))
+                            args.push_back(i == 0 ? value(c->getArg(i), ctx.UnsignedLongLongTy)
+                                                  : truth(c->getArg(i)));
+                    return object + "." + n + "(" + join(args) + ")";
+                }
+                if (n == "to_string") {
+                    auto zero = c->getNumArgs() ? expr(c->getArg(0)) : "'0'";
+                    auto one = c->getNumArgs() > 1 ? expr(c->getArg(1)) : "'1'";
+                    return object + ".to_string(" + zero + ", " + one + ")";
+                }
+                fail(c, "unsupported bitset operation " + n);
+            }
             if (n == "sync_with_stdio")
                 return "Jpp.last(" + expr(obj) + ", JppIoState.sync(" + truth(c->getArg(0)) + "))";
             if (stream(ot)) {
@@ -2411,6 +2491,8 @@ class Emitter {
             return "Jpp.assertFail()";
         if (n == "make_pair")
             return "new " + type(c->getType()) + "(" + arguments(c) + ")";
+        if (n == "swap" && family(c->getArg(0)->getType()) == "bitset")
+            return "JppBitset.swap(" + expr(c->getArg(0)) + ", " + expr(c->getArg(1)) + ")";
         if (n == "swap")
             return "Jpp.swap(" + reference(c->getArg(0)) + ", " + reference(c->getArg(1)) + ")";
         if (n == "flush")
@@ -3030,6 +3112,41 @@ class Emitter {
                 return outputChain(x);
             if (op == OO_GreaterGreater && x->getNumArgs() == 2 && stream(x->getArg(0)->getType()))
                 return inputExpression(x);
+            if (x->getNumArgs() && bitReference(x->getArg(0)->getType())) {
+                if (op == OO_Equal && x->getNumArgs() == 2)
+                    return "JppBitRef.assign(" + expr(x->getArg(1)) + ", " + expr(x->getArg(0)) +
+                           ")";
+                if (op == OO_Tilde)
+                    return "!" + expr(x->getArg(0)) + ".get()";
+            }
+            if (x->getNumArgs() && family(x->getArg(0)->getType()) == "bitset") {
+                auto object = expr(x->getArg(0));
+                if (op == OO_Tilde)
+                    return object + ".complement()";
+                if (op == OO_Subscript)
+                    return object + (bitReference(x->getType()) ? ".ref(" : ".get(") +
+                           value(x->getArg(1), ctx.UnsignedLongLongTy) + ")";
+                if (op == OO_LessLess || op == OO_GreaterGreater)
+                    return object + (op == OO_LessLess ? ".shiftLeft(" : ".shiftRight(") +
+                           value(x->getArg(1), ctx.UnsignedLongLongTy) + ")";
+                std::string operation;
+                if (op == OO_Amp || op == OO_AmpEqual)
+                    operation = "and";
+                if (op == OO_Pipe || op == OO_PipeEqual)
+                    operation = "or";
+                if (op == OO_Caret || op == OO_CaretEqual)
+                    operation = "xor";
+                if (!operation.empty()) {
+                    if (isCompoundAssignmentOperator(op))
+                        return "JppBitset." + operation + "Assign(" + expr(x->getArg(1)) + ", " +
+                               object + ")";
+                    return object + "." + operation + "(" + expr(x->getArg(1)) + ")";
+                }
+                if (op == OO_LessLessEqual || op == OO_GreaterGreaterEqual)
+                    return std::string("JppBitset.") +
+                           (op == OO_LessLessEqual ? "shiftLeftAssign(" : "shiftRightAssign(") +
+                           value(x->getArg(1), ctx.UnsignedLongLongTy) + ", " + object + ")";
+            }
             if (op == OO_Subscript) {
                 auto b = x->getArg(0);
                 auto i = x->getArg(1);
