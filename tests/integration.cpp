@@ -174,6 +174,10 @@ int main() {
         cases.emplace_back("gnu", expressions.str());
         cases.emplace_back("pointers", expressions.str());
         cases.emplace_back("memory", expressions.str());
+        cases.emplace_back("array_views", expressions.str());
+        cases.emplace_back("array_literals", expressions.str());
+        cases.emplace_back("vla_bounds", expressions.str());
+        cases.emplace_back("vla_types", expressions.str());
         cases.emplace_back("chrono", expressions.str());
         cases.emplace_back("frontend_arrays", "");
 #ifdef JPP_TEST_GNU_FRONTEND
