@@ -69,4 +69,13 @@ int main() {
     missing.clear();
     missing.open("jpp-io-values.txt");
     cout << bool(missing) << ' ' << missing.is_open() << '\n';
+    {
+        ifstream captured("jpp-io-values.txt");
+        auto read = [&] {
+            long long value;
+            captured >> value;
+            return value;
+        };
+        cout << read() << '\n';
+    }
 }

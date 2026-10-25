@@ -332,9 +332,12 @@ class Emitter {
     std::unordered_set<std::string> reservedNames;
     std::unordered_set<const VarDecl*> cells;
     std::unordered_set<const VarDecl*> references;
+    std::unordered_set<const VarDecl*> hoistedVariables;
+    std::unordered_map<const LabelDecl*, std::string> jumpLabels;
     std::unordered_map<const FunctionProtoType*, std::string> functionTypes;
     std::vector<std::pair<const FunctionProtoType*, std::string>> interfaces;
     const FunctionDecl* current = nullptr;
+    std::vector<const FunctionDecl*> enclosingFunctions;
     const CXXRecordDecl* currentRecord = nullptr;
 
     [[noreturn]] void fail(SourceLocation loc, const std::string& message) const {
@@ -396,6 +399,17 @@ class Emitter {
             base = "anonymous";
         if (auto v = dyn_cast<VarDecl>(d);
             current && ((v && v->isLocalVarDeclOrParm()) || isa<BindingDecl>(d))) {
+            bool shadows = std::any_of(names.begin(), names.end(), [&](const auto& entry) {
+                if (entry.second != base)
+                    return false;
+                auto function = dyn_cast<FunctionDecl>(entry.first->getDeclContext());
+                return function && std::any_of(enclosingFunctions.begin(), enclosingFunctions.end(),
+                    [&](const FunctionDecl* outer) {
+                        return outer->getCanonicalDecl() == function->getCanonicalDecl();
+                    });
+            });
+            if (shadows)
+                base = temporary(base + "_lambda");
             int count = ++localNames[current][base];
             if (count > 1)
                 base += "_" + std::to_string(count);
@@ -1203,6 +1217,18 @@ class Emitter {
                ") -> " + calculate(left, right) + ")";
     }
     std::string binary(const Expr* lhs, const Expr* rhs, std::string op, QualType result) {
+        auto position = [&](QualType t) {
+            return isIter(t) || (t->isPointerType() && t->getPointeeType()->isArithmeticType());
+        };
+        if ((op == "+=" || op == "-=") && isIter(lhs->getType()))
+            return "Jpp.advance(" + std::string(op == "-=" ? "-(" : "(") + intArgument(rhs) +
+                   "), " + expr(lhs) + ")";
+        if (op == "+" && position(rhs->getType()) && lhs->getType()->isIntegerType())
+            return asIterator(rhs) + ".plus(" + intArgument(lhs) + ")";
+        if (op == "-" && position(lhs->getType()) && position(rhs->getType())) {
+            auto difference = asIterator(lhs) + ".minus(" + asIterator(rhs) + ")";
+            return ctx.getTypeSize(clean(result)) > 32 ? "(long)(" + difference + ")" : difference;
+        }
         if (op == "=") {
             auto v = value(rhs, lhs->getType(), true);
             if (!isa<DeclRefExpr>(bare(lhs)) &&
@@ -2162,7 +2188,7 @@ class Emitter {
             auto base = identifier(p->getNameAsString());
             if (std::any_of(names.begin(), names.end(),
                             [&](const auto& n) { return n.first != p && n.second == base; }))
-                names[p] = base + "_lambda" + std::to_string(++serial);
+                names[p] = temporary(base + "_lambda");
             params.push_back(parameterType(p->getType()) + " " +
                              (cells.count(p) && !references.count(p) ? "jppParam_" : "") + name(p));
         }
@@ -2183,6 +2209,9 @@ class Emitter {
         auto old = out.str();
         auto oldIndent = indent;
         auto oldCurrent = current;
+        auto oldEnclosing = enclosingFunctions.size();
+        if (oldCurrent)
+            enclosingFunctions.push_back(oldCurrent);
         current = f;
         out.str("");
         out.clear();
@@ -2207,6 +2236,7 @@ class Emitter {
         out.seekp(0, std::ios_base::end);
         indent = oldIndent;
         current = oldCurrent;
+        enclosingFunctions.resize(oldEnclosing);
         aliases = std::move(oldAliases);
         if (!captures.empty())
             return "new " + functionType(f->getType()->getAs<FunctionProtoType>()) + "() { " +
@@ -2369,8 +2399,11 @@ class Emitter {
     bool terminates(const Stmt* s) const {
         if (!s)
             return false;
-        if (isa<ReturnStmt>(s) || isa<CXXThrowExpr>(s) || isa<BreakStmt>(s) || isa<ContinueStmt>(s))
+        if (isa<ReturnStmt>(s) || isa<CXXThrowExpr>(s) || isa<BreakStmt>(s) || isa<ContinueStmt>(s) ||
+            isa<GotoStmt>(s))
             return true;
+        if (auto label = dyn_cast<LabelStmt>(s))
+            return terminates(label->getSubStmt());
         if (auto b = dyn_cast<CompoundStmt>(s))
             return !b->body_empty() && terminates(b->body_back());
         if (auto i = dyn_cast<IfStmt>(s))
@@ -2378,9 +2411,73 @@ class Emitter {
         return false;
     }
     void bodyStatements(const CompoundStmt* body) {
+        struct Exit {
+            const LabelDecl* label;
+            size_t begin, end;
+        };
+        std::vector<const Stmt*> statements(body->body_begin(), body->body_end());
+        std::vector<Exit> exits;
+        for (size_t target = 0; target < statements.size(); ++target) {
+            auto label = dyn_cast<LabelStmt>(statements[target]);
+            if (!label)
+                continue;
+            size_t begin = target;
+            std::function<void(const Stmt*, size_t)> find = [&](const Stmt* s, size_t index) {
+                if (!s || isa<LambdaExpr>(s))
+                    return;
+                if (auto jump = dyn_cast<GotoStmt>(s); jump && jump->getLabel() == label->getDecl()) {
+                    if (index >= target)
+                        fail(jump, "backward goto requires additional control flow lowering");
+                    begin = std::min(begin, index);
+                }
+                for (auto child : s->children())
+                    find(child, index);
+            };
+            for (size_t i = 0; i < statements.size(); ++i)
+                find(statements[i], i);
+            if (begin < target)
+                exits.push_back({label->getDecl(), begin, target});
+        }
+        // Crossing forward exits become nested labeled blocks, ordered by destination.
+        for (size_t i = 0; i < exits.size(); ++i)
+            for (size_t j = i + 1; j < exits.size(); ++j)
+                if (exits[j].begin > exits[i].begin && exits[j].begin < exits[i].end)
+                    exits[j].begin = exits[i].begin;
+        for (size_t i = 0; i < statements.size(); ++i)
+            if (std::any_of(exits.begin(), exits.end(), [&](const Exit& e) { return i >= e.begin && i < e.end; }))
+                if (auto declarations = dyn_cast<DeclStmt>(statements[i]))
+                    for (auto decl : declarations->decls())
+                        if (auto v = dyn_cast<VarDecl>(decl);
+                            v && v->hasLocalStorage() && !v->hasInit() &&
+                            hoistedVariables.insert(v).second)
+                            line(variable(v) + ";");
+        auto previousLabels = jumpLabels;
         unsigned resources = 0;
-        for (auto child : body->body()) {
-            auto declarations = dyn_cast<DeclStmt>(child);
+        bool dead = false;
+        for (size_t i = 0; i < statements.size(); ++i) {
+            auto child = statements[i];
+            for (const auto& exit : exits)
+                if (exit.end == i && jumpLabels.count(exit.label)) {
+                    --indent;
+                    line("}");
+                    jumpLabels.erase(exit.label);
+                    dead = false;
+                }
+            for (auto exit = exits.rbegin(); exit != exits.rend(); ++exit)
+                if (exit->begin == i && !dead) {
+                    auto label = name(exit->label);
+                    line(label + ": {");
+                    ++indent;
+                    jumpLabels[exit->label] = label;
+                }
+            if (isa<SwitchCase>(child))
+                dead = false;
+            if (dead)
+                continue;
+            const Stmt* declarationStatement = child;
+            while (auto label = dyn_cast<LabelStmt>(declarationStatement))
+                declarationStatement = label->getSubStmt();
+            auto declarations = dyn_cast<DeclStmt>(declarationStatement);
             bool ownsStream = false;
             if (declarations)
                 for (auto decl : declarations->decls())
@@ -2389,6 +2486,7 @@ class Emitter {
                         ownsStream = true;
             if (!ownsStream) {
                 stmt(child);
+                dead = terminates(child);
                 continue;
             }
             for (auto decl : declarations->decls()) {
@@ -2396,7 +2494,12 @@ class Emitter {
                 if (!v)
                     fail(child, "unsupported declaration alongside a file stream");
                 if (fileStream(v->getType()) && !v->getType()->isReferenceType()) {
-                    line("try (" + variable(v) + ") {");
+                    if (cell(v)) {
+                        line(variable(v) + ";");
+                        line("try (" + type(v->getType()) + " " + temporary("jppResource") +
+                             " = " + name(v) + ".get()) {");
+                    } else
+                        line("try (" + variable(v) + ") {");
                     ++indent;
                     ++resources;
                 } else
@@ -2407,6 +2510,7 @@ class Emitter {
             --indent;
             line("}");
         }
+        jumpLabels = std::move(previousLabels);
     }
     void block(const Stmt* s) {
         line("{");
@@ -2429,9 +2533,10 @@ class Emitter {
         }
         if (auto d = dyn_cast<DeclStmt>(s)) {
             for (auto decl : d->decls()) {
-                if (auto v = dyn_cast<VarDecl>(decl))
-                    line(variable(v) + ";");
-                else if (isa<TypedefNameDecl>(decl) || isa<UsingDecl>(decl) ||
+                if (auto v = dyn_cast<VarDecl>(decl)) {
+                    if (!hoistedVariables.count(v))
+                        line(variable(v) + ";");
+                } else if (isa<TypedefNameDecl>(decl) || isa<UsingDecl>(decl) ||
                          isa<UsingDirectiveDecl>(decl) || isa<StaticAssertDecl>(decl))
                     continue;
                 else
@@ -2441,6 +2546,17 @@ class Emitter {
         }
         if (auto e = dyn_cast<Expr>(s)) {
             expressionStatement(e);
+            return;
+        }
+        if (auto jump = dyn_cast<GotoStmt>(s)) {
+            if (auto label = jumpLabels.find(jump->getLabel()); label != jumpLabels.end())
+                line("break " + label->second + ";");
+            else
+                fail(jump, "goto into another scope requires additional control flow lowering");
+            return;
+        }
+        if (auto label = dyn_cast<LabelStmt>(s)) {
+            stmt(label->getSubStmt());
             return;
         }
         if (auto r = dyn_cast<ReturnStmt>(s)) {

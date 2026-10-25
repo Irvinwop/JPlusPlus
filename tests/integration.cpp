@@ -130,6 +130,7 @@ int main() {
         }
         cases.emplace_back("arrays", sequence.str());
         cases.emplace_back("vectors", sequence.str());
+        cases.emplace_back("iterators", sequence.str());
         std::ostringstream graph;
         graph << 55 << ' ' << 400 << '\n';
         for (int i = 0; i < 400; ++i)
@@ -149,6 +150,7 @@ int main() {
             keys << r(70) - 35 << ' ';
         keys << '\n';
         cases.emplace_back("maps", keys.str());
+        cases.emplace_back("jumps", keys.str());
         cases.emplace_back("lambdas", "17\n");
         cases.emplace_back("cpp23", "-9\n");
         std::ostringstream bits;

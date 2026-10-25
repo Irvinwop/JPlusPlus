@@ -1373,6 +1373,9 @@ static final JppInput jppIn = new JppInput();
 static final JppOutput jppOut = new JppOutput(System.out), jppErr = new JppOutput(System.err);
 
 static class Jpp {
+    static <T> JppIter<T> advance(int amount, JppIter<T> position) {
+        return position.advance(amount);
+    }
     static <T> T extract(JppInput source, JppRef<T> destination,
                          java.util.function.BiFunction<JppInput, T, T> reader) {
         return destination.set(reader.apply(source, destination.get()));

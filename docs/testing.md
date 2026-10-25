@@ -10,6 +10,8 @@ File fixtures run in an isolated working directory and compare both console outp
 
 Extraction regressions compare signed and unsigned integer limits, narrow integer overflow, boolean failure states, floating prefixes and overflow, unchanged destinations after failure, and source/destination expressions with side effects. Line-reading cases include carriage returns and a final line without a newline.
 
+Forward-jump cases compare nested exits, crossing destinations, declarations used after a label, unreachable statements, switch cases, and file closing on a jump. Iterator cases exercise both operand orders of array/iterator addition, raw-array bound differences, compound iterator movement, reverse iterators, and deferred iterator assignment.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

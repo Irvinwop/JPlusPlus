@@ -7,7 +7,7 @@ J++ is an experimental source transpiler for competitive programming. **It does 
 | Area | Implemented paths |
 | :-- | :-- |
 | Frontend | GNU++23, preprocessing, local includes, `bits/stdc++.h`, aliases, resolved overloads, concrete function template instantiations |
-| Control flow | Functions, recursion, blocks, `if`, `if constexpr`, runtime branches of `if consteval`, loops, switch, break, continue, return |
+| Control flow | Functions, recursion, blocks, `if`, `if constexpr`, runtime branches of `if consteval`, loops, switch, break, continue, return, forward goto exits to enclosing blocks |
 | Expressions | Chained assignments, boolean arithmetic and numeric conversions, arithmetic compound assignments, void comma/conditional expressions; RHS-before-destination sequencing and one destination evaluation for supported lvalues |
 | Types | Boolean, character, signed integer and floating primitives; common unsigned 32/64-bit operations; enums; signed `__int128` arithmetic via `BigInteger` |
 | Arrays | Fixed bounds, GNU variable length arrays, multidimensional primitive arrays, partial initialization, string-initialized character arrays |
@@ -23,6 +23,7 @@ Implemented paths have limits. A container appearing in this table does not impl
 ## Known gaps
 
 - Arbitrary raw pointers, pointer arithmetic outside supported array ranges, general address-taking, and storage layout dependent code.
+- Backward and computed jumps, jumps into nested scopes, and full unstructured control flow.
 - Full object lifetimes and RAII, user-defined destructors, inheritance, unions, bitfields, RTTI, and exceptions.
 - Generic lambdas with multiple concrete call signatures, every capture mode, all reference-returning expressions, and full iterator/reference invalidation semantics. Node-value merging does not yet preserve iterator identity across containers.
 - Coroutines, modules, concurrency, atomics, platform APIs, inline assembly, and target-specific SIMD intrinsics.
