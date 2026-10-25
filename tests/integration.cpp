@@ -259,6 +259,12 @@ int main() {
                           << (i < boundaries.size() ? boundaries[i] : random()) << '\n';
         cases.emplace_back("unsigned_conversions", unsignedCases.str());
         cases.emplace_back("bitsets", unsignedCases.str());
+        std::string byteInput = "4\nélève 日本語\n";
+        byteInput += "\xff\x80X\n";
+        byteInput += std::string("prefix") + '\0' + "suffix\n";
+        byteInput += "\r\n";
+        byteInput += "élève\xff token\x80\n";
+        cases.emplace_back("bytes", byteInput);
         auto switchBoundaries = boundaries;
         switchBoundaries.insert(
             switchBoundaries.end(),
@@ -333,6 +339,8 @@ int main() {
                 outputNames = {"jpp-static.txt", "jpp-static-ref.txt"};
             else if (name == "halt")
                 outputNames = {"jpp-halt.txt"};
+            else if (name == "bytes")
+                outputNames = {"jpp-byte-é.txt"};
             for (const auto& output : outputNames) {
                 if (!fs::exists(p / output))
                     throw std::runtime_error("native file output is missing: " + name + ", " +

@@ -479,9 +479,26 @@ static class JppString
                                      ? Jpp.cString(value)
                                      : String.valueOf(value));
     }
-    JppString(int count, char value) {
-        data = new StringBuilder(count);
-        while (count-- > 0)
+    JppString(Collection<Character> values) {
+        data = new StringBuilder(values.size());
+        for (char value : values)
+            data.append(value);
+    }
+    JppString(JppIter<Character> source, long count) {
+        int size = Jpp.stringSize(count);
+        data = new StringBuilder(size);
+        for (int i = 0; i < size; ++i)
+            data.append((char)source.plus(i).get());
+    }
+    JppString(JppIter<Character> first, JppIter<Character> last) {
+        data = new StringBuilder();
+        for (JppIter<Character> at = first.plus(0); !at.same(last); at.advance(1))
+            data.append((char)at.get());
+    }
+    JppString(long count, char value) {
+        int length = Jpp.stringSize(count);
+        data = new StringBuilder(length);
+        while (length-- > 0)
             data.append(value);
     }
     public JppString copy() {
@@ -505,6 +522,22 @@ static class JppString
     int length() {
         return size();
     }
+    int capacity() {
+        return data.capacity();
+    }
+    void reserve(long count) {
+        data.ensureCapacity(Jpp.stringSize(count));
+    }
+    void resize(long count, char fill) {
+        int length = Jpp.stringSize(count);
+        if (fill == '\0' || length <= size())
+            data.setLength(length);
+        else {
+            data.ensureCapacity(length);
+            while (size() < length)
+                data.append(fill);
+        }
+    }
     boolean empty() {
         return size() == 0;
     }
@@ -518,6 +551,45 @@ static class JppString
     JppString append(Object value) {
         data.append(Jpp.cString(value));
         return this;
+    }
+    JppString append(long count, char value) {
+        return append(new JppString(count, value));
+    }
+    JppString append(JppIter<Character> source, long count) {
+        return append(new JppString(source, count));
+    }
+    JppString append(JppIter<Character> first, JppIter<Character> last) {
+        return append(new JppString(first, last));
+    }
+    JppString append(Collection<Character> values) {
+        return append(new JppString(values));
+    }
+    JppString append(JppString source, long start) {
+        return append(source.substr(start));
+    }
+    JppString append(JppString source, long start, long count) {
+        return append(source.substr(start, count));
+    }
+    JppString assign(Object value) {
+        return jppSetText(Jpp.cString(value));
+    }
+    JppString assign(long count, char value) {
+        return jppAssignFrom(new JppString(count, value));
+    }
+    JppString assign(JppIter<Character> source, long count) {
+        return jppAssignFrom(new JppString(source, count));
+    }
+    JppString assign(JppIter<Character> first, JppIter<Character> last) {
+        return jppAssignFrom(new JppString(first, last));
+    }
+    JppString assign(Collection<Character> values) {
+        return jppAssignFrom(new JppString(values));
+    }
+    JppString assign(JppString source, long start) {
+        return jppAssignFrom(source.substr(start));
+    }
+    JppString assign(JppString source, long start, long count) {
+        return jppAssignFrom(source.substr(start, count));
     }
     void push_back(char c) {
         data.append(c);
@@ -534,19 +606,28 @@ static class JppString
     char back() {
         return get(size() - 1);
     }
-    JppString substr(int start) {
-        return new JppString(data.substring(start));
+    JppString substr(long start) {
+        return substr(start, -1L);
     }
-    JppString substr(int start, int length) {
-        return new JppString(data.substring(start, Math.min(size(), start + length)));
+    JppString substr(long start, long length) {
+        if (Long.compareUnsigned(start, size()) > 0)
+            throw new IndexOutOfBoundsException();
+        int available = size() - (int)start;
+        int count = Long.compareUnsigned(length, available) < 0 ? (int)length : available;
+        return new JppString(data.substring((int)start, (int)start + count));
     }
     long find(Object value) {
         int n = data.indexOf(Jpp.cString(value));
         return n < 0 ? -1L : n;
     }
-    long find(Object value, int from) {
-        int n = data.indexOf(Jpp.cString(value), from);
+    long find(Object value, long from) {
+        if (Long.compareUnsigned(from, size()) > 0)
+            return -1L;
+        int n = data.indexOf(Jpp.cString(value), (int)from);
         return n < 0 ? -1L : n;
+    }
+    long find(JppIter<Character> value, long from, long count) {
+        return find(new JppString(value, count), from);
     }
     JppIter<Character> begin() {
         return new JppIter<Character>(view(), 0, 1, this);
@@ -1314,7 +1395,7 @@ static class JppInput extends JppStreamState implements AutoCloseable {
             return;
         }
         try {
-            input = new FileInputStream(path);
+            input = new FileInputStream(Jpp.filePath(path));
             pos = size = 0;
             saved = -2;
             good = true;
@@ -1502,7 +1583,7 @@ static class JppInput extends JppStreamState implements AutoCloseable {
             c = readByte();
         }
         saved = c;
-        String text = new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+        String text = new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.ISO_8859_1);
         return previous == null ? new JppString(text) : previous.jppSetText(text);
     }
     double nextDouble() {
@@ -1588,7 +1669,7 @@ static class JppInput extends JppStreamState implements AutoCloseable {
             bytes.write(c);
         if (c < 0 && bytes.size() == 0)
             good = false;
-        String text = new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+        String text = new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.ISO_8859_1);
         return previous == null ? new JppString(text) : previous.jppSetText(text);
     }
 }
@@ -1793,7 +1874,7 @@ static class JppOutput extends JppStreamState implements AutoCloseable {
     boolean boolalpha, good = true, ended, unitBuffered;
     JppOutput(OutputStream stream) {
         output = new PrintWriter(new BufferedWriter(
-            new OutputStreamWriter(stream, java.nio.charset.StandardCharsets.UTF_8)));
+            new OutputStreamWriter(stream, java.nio.charset.StandardCharsets.ISO_8859_1)));
     }
     JppOutput(OutputStream stream, boolean errorStream) {
         this(stream);
@@ -1824,8 +1905,8 @@ static class JppOutput extends JppStreamState implements AutoCloseable {
         }
         try {
             output = new PrintWriter(new BufferedWriter(
-                new OutputStreamWriter(new FileOutputStream(path, (mode & 1) != 0),
-                                       java.nio.charset.StandardCharsets.UTF_8)));
+                new OutputStreamWriter(new FileOutputStream(Jpp.filePath(path), (mode & 1) != 0),
+                                       java.nio.charset.StandardCharsets.ISO_8859_1)));
             good = true;
         } catch (IOException e) {
             good = false;
@@ -2002,8 +2083,7 @@ static class JppOutput extends JppStreamState implements AutoCloseable {
                     value instanceof Character ? (Character)value : ((Number)value).intValue();
                 text = Character.toString((char)(code & 255));
             } else if (c == 'n') {
-                int count =
-                    result.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+                int count = result.length();
                 Object countValue = length.isEmpty() || length.equals("h") || length.equals("hh")
                                         ? (Object)Integer.valueOf(count)
                                         : (Object)Long.valueOf(count);
@@ -2046,7 +2126,7 @@ static class JppOutput extends JppStreamState implements AutoCloseable {
         }
         String text = result.toString();
         output.print(text);
-        return text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        return text.length();
     }
 }
 
@@ -2056,6 +2136,18 @@ static final JppOutput jppOut = new JppOutput(System.out),
                       jppLog = new JppOutput(jppErr);
 
 static class Jpp {
+    static int stringSize(long size) {
+        if (Long.compareUnsigned(size, Integer.MAX_VALUE) > 0)
+            throw new IllegalArgumentException("string length exceeds Java's limit");
+        return (int)size;
+    }
+    static String filePath(String bytes) {
+        int zero = bytes.indexOf('\0');
+        if (zero >= 0)
+            bytes = bytes.substring(0, zero);
+        return new String(bytes.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1),
+                          java.nio.charset.StandardCharsets.UTF_8);
+    }
     static <T> JppRef<T> storeReference(T value, JppRef<T> target) {
         target.set(value);
         return target;
@@ -2306,6 +2398,11 @@ static class Jpp {
         return Arrays.copyOf(value.toCharArray(), size);
     }
     static String cString(Object value) {
+        if (value instanceof String) {
+            String text = (String)value;
+            int end = text.indexOf('\0');
+            return end < 0 ? text : text.substring(0, end);
+        }
         if (value instanceof JppIter) {
             JppIter<?> at = ((JppIter<?>)value).plus(0);
             StringBuilder result = new StringBuilder();

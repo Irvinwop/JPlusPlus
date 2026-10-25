@@ -123,7 +123,7 @@ std::string number(const llvm::APSInt& value) {
     return s.str().str();
 }
 
-std::string quote(std::string_view s) {
+std::string quote(std::string_view s, bool bytes = false) {
     std::string r = "\"";
     for (unsigned char c : s) {
         switch (c) {
@@ -143,7 +143,7 @@ std::string quote(std::string_view s) {
             r += "\\t";
             break;
         default:
-            if (c < 32 || c == 127) {
+            if (c < 32 || c == 127 || (bytes && c > 127)) {
                 char b[8];
                 snprintf(b, sizeof b, "\\%03o", c);
                 r += b;
@@ -993,7 +993,7 @@ class Emitter {
             return "Jpp.pointer(" + expr(e) + ")";
         auto s = expr(e);
         if (isString(target) && !isString(e->getType()))
-            s = "new JppString(" + s + ")";
+            s = "new JppString(Jpp.cString(" + s + "))";
         else
             s = converted(s, e->getType(), target);
         if (copy && copyType(target) && e->isLValue())
@@ -1395,7 +1395,7 @@ class Emitter {
                 auto size = dyn_cast<ConstantArrayType>(a);
                 if (!size)
                     fail(init, "a string-initialized character array needs a fixed bound");
-                return "Jpp.charArray(" + quote(literal->getBytes().str()) + ", " +
+                return "Jpp.charArray(" + quote(literal->getBytes().str(), true) + ", " +
                        std::to_string(size->getSize().getZExtValue()) + ")";
             }
             auto list = dyn_cast<InitListExpr>(bare(init));
@@ -1910,11 +1910,27 @@ class Emitter {
             return "new " + type(t) + "(" + join(a) + ")";
         }
         if (isString(t)) {
+            if (args.size() > 1 && isString(args[0]->getType())) {
+                std::vector<std::string> positions;
+                for (unsigned i = 1; i < args.size(); ++i)
+                    positions.push_back(value(args[i], ctx.UnsignedLongLongTy));
+                return "(" + expr(args[0]) + ").substr(" + join(positions) + ")";
+            }
             std::vector<std::string> a;
             for (auto e : args)
                 a.push_back(expr(e));
-            if (args.size() == 2)
-                a[0] = intArgument(args[0]);
+            if (dataPointer(args[0]->getType())) {
+                a[0] = args.size() == 1 ? "Jpp.cString(" + a[0] + ")"
+                                       : value(args[0], args[0]->getType());
+                if (args.size() == 2 && dataPointer(args[1]->getType()))
+                    a[1] = value(args[1], args[1]->getType());
+            }
+            if (args.size() == 2) {
+                if (clean(args[0]->getType())->isIntegerType())
+                    a[0] = value(args[0], ctx.UnsignedLongLongTy);
+                else if (clean(args[1]->getType())->isIntegerType())
+                    a[1] = value(args[1], ctx.UnsignedLongLongTy);
+            }
             return "new JppString(" + join(a) + ")";
         }
         if (isVec(t)) {
@@ -2309,20 +2325,40 @@ class Emitter {
             }
             if (n == "reserve" && isVec(ot))
                 return o + ".ensureCapacity(" + intArgument(c->getArg(0)) + ")";
+            if (n == "reserve" && isString(ot))
+                return o + ".reserve(" +
+                       (c->getNumArgs() ? value(c->getArg(0), ctx.UnsignedLongLongTy) : "0L") + ")";
+            if (n == "resize" && isString(ot))
+                return o + ".resize(" + value(c->getArg(0), ctx.UnsignedLongLongTy) + ", " +
+                       (c->getNumArgs() > 1 ? expr(c->getArg(1)) : "'\\0'") + ")";
             if (n == "reserve" && family(ot).starts_with("unordered_"))
                 return "Jpp.ignore(" + o + ", " + expr(c->getArg(0)) + ")";
             if (n == "fill" && family(ot) == "array")
                 return "Jpp.fill(" + o + ", " + args[0] + ")";
             if (n == "at" && (isVec(ot) || isString(ot)))
                 return o + ".get(" + intArgument(c->getArg(0)) + ")";
+            if (isString(ot) && (n == "append" || n == "assign")) {
+                for (unsigned i = 0; i < args.size(); ++i) {
+                    auto argument = c->getArg(i);
+                    if (clean(argument->getType())->isIntegerType() &&
+                        !(i == 1 && clean(c->getArg(0)->getType())->isIntegerType()))
+                        args[i] = value(argument, ctx.UnsignedLongLongTy);
+                    else if (args.size() > 1 && dataPointer(argument->getType()))
+                        args[i] = value(argument, argument->getType());
+                }
+            }
             if (n == "substr" || n == "find") {
                 if (isString(ot)) {
                     for (size_t i = (n == "substr" ? 0 : 1); i < args.size(); ++i)
-                        args[i] = intArgument(c->getArg(i));
+                        args[i] = value(c->getArg(i), ctx.UnsignedLongLongTy);
+                    if (n == "find" && args.size() == 3)
+                        args[0] = value(c->getArg(0), c->getArg(0)->getType());
                 }
             }
-            if (n == "c_str" && isString(ot))
+            if ((n == "c_str" || n == "data") && isString(ot))
                 return o + ".c_str()";
+            if (n == "capacity" && isString(ot))
+                return o + ".capacity()";
             if (n == "data" && isVec(ot))
                 return "Jpp.pointer(Jpp.begin(" + o + "))";
             if (n == "pop" && family(ot) == "stack")
@@ -2846,7 +2882,7 @@ class Emitter {
             return std::string("'") + static_cast<char>(c) + "'";
         }
         if (auto x = dyn_cast<StringLiteral>(e))
-            return quote(x->getBytes().str());
+            return quote(x->getBytes().str(), true);
         if (auto x = dyn_cast<CXXBoolLiteralExpr>(e))
             return x->getValue() ? "true" : "false";
         if (isa<CXXNullPtrLiteralExpr>(e) || isa<GNUNullExpr>(e))

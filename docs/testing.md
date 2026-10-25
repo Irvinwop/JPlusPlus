@@ -42,6 +42,8 @@ Bitset cases instantiate sizes 0, 1, 16, 63, 64, 65, and 129. They compare word-
 
 Cast regressions chain methods after temporary construction and mutate arrays through explicitly cast pointers. These check that a Java cast applies to its operand before a following member access or subscript.
 
+Byte-string cases compare literal and input bytes for UTF-8, invalid UTF-8, embedded NULs, and high-bit characters. Pointer/count and iterator-range construction, self-overlapping assignment and append, initializer lists, large substring counts, and byte-wise mutation distinguish bounded strings from C strings. Formatted output checks byte precision and return counts; a file round-trip uses a UTF-8 filename with a NUL suffix. The harness compares the file contents as bytes as well as console output.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:
