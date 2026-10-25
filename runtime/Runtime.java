@@ -2580,6 +2580,17 @@ static class Jpp {
     static <T> Comparator<T> heapComparator(java.util.function.BiPredicate<? super T, ? super T> less) {
         return (a, b) -> less.test(a, b) ? 1 : less.test(b, a) ? -1 : 0;
     }
+    static <T> PriorityQueue<T> heapFrom(PriorityQueue<T> heap, Iterable<? extends T> values) {
+        for (T value : values)
+            heap.add(jppCopy(value));
+        return heap;
+    }
+    static <A, T> PriorityQueue<T> heapFrom(PriorityQueue<T> heap, JppIter<A> first, JppIter<A> last,
+                                            java.util.function.Function<A, T> convert) {
+        for (JppIter<A> at = first.plus(0); !at.same(last); at.advance(1))
+            heap.add(jppCopy(convert.apply(at.get())));
+        return heap;
+    }
     static <T> ArrayList<T> vectorDefault(int n, java.util.function.Supplier<T> factory) {
         ArrayList<T> a = new ArrayList<T>(n);
         while (n-- > 0)

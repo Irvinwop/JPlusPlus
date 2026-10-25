@@ -1383,6 +1383,12 @@ class Emitter {
                 cast->getCastKind() == CK_PointerToBoolean)
                 return truth(cast->getSubExpr());
         }
+        if ((e->getType()->isFunctionPointerType() || e->getType()->isFunctionType()) &&
+            !e->HasSideEffects(ctx)) {
+            bool result;
+            if (e->EvaluateAsBooleanCondition(result, ctx))
+                return result ? "true" : "false";
+        }
         return booleanValue(expr(e), e->getType());
     }
     std::string newArray(QualType t, const Expr* init, bool initializeObjects = true) {
@@ -1695,8 +1701,16 @@ class Emitter {
         auto kind = family(comparator);
         if (kind == "less" || kind == "greater") {
             auto parameter = element(comparator);
-            return comparisonPredicate(leftType, rightType, kind == "greater",
-                                       parameter->isVoidType() ? QualType{} : parameter);
+            auto predicate = comparisonPredicate(leftType, rightType, kind == "greater",
+                                                 parameter->isVoidType() ? QualType{} : parameter);
+            if (initializer.empty())
+                return predicate;
+            return supplier([&] {
+                line("final " + type(comparator) + " " + temporary("jppComparator") + " = " +
+                     initializer + ";");
+                line("return (java.util.function.BiPredicate<" + boxed(leftType) + ", " +
+                     boxed(rightType) + ">) (" + predicate + ");");
+            });
         }
         auto prototype = callableType(comparator);
         if (prototype->getNumParams() != 2)
@@ -1987,6 +2001,30 @@ class Emitter {
                        asIterator(args[1]) + ")";
             if (list)
                 return "Jpp.setFrom(" + created + ", " + expr(args[0]) + ")";
+            return created;
+        }
+        if (n == "priority_queue") {
+            bool range = args.size() > 1 &&
+                         (isIter(args[0]->getType()) || dataPointer(args[0]->getType()));
+            auto comparatorIndex = range ? 2U : 0U;
+            auto item = element(t);
+            auto created = defaultValue(t);
+            if (args.size() > comparatorIndex) {
+                auto comparator = args[comparatorIndex];
+                created = "new " + type(t) + "(Jpp.heapComparator(" +
+                          comparatorPredicate(comparator->getType(), item, item,
+                                              storedElement(comparator,
+                                                            clean(comparator->getType()), false)) +
+                          "))";
+            }
+            if (args.size() > comparatorIndex + 1)
+                created = "Jpp.heapFrom(" + created + ", " + expr(args[comparatorIndex + 1]) + ")";
+            if (range) {
+                auto value = temporary("jppValue");
+                created = "Jpp.heapFrom(" + created + ", " + asIterator(args[0]) + ", " +
+                          asIterator(args[1]) + ", " + value + " -> " +
+                          converted(value, iteratorElement(args[0]->getType()), item) + ")";
+            }
             return created;
         }
         if (n == "greater" || n == "less")
@@ -3273,6 +3311,8 @@ class Emitter {
         if (auto x = dyn_cast<InitListExpr>(e)) {
             auto t = x->getType();
             std::vector<std::string> a;
+            if (family(t) == "less" || family(t) == "greater")
+                return defaultValue(t);
             if (ctx.getAsArrayType(t))
                 return newArray(t, x);
             if (family(t) == "array") {
@@ -3521,7 +3561,17 @@ class Emitter {
                 op->getOperator() == OO_Equal || isCompoundAssignmentOperator(op->getOperator());
         if (assignment && s.starts_with('('))
             s = s.substr(1, s.size() - 2);
-        return s;
+        if (assignment || e->getType()->isVoidType())
+            return s;
+        if (auto unary = dyn_cast<UnaryOperator>(b); unary && unary->isIncrementDecrementOp())
+            return s;
+        // Java permits method calls and class construction as statement expressions. Other
+        // discarded C++ values still need to be evaluated, including in a for-loop update.
+        if ((isa<CallExpr>(b) || isa<CXXConstructExpr>(b) || isa<StmtExpr>(b) ||
+             isa<BinaryConditionalOperator>(b)) &&
+            s.ends_with(')') && !s.starts_with('(') && !s.starts_with('!'))
+            return s;
+        return "Jpp.ignore(" + s + ")";
     }
     std::string supplier(const std::function<void()>& emit) {
         auto old = out.str();
@@ -3609,10 +3659,6 @@ class Emitter {
                 s = expr(base) + ".set(" + intArgument(index) + ", " +
                     value(bin->getRHS(), bin->getLHS()->getType(), true) + ")";
         }
-        // Java only accepts calls, assignments, creation, and ++/-- as statements.
-        if (isa<ConditionalOperator>(b) ||
-            (isa<BinaryOperator>(b) && !cast<BinaryOperator>(b)->isAssignmentOp()))
-            s = "Jpp.ignore(" + s + ")";
         line(s + ";");
         if (auto call = dyn_cast<CallExpr>(b);
             call && call->getDirectCallee() && call->getDirectCallee()->isNoReturn())

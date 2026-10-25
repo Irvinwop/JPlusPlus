@@ -44,6 +44,8 @@ Cast regressions chain methods after temporary construction and mutate arrays th
 
 Byte-string cases compare literal and input bytes for UTF-8, invalid UTF-8, embedded NULs, and high-bit characters. Pointer/count and iterator-range construction, self-overlapping assignment and append, initializer lists, large substring counts, and byte-wise mutation distinguish bounded strings from C strings. Formatted output checks byte precision and return counts; a file round-trip uses a UTF-8 filename with a NUL suffix. The harness compares the file contents as bytes as well as console output.
 
+Discarded-expression cases use conditional, comma, arithmetic, cast, and literal expressions in statement and loop-update positions. Native results distinguish skipped updates, duplicate evaluation, and updates incorrectly executed after a break or continue. Heap cases combine explicit lambdas, copied stateful comparators, comparator factories, range element conversion, supplied containers, and independent copies. Mutating the original comparator or container must not change the stored ordering or values.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:
