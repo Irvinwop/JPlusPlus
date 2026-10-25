@@ -263,6 +263,7 @@ int main() {
                           << (i < boundaries.size() ? boundaries[i] : random()) << '\n';
         cases.emplace_back("unsigned_conversions", unsignedCases.str());
         cases.emplace_back("bitsets", unsignedCases.str());
+        cases.emplace_back("engines", unsignedCases.str());
         std::string byteInput = "4\nélève 日本語\n";
         byteInput += "\xff\x80X\n";
         byteInput += std::string("prefix") + '\0' + "suffix\n";

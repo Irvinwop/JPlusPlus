@@ -720,6 +720,14 @@ class Emitter {
             return "JppString";
         if (family(t) == "bitset")
             return "JppBitset";
+        if (n == "mersenne_twister_engine") {
+            auto arguments = templateArgs(t);
+            auto width = arguments[1].getAsIntegral().getZExtValue();
+            if (width < 2 || width > 64 ||
+                arguments[2].getAsIntegral().getZExtValue() > 2147483647ULL)
+                fail(SourceLocation(), "this Mersenne Twister configuration needs wider storage");
+            return "JppMtEngine";
+        }
         if (bitReference(t))
             return "JppBitRef";
         if (isVec(t))
@@ -774,6 +782,18 @@ class Emitter {
         functionPointers.push_back({f, field, type(target)});
         return field;
     }
+    std::string mtEngine(QualType t, const std::string& seed = "5489L") {
+        auto arguments = templateArgs(t);
+        std::vector<std::string> values;
+        for (unsigned i = 1; i < arguments.size(); ++i) {
+            bool word = i == 5 || i == 7 || i == 9 || i == 11 || i == 13;
+            values.push_back(word ? integerLiteral(arguments[i].getAsIntegral().zextOrTrunc(64),
+                                                    ctx.UnsignedLongLongTy)
+                                  : number(arguments[i].getAsIntegral()));
+        }
+        values.push_back(seed);
+        return "new " + type(t) + "(" + join(values) + ")";
+    }
     std::string defaultValue(QualType t) {
         if (t->isReferenceType())
             t = t.getNonReferenceType();
@@ -802,6 +822,8 @@ class Emitter {
             return "null";
         if (family(t) == "bitset")
             return "new JppBitset(" + bitsetSize(t) + ")";
+        if (family(t) == "mersenne_twister_engine")
+            return mtEngine(t);
         if (family(t) == "less" || family(t) == "greater")
             return element(t)->isVoidType()
                        ? "(" + jt + ") ((a, b) -> Jpp.compare(a, b) " +
@@ -1613,6 +1635,8 @@ class Emitter {
             return left + ".precision(" + intArgument(call->getArg(0)) + ")";
         auto s = expr(op->getArg(1));
         auto t = op->getArg(1)->getType();
+        if (family(t) == "mersenne_twister_engine")
+            fail(op, "Mersenne Twister stream serialization needs additional lowering");
         if (t->isPointerType() && t->getPointeeType()->isCharType())
             s = "Jpp.cString(" + s + ")";
         else if (unsignedLong(t))
@@ -1940,6 +1964,8 @@ class Emitter {
         }
         if ((op == "==" || op == "!=") && family(lhs->getType()) == "bitset")
             return std::string(op == "!=" ? "!" : "") + expr(lhs) + ".equals(" + expr(rhs) + ")";
+        if ((op == "==" || op == "!=") && family(lhs->getType()) == "mersenne_twister_engine")
+            return std::string(op == "!=" ? "!" : "") + expr(lhs) + ".sameState(" + expr(rhs) + ")";
         if (comparison && (lhs->getType()->isRecordType() || rhs->getType()->isRecordType()))
             return "(Jpp.compare(" + expr(lhs) + ", " + expr(rhs) + ") " + op + " 0)";
         return arithmetic(expr(lhs), lhs->getType(), expr(rhs), rhs->getType(), op);
@@ -1970,6 +1996,11 @@ class Emitter {
         if (args.empty())
             return defaultValue(t);
         auto n = family(t);
+        if (n == "mersenne_twister_engine") {
+            if (args.size() != 1 || !clean(args[0]->getType())->isIntegerType())
+                fail(c, "Mersenne Twister seed sequences need additional lowering");
+            return mtEngine(t, value(args[0], ctx.UnsignedLongLongTy));
+        }
         if (n == "bitset") {
             if (args[0]->getType()->isArithmeticType() || args[0]->getType()->isEnumeralType())
                 return "new JppBitset(" + bitsetSize(t) + ", " +
@@ -2259,6 +2290,20 @@ class Emitter {
                 owner && owner->getName() == "numeric_limits")
                 if (auto constant = constantValue(c); !constant.empty())
                     return constant;
+        if (f && !user(f))
+            if (auto owner = dyn_cast<CXXRecordDecl>(f->getDeclContext());
+                owner && owner->getName() == "mersenne_twister_engine" &&
+                (f->getNameAsString() == "min" || f->getNameAsString() == "max")) {
+                auto width = templateArgs(ctx.getRecordType(owner))[1].getAsIntegral().getZExtValue();
+                auto result = integerLiteral(f->getNameAsString() == "min"
+                                                 ? llvm::APInt(64, 0)
+                                                 : llvm::APInt::getLowBitsSet(64, width),
+                                             c->getType());
+                if (auto member = dyn_cast<MemberExpr>(bare(c->getCallee()));
+                    member && member->getBase()->HasSideEffects(ctx))
+                    return "Jpp.last(" + expr(member->getBase()) + ", " + result + ")";
+                return result;
+            }
         if (auto m = dyn_cast<CXXMemberCallExpr>(c)) {
             auto me = dyn_cast<MemberExpr>(bare(m->getCallee()));
             if (!me)
@@ -2274,6 +2319,22 @@ class Emitter {
                 return object + "." + allocatedName + "(" + arguments(c, f) + ")";
             }
             auto n = me->getMemberDecl()->getNameAsString();
+            if (family(ot) == "mersenne_twister_engine") {
+                auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                if (n == "operator()")
+                    return converted(object + ".next()", ctx.UnsignedLongLongTy, c->getType());
+                if (n == "operator=")
+                    return object + ".jppAssignFrom(" + expr(c->getArg(0)) + ")";
+                if (n == "discard")
+                    return object + ".discard(" + value(c->getArg(0), ctx.UnsignedLongLongTy) + ")";
+                if (n == "seed") {
+                    if (c->getNumArgs() && !clean(c->getArg(0)->getType())->isIntegerType())
+                        fail(c, "Mersenne Twister seed sequences need additional lowering");
+                    return object + ".seed(" +
+                           (c->getNumArgs() ? value(c->getArg(0), ctx.UnsignedLongLongTy) : "5489L") + ")";
+                }
+                fail(c, "unsupported Mersenne Twister member " + n);
+            }
             if (bitReference(ot)) {
                 auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
                 if (n == "operator bool")
@@ -3310,6 +3371,10 @@ class Emitter {
                 return (method ? expr(x->getArg(0)) + "." : "") + name(function) + "(" +
                        join(arguments) + ")";
             }
+            if (op == OO_Call && x->getNumArgs() &&
+                family(x->getArg(0)->getType()) == "mersenne_twister_engine")
+                return converted(expr(x->getArg(0)) + ".next()", ctx.UnsignedLongLongTy,
+                                 x->getType());
             if (op == OO_LessLess && x->getNumArgs() == 2 && stream(x->getArg(0)->getType()))
                 return outputChain(x);
             if (op == OO_GreaterGreater && x->getNumArgs() == 2 && stream(x->getArg(0)->getType()))

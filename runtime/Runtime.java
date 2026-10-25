@@ -468,6 +468,103 @@ static class JppBitRef implements JppCopyable<JppBitRef> {
     }
 }
 
+static class JppMtEngine implements JppAssignable<JppMtEngine> {
+    final int width, middle, separation, u, s, t, l;
+    final long a, d, b, c, multiplier, mask;
+    long[] state;
+    int position;
+    JppMtEngine(int width, int size, int middle, int separation, long a, int u, long d,
+                  int s, long b, int t, long c, int l, long multiplier, long seed) {
+        this.width = width;
+        this.middle = middle;
+        this.separation = separation;
+        this.a = a;
+        this.u = u;
+        this.d = d;
+        this.s = s;
+        this.b = b;
+        this.t = t;
+        this.c = c;
+        this.l = l;
+        this.multiplier = multiplier;
+        mask = width == 64 ? -1L : (1L << width) - 1;
+        state = new long[size];
+        seed(seed);
+    }
+    private JppMtEngine(JppMtEngine other) {
+        width = other.width;
+        middle = other.middle;
+        separation = other.separation;
+        a = other.a;
+        u = other.u;
+        d = other.d;
+        s = other.s;
+        b = other.b;
+        t = other.t;
+        c = other.c;
+        l = other.l;
+        multiplier = other.multiplier;
+        mask = other.mask;
+        state = other.state.clone();
+        position = other.position;
+    }
+    void seed(long value) {
+        state[0] = value & mask;
+        for (int i = 1; i < state.length; ++i) {
+            long previous = state[i - 1];
+            state[i] = (multiplier * (previous ^ (previous >>> (width - 2))) + i) & mask;
+        }
+        position = state.length;
+    }
+    private static long right(long value, int amount) {
+        return amount == 64 ? 0 : value >>> amount;
+    }
+    private static long left(long value, int amount) {
+        return amount == 64 ? 0 : value << amount;
+    }
+    private void twist() {
+        long lower = separation == 64 ? -1L : (1L << separation) - 1;
+        long upper = mask ^ lower;
+        for (int i = 0; i < state.length; ++i) {
+            long combined = (state[i] & upper) | (state[(i + 1) % state.length] & lower);
+            int shifted = i >= state.length - middle ? i - (state.length - middle) : i + middle;
+            state[i] = (state[shifted] ^ (combined >>> 1) ^
+                         ((combined & 1) == 0 ? 0 : a)) & mask;
+        }
+        position = 0;
+    }
+    long next() {
+        if (position == state.length)
+            twist();
+        long value = state[position++];
+        value ^= right(value, u) & d;
+        value ^= left(value, s) & b;
+        value ^= left(value, t) & c;
+        value ^= right(value, l);
+        return value & mask;
+    }
+    void discard(long count) {
+        while (Long.compareUnsigned(count, state.length - position) > 0) {
+            count -= state.length - position;
+            twist();
+        }
+        position += (int)count;
+    }
+    boolean sameState(JppMtEngine other) {
+        return position == other.position && Arrays.equals(state, other.state);
+    }
+    public JppMtEngine copy() {
+        return new JppMtEngine(this);
+    }
+    public JppMtEngine jppAssignFrom(JppMtEngine other) {
+        if (other != this) {
+            state = other.state.clone();
+            position = other.position;
+        }
+        return this;
+    }
+}
+
 static class JppString
     implements Comparable<JppString>, Iterable<Character>, JppAssignable<JppString> {
     private final StringBuilder data;

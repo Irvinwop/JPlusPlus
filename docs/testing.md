@@ -50,6 +50,8 @@ Reference-result cases mutate through direct and recursive functions, function p
 
 Map-swap cases retain references to both the containers and their elements, then use existing iterators in the destination. They compare addresses, iterator movement, erasure, self-swap, stateful comparison order, and later assignment and copying. Construction cases use initializer lists and ranges with element conversions, duplicate keys, copied comparison state, and partially initialized nested pair arrays. Unordered-map checks avoid relying on an unspecified traversal order.
 
+Random-engine cases compare native `mt19937`, `mt19937_64`, an explicitly 32-bit result type with high-bit masks, a 13-bit configuration, and a one-word 64-bit configuration. Seeds include unsigned boundaries and fixed randomized values. Samples and rolling output digests span multiple state refills; discard counts cross 17-, 312-, and 624-word boundaries. Independent copies, assignment aliases, array elements, value parameters and returns, captured engines, default reseeding, and explicit operator calls exercise state ownership. Static bounds called through a factory retain its side effects.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:
