@@ -31,7 +31,13 @@ Java's integer switch accepts only narrow integer conditions. Wider switches use
 
 Unsigned 32/64-bit ordering, division, remainder, and right shifts use Java's unsigned operations. `__int128` arithmetic uses `BigInteger`; it is slower than native arithmetic and currently targets defined signed calculations, not an emulation of every overflow behavior.
 
+Library comparisons also need the original C++ types. Generated predicates retain signedness and integer promotion rules for sorting, ordered containers, extrema, and heterogeneous bounds searches. Pair and vector predicates compare their elements recursively. User comparators are bound once when constructing the Java comparator, so their constructors do not run for each comparison.
+
+Callable adapters bridge compatible C++ signatures when their Java interfaces differ. They convert parameters and results explicitly, including conversion to boolean and discarding a result for a void callback. This keeps the callable body in an ordinary translated method or lambda.
+
 The bundled support declarations live in `runtime/Runtime.java`, a source fragment embedded into the C++ binary at build time. A declaration dependency pass selects the helpers referenced by the translated program. Clang's Java formatter formats the complete output.
+
+The build embeds the fragment in bounded string chunks, avoiding a compiler's single-literal size limit as support grows.
 
 ## Diagnostics and execution
 

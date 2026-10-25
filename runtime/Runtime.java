@@ -517,8 +517,13 @@ static class JppTreeIter<T> extends JppIter<T> {
 static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppMap<K, V>> {
     final Map<K, V> data;
     final java.util.function.Supplier<V> factory;
+    final Comparator<? super K> comparator;
     JppMap(boolean ordered, java.util.function.Supplier<V> init) {
-        data = ordered ? new TreeMap<K, V>(Jpp::compare) : new HashMap<K, V>();
+        this(ordered, init, Jpp::compare);
+    }
+    JppMap(boolean ordered, java.util.function.Supplier<V> init, Comparator<? super K> comparison) {
+        comparator = comparison;
+        data = ordered ? new TreeMap<K, V>(comparison) : new HashMap<K, V>();
         factory = init;
     }
     V get(K key) {
@@ -540,6 +545,9 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppM
         if (inserted)
             data.put(jppCopy(key), value);
         return new JppPair<JppIter<JppPair<K, V>>, Boolean>(find(key), inserted);
+    }
+    JppPair<JppIter<JppPair<K, V>>, Boolean> insert(JppPair<K, V> value) {
+        return emplace(value.first, jppCopy(value.second));
     }
     void merge(JppMap<K, V> source) {
         if (source == this)
@@ -594,7 +602,7 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppM
         return Jpp.end(v);
     }
     public JppMap<K, V> copy() {
-        JppMap<K, V> result = new JppMap<K, V>(data instanceof TreeMap, factory);
+        JppMap<K, V> result = new JppMap<K, V>(data instanceof TreeMap, factory, comparator);
         for (Map.Entry<K, V> e : data.entrySet())
             result.data.put(jppCopy(e.getKey()), jppCopy(e.getValue()));
         return result;
@@ -610,10 +618,14 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppAssignable<JppM
 }
 
 static class JppSet<T> implements Iterable<T>, JppAssignable<JppSet<T>> {
-    final NavigableMap<T, Integer> data = new TreeMap<T, Integer>(Jpp::compare);
+    final NavigableMap<T, Integer> data;
     final boolean multiple;
     int count;
     JppSet(boolean multi) {
+        this(multi, Jpp::compare);
+    }
+    JppSet(boolean multi, Comparator<? super T> comparison) {
+        data = new TreeMap<T, Integer>(comparison);
         multiple = multi;
     }
     JppPair<JppIter<T>, Boolean> insert(T value) {
@@ -730,7 +742,7 @@ static class JppSet<T> implements Iterable<T>, JppAssignable<JppSet<T>> {
         return new JppTreeIter<T>(data, data.higherKey(value), 1);
     }
     public JppSet<T> copy() {
-        JppSet<T> s = new JppSet<T>(multiple);
+        JppSet<T> s = new JppSet<T>(multiple, data.comparator());
         s.data.putAll(data);
         s.count = count;
         return s;
@@ -1669,6 +1681,9 @@ static class Jpp {
         BigInteger magnitude = BigInteger.valueOf(value & Long.MAX_VALUE);
         return value < 0 ? magnitude.setBit(63) : magnitude;
     }
+    static BigInteger floatingInteger(double value) {
+        return new BigDecimal(value).toBigInteger();
+    }
     static String decimalPoint(String text, boolean alternate) {
         return alternate && text.indexOf('.') < 0 ? text + '.' : text;
     }
@@ -1993,10 +2008,10 @@ static class Jpp {
     static int isdigit(int c) {
         return c >= '0' && c <= '9' ? 1 : 0;
     }
-    static <T> Comparator<T> comparator(java.util.function.BiPredicate<T, T> less) {
+    static <T> Comparator<T> comparator(java.util.function.BiPredicate<? super T, ? super T> less) {
         return (a, b) -> less.test(a, b) ? -1 : less.test(b, a) ? 1 : 0;
     }
-    static <T> Comparator<T> heapComparator(java.util.function.BiPredicate<T, T> less) {
+    static <T> Comparator<T> heapComparator(java.util.function.BiPredicate<? super T, ? super T> less) {
         return (a, b) -> less.test(a, b) ? 1 : less.test(b, a) ? -1 : 0;
     }
     static <T> ArrayList<T> vectorDefault(int n, java.util.function.Supplier<T> factory) {
@@ -2013,6 +2028,14 @@ static class Jpp {
         for (JppIter<T> p = first.plus(0); !p.same(last); p.advance(1))
             a.add(jppCopy(p.get()));
         return a;
+    }
+    static <T> ArrayList<T> vectorInitialized(int size, java.util.function.Supplier<T> zero,
+                                            List<T> initial) {
+        ArrayList<T> result = new ArrayList<T>(size);
+        result.addAll(initial);
+        while (result.size() < size)
+            result.add(zero.get());
+        return result;
     }
     static <T> T set(List<T> a, int i, T value) {
         a.set(i, value);
@@ -2121,6 +2144,38 @@ static class Jpp {
     static <T> T min(T a, T b) {
         return compare(a, b) <= 0 ? a : b;
     }
+    static <T> T min(T a, T b, java.util.function.BiPredicate<? super T, ? super T> less) {
+        return less.test(b, a) ? b : a;
+    }
+    static <T> T max(T a, T b, java.util.function.BiPredicate<? super T, ? super T> less) {
+        return less.test(a, b) ? b : a;
+    }
+    static <T> T min(List<T> values, java.util.function.BiPredicate<? super T, ? super T> less) {
+        T result = values.get(0);
+        for (int i = 1; i < values.size(); ++i)
+            result = min(result, values.get(i), less);
+        return result;
+    }
+    static <T> T max(List<T> values, java.util.function.BiPredicate<? super T, ? super T> less) {
+        T result = values.get(0);
+        for (int i = 1; i < values.size(); ++i)
+            result = max(result, values.get(i), less);
+        return result;
+    }
+    static <T> T clamp(T value, T low, T high,
+                      java.util.function.BiPredicate<? super T, ? super T> less) {
+        return less.test(value, low) ? low : less.test(high, value) ? high : value;
+    }
+    static <T> JppSet<T> setFrom(JppSet<T> destination, JppIter<T> first, JppIter<T> last) {
+        for (JppIter<T> position = first.plus(0); !position.same(last); position.advance(1))
+            destination.insert(position.get());
+        return destination;
+    }
+    static <T> JppSet<T> setFrom(JppSet<T> destination, List<T> values) {
+        for (T value : values)
+            destination.insert(value);
+        return destination;
+    }
     static <T> T max(T a, T b) {
         return compare(a, b) >= 0 ? a : b;
     }
@@ -2219,7 +2274,7 @@ static class Jpp {
         sort(first, last, (a, b) -> compare(a, b) < 0);
     }
     static <T> void sort(JppIter<T> first, JppIter<T> last,
-                         java.util.function.BiPredicate<T, T> less) {
+                         java.util.function.BiPredicate<? super T, ? super T> less) {
         ArrayList<T> values = new ArrayList<T>();
         for (int i = first.pos; i != last.pos; i += first.step)
             values.add(first.list.get(i));
@@ -2234,13 +2289,27 @@ static class Jpp {
     }
     static <T> void fill(JppIter<T> first, JppIter<T> last, T value) {
         for (int i = first.pos; i != last.pos; i += first.step)
-            first.list.set(i, jppCopy(value));
+            first.list.set(i, assignValue(first.list.get(i), value));
     }
-    static <T> JppIter<T> lower_bound(JppIter<T> first, JppIter<T> last, T value) {
+    static <T> void fill(List<T> values, T value) {
+        fill(begin(values), end(values), value);
+    }
+    static <T, U> boolean lexicographicalLess(List<T> left, List<U> right,
+                         java.util.function.BiPredicate<T, U> less,
+                         java.util.function.BiPredicate<U, T> reverseLess) {
+        for (int i = 0; i < Math.min(left.size(), right.size()); ++i) {
+            if (less.test(left.get(i), right.get(i)))
+                return true;
+            if (reverseLess.test(right.get(i), left.get(i)))
+                return false;
+        }
+        return left.size() < right.size();
+    }
+    static <T, U> JppIter<T> lower_bound(JppIter<T> first, JppIter<T> last, U value) {
         return lower_bound(first, last, value, (a, b) -> compare(a, b) < 0);
     }
-    static <T> JppIter<T> lower_bound(JppIter<T> first, JppIter<T> last, T value,
-                                      java.util.function.BiPredicate<T, T> less) {
+    static <T, U> JppIter<T> lower_bound(JppIter<T> first, JppIter<T> last, U value,
+                                      java.util.function.BiPredicate<? super T, ? super U> less) {
         int lo = 0, hi = last.minus(first);
         while (lo < hi) {
             int mid = (lo + hi) >>> 1;
@@ -2251,11 +2320,15 @@ static class Jpp {
         }
         return first.plus(lo);
     }
-    static <T> JppIter<T> upper_bound(JppIter<T> first, JppIter<T> last, T value) {
+    static <T, U> JppIter<T> upper_bound(JppIter<T> first, JppIter<T> last, U value) {
+        return upper_bound(first, last, value, (a, b) -> compare(a, b) < 0);
+    }
+    static <T, U> JppIter<T> upper_bound(JppIter<T> first, JppIter<T> last, U value,
+                                      java.util.function.BiPredicate<? super U, ? super T> less) {
         int lo = 0, hi = last.minus(first);
         while (lo < hi) {
             int mid = (lo + hi) >>> 1;
-            if (compare(value, first.plus(mid).get()) >= 0)
+            if (!less.test(value, first.plus(mid).get()))
                 lo = mid + 1;
             else
                 hi = mid;
@@ -2265,6 +2338,12 @@ static class Jpp {
     static <T> boolean binary_search(JppIter<T> first, JppIter<T> last, T value) {
         JppIter<T> p = lower_bound(first, last, value);
         return !p.same(last) && compare(p.get(), value) == 0;
+    }
+    static <T, U> boolean binary_search(JppIter<T> first, JppIter<T> last, U value,
+                            java.util.function.BiPredicate<? super T, ? super U> less,
+                            java.util.function.BiPredicate<? super U, ? super T> reverseLess) {
+        JppIter<T> position = lower_bound(first, last, value, less);
+        return !position.same(last) && !reverseLess.test(value, position.get());
     }
     static <T> JppIter<T> unique(JppIter<T> first, JppIter<T> last) {
         if (first.same(last))

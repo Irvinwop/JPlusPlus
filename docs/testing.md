@@ -28,6 +28,10 @@ Static-storage cases compare once-only initialization, repeated and recursive ca
 
 Switch cases distinguish values with matching low 32 bits, signed and unsigned boundaries, 128-bit conditions, GNU case ranges, enum conditions, condition declarations, and fallthrough. Call cases compare default-expression side effects and global bindings, default reference parameters, user methods named like library operations, and evaluation of static-method receivers.
 
+Standard-value cases cover partial, nested, and zero-length `std::array` initialization, copies, assignment, and element references retained across fill. They also exercise reference-taking constructors, conversion of callable arguments and results, discarded results for void callbacks, recursive converted callbacks, and floating-point to `__int128` conversion above the 64-bit range.
+
+Ordering cases use unsigned values on both sides of the signed limit, pairs, raw arrays, range-constructed sets, initializer-list sets, map insertion, custom comparators, and min-heaps. Native output checks both ordering and comparator construction effects. Heterogeneous bounds searches use signed and unsigned elements, 64-bit keys, and descending transparent comparators; extrema and direct transparent comparisons cover C++ integer conversion rules.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

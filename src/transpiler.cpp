@@ -629,6 +629,8 @@ class Emitter {
         fail(SourceLocation(), "cannot determine callable signature of " + t.getAsString());
     }
     std::string callableMethod(QualType t) {
+        if (family(t) == "less" || family(t) == "greater")
+            return "test";
         if (auto r = record(t); r && user(r) && !r->isLambda())
             for (auto method : r->methods())
                 if (method->isOverloadedOperator() && method->getOverloadedOperator() == OO_Call)
@@ -697,6 +699,11 @@ class Emitter {
             return "PriorityQueue<" + boxed(element(t)) + ">";
         if (n == "function")
             return functionType(element(t)->getAs<FunctionProtoType>());
+        if (n == "less" || n == "greater") {
+            auto argument = element(t);
+            auto value = argument->isVoidType() ? "Object" : boxed(argument);
+            return "java.util.function.BiPredicate<" + value + ", " + value + ">";
+        }
         if (isIter(t)) {
             return "JppIter<" + boxed(iteratorElement(t)) + ">";
         }
@@ -756,28 +763,33 @@ class Emitter {
             return "new " + type(t) + "((String)null)";
         if (t->isPointerType() || family(t) == "function")
             return "null";
+        if (family(t) == "less" || family(t) == "greater")
+            return element(t)->isVoidType()
+                       ? "(" + jt + ") ((a, b) -> Jpp.compare(a, b) " +
+                             (family(t) == "less" ? "<" : ">") + " 0)"
+                       : comparisonPredicate(element(t), element(t), family(t) == "greater");
         if (isMap(t))
             return "new " + jt + "(" + (family(t) == "map" ? "true" : "false") + ", () -> " +
-                   defaultValue(element(t, 1)) + ")";
+                   defaultValue(element(t, 1)) + ", Jpp.comparator(" +
+                   (family(t) == "map" ? comparatorPredicate(templateArgs(t)[2].getAsType(),
+                                                             element(t), element(t))
+                                       : comparisonPredicate(element(t), element(t))) +
+                   "))";
         if (isSet(t))
             return "new " + jt + "(" +
                    ((family(t) == "multiset" || family(t) == "unordered_multiset") ? "true"
                                                                                    : "false") +
-                   ")";
+                   ", Jpp.comparator(" +
+                   (family(t).starts_with("unordered_")
+                        ? comparisonPredicate(element(t), element(t))
+                        : comparatorPredicate(templateArgs(t)[1].getAsType(), element(t),
+                                              element(t))) +
+                   "))";
         if (family(t) == "priority_queue") {
             auto args = templateArgs(t);
-            std::string comparator = "Jpp::reverseCompare";
-            if (args.size() > 2) {
-                auto c = args[2].getAsType();
-                auto n = family(c);
-                if (n == "greater")
-                    comparator = "Jpp::compare";
-                else if (n != "less") {
-                    auto a = temporary("jppLeft"), b = temporary("jppRight");
-                    comparator = "Jpp.heapComparator((" + a + ", " + b + ") -> new " + type(c) +
-                                 "().call(" + a + ", " + b + "))";
-                }
-            }
+            auto comparator = "Jpp.heapComparator(" +
+                              comparatorPredicate(args[2].getAsType(), element(t), element(t)) +
+                              ")";
             return "new " + jt + "(" + comparator + ")";
         }
         if (family(t) == "array") {
@@ -857,6 +869,40 @@ class Emitter {
     std::string converted(std::string s, QualType from, QualType target) {
         from = clean(from);
         target = clean(target);
+        if (family(target) == "function" && !from->isNullPtrType() && type(from) != type(target)) {
+            auto source = callableType(from), destination = callableType(target);
+            if (source->getNumParams() != destination->getNumParams())
+                fail(SourceLocation(), "callable conversion needs argument-pack lowering");
+            return supplier([&] {
+                auto function = temporary("jppCallable");
+                line("final " + type(from) + " " + function + " = " + s + ";");
+                std::vector<std::string> parameters, arguments;
+                for (unsigned i = 0; i < destination->getNumParams(); ++i) {
+                    auto parameter = temporary("jppArgument");
+                    auto accepted = destination->getParamType(i), needed = source->getParamType(i);
+                    parameters.push_back(parameterType(accepted) + " " + parameter);
+                    auto argument = scalarReference(accepted) ? parameter + ".get()" : parameter;
+                    if (scalarReference(needed) && scalarReference(accepted) &&
+                        ctx.hasSameType(clean(accepted), clean(needed)))
+                        argument = parameter;
+                    else {
+                        argument = converted(argument, accepted, needed);
+                        if (scalarReference(needed))
+                            argument = "JppRef.cell(" + argument + ")";
+                        else if (copyType(needed))
+                            argument = "jppCopy(" + argument + ")";
+                    }
+                    arguments.push_back(argument);
+                }
+                auto invocation =
+                    function + "." + callableMethod(from) + "(" + join(arguments) + ")";
+                auto body = destination->getReturnType()->isVoidType()
+                                ? "{ " + invocation + "; }"
+                                : converted(invocation, source->getReturnType(),
+                                            destination->getReturnType());
+                line("return (" + type(target) + ") ((" + join(parameters) + ") -> " + body + ");");
+            });
+        }
         if (family(from) == "pair" && family(target) == "pair" && !ctx.hasSameType(from, target)) {
             auto first = temporary("jppFirst"), second = temporary("jppSecond");
             return "Jpp.convertPair(" + s + ", " + first + " -> " +
@@ -888,8 +934,9 @@ class Emitter {
             from = single ? ctx.FloatTy : ctx.DoubleTy;
         }
         if (big(target) && !big(from))
-            s = std::string(unsignedLong(from) ? "Jpp.unsignedBigInteger("
-                                               : "BigInteger.valueOf(") +
+            s = std::string(from->isRealFloatingType() ? "Jpp.floatingInteger("
+                            : unsignedLong(from)       ? "Jpp.unsignedBigInteger("
+                                                       : "BigInteger.valueOf(") +
                 s + ")";
         else if (!big(target) && big(from)) {
             auto jt = type(target);
@@ -1069,6 +1116,16 @@ class Emitter {
                 if (scalarReference(f->getParamDecl(i)->getType()))
                     markReference(c->getArg(i + offset));
         }
+        if (auto c = dyn_cast<CXXOperatorCallExpr>(s); c && c->getOperator() == OO_Call)
+            if (auto function = c->getDirectCallee())
+                for (unsigned i = 0; i < function->getNumParams() && i + 1 < c->getNumArgs(); ++i)
+                    if (scalarReference(function->getParamDecl(i)->getType()))
+                        markReference(c->getArg(i + 1));
+        if (auto c = dyn_cast<CXXConstructExpr>(s))
+            for (unsigned i = 0; i < c->getConstructor()->getNumParams() && i < c->getNumArgs();
+                 ++i)
+                if (scalarReference(c->getConstructor()->getParamDecl(i)->getType()))
+                    markReference(c->getArg(i));
         if (auto c = dyn_cast<CallExpr>(s);
             c && c->getDirectCallee() && c->getDirectCallee()->getNameAsString() == "getline" &&
             c->getNumArgs() >= 2 && isString(c->getArg(1)->getType())) {
@@ -1534,6 +1591,104 @@ class Emitter {
                    rhs + "))";
         return "(" + lhs + " " + op + " " + rhs + ")";
     }
+    QualType commonArithmeticType(QualType left, QualType right) {
+        left = clean(left);
+        right = clean(right);
+        if (!left->isArithmeticType() || !right->isArithmeticType())
+            return {};
+        if (left->isRealFloatingType() || right->isRealFloatingType()) {
+            if (!left->isRealFloatingType())
+                return right;
+            if (!right->isRealFloatingType())
+                return left;
+            return ctx.getFloatingTypeOrder(left, right) >= 0 ? left : right;
+        }
+        if (ctx.isPromotableIntegerType(left))
+            left = ctx.getPromotedIntegerType(left);
+        if (ctx.isPromotableIntegerType(right))
+            right = ctx.getPromotedIntegerType(right);
+        if (left->isUnsignedIntegerType() == right->isUnsignedIntegerType())
+            return ctx.getIntegerTypeOrder(left, right) >= 0 ? left : right;
+        auto unsignedType = left->isUnsignedIntegerType() ? left : right;
+        auto signedType = left->isUnsignedIntegerType() ? right : left;
+        if (ctx.getIntegerTypeOrder(unsignedType, signedType) >= 0)
+            return unsignedType;
+        return ctx.getTypeSize(signedType) > ctx.getTypeSize(unsignedType)
+                   ? signedType
+                   : ctx.getCorrespondingUnsignedType(signedType);
+    }
+    std::string lessExpression(const std::string& left, QualType leftType, const std::string& right,
+                               QualType rightType) {
+        if (auto common = commonArithmeticType(leftType, rightType); !common.isNull())
+            return arithmetic(converted(left, leftType, common), common,
+                              converted(right, rightType, common), common, "<");
+        if (family(leftType) == "pair" && family(rightType) == "pair") {
+            auto first = lessExpression(left + ".first", element(leftType), right + ".first",
+                                        element(rightType));
+            auto reverse = lessExpression(right + ".first", element(rightType), left + ".first",
+                                          element(leftType));
+            auto second = lessExpression(left + ".second", element(leftType, 1), right + ".second",
+                                         element(rightType, 1));
+            return "(" + first + " || (!" + reverse + " && " + second + "))";
+        }
+        if (isVec(leftType) && isVec(rightType))
+            return "Jpp.lexicographicalLess(" + left + ", " + right + ", " +
+                   comparisonPredicate(element(leftType), element(rightType)) + ", " +
+                   comparisonPredicate(element(rightType), element(leftType)) + ")";
+        if (auto r = record(leftType); r && user(r))
+            for (auto method : r->methods())
+                if (method->isOverloadedOperator() && method->getOverloadedOperator() == OO_Less)
+                    return booleanValue(left + "." + name(method) + "(" + right + ")",
+                                        method->getReturnType());
+        return "(Jpp.compare(" + left + ", " + right + ") < 0)";
+    }
+    std::string comparisonPredicate(QualType leftType, QualType rightType, bool reverse = false,
+                                    QualType parameterType = {}) {
+        auto left = temporary("jppLeft"), right = temporary("jppRight");
+        auto lhs = parameterType.isNull() ? left : converted(left, leftType, parameterType);
+        auto rhs = parameterType.isNull() ? right : converted(right, rightType, parameterType);
+        auto lhsType = parameterType.isNull() ? leftType : parameterType;
+        auto rhsType = parameterType.isNull() ? rightType : parameterType;
+        auto result = reverse ? lessExpression(rhs, rhsType, lhs, lhsType)
+                              : lessExpression(lhs, lhsType, rhs, rhsType);
+        return "(" + boxed(leftType) + " " + left + ", " + boxed(rightType) + " " + right +
+               ") -> " + result;
+    }
+    std::string comparatorPredicate(QualType comparator, QualType leftType, QualType rightType,
+                                    const std::string& initializer = {}) {
+        auto kind = family(comparator);
+        if (kind == "less" || kind == "greater") {
+            auto parameter = element(comparator);
+            return comparisonPredicate(leftType, rightType, kind == "greater",
+                                       parameter->isVoidType() ? QualType{} : parameter);
+        }
+        auto prototype = callableType(comparator);
+        if (prototype->getNumParams() != 2)
+            fail(SourceLocation(), "comparison callback must accept two arguments");
+        return supplier([&] {
+            auto function = temporary("jppComparator");
+            line("final " + type(comparator) + " " + function + " = " +
+                 (initializer.empty() ? defaultValue(comparator) : initializer) + ";");
+            std::vector<std::string> parameters, arguments;
+            for (unsigned i = 0; i < 2; ++i) {
+                auto parameter = temporary("jppOperand");
+                auto type = i == 0 ? leftType : rightType;
+                auto target = prototype->getParamType(i);
+                parameters.push_back(boxed(type) + " " + parameter);
+                auto argument = converted(parameter, type, target);
+                if (scalarReference(target))
+                    argument = "JppRef.cell(" + argument + ")";
+                else if (copyType(target))
+                    argument = "jppCopy(" + argument + ")";
+                arguments.push_back(argument);
+            }
+            auto invocation =
+                function + "." + callableMethod(comparator) + "(" + join(arguments) + ")";
+            line("return (java.util.function.BiPredicate<" + boxed(leftType) + ", " +
+                 boxed(rightType) + ">) ((" + join(parameters) + ") -> " +
+                 booleanValue(invocation, prototype->getReturnType()) + ");");
+        });
+    }
     bool addressHasSideEffects(const Expr* e) const {
         if (auto [base, index] = subscript(e); base)
             return isMap(base->getType()) || base->HasSideEffects(ctx) ||
@@ -1737,11 +1892,32 @@ class Emitter {
             return "new " + type(t) + "(" + join(a) + ")";
         }
         if (n == "function")
-            return expr(args[0]);
+            return converted(expr(args[0]), args[0]->getType(), t);
         if (isIter(t))
             return expr(args[0]);
-        if (isSet(t))
-            fail(c, "non-default set constructors are not supported yet");
+        if (isSet(t)) {
+            bool range = args.size() > 1 &&
+                         (isIter(args[0]->getType()) || args[0]->getType()->isPointerType());
+            bool list = isa<CXXStdInitializerListExpr>(bare(args[0]));
+            auto comparatorIndex = range ? 2U : list ? 1U : 0U;
+            auto created = defaultValue(t);
+            if (args.size() > comparatorIndex) {
+                auto comparator = args[comparatorIndex];
+                created = "new " + type(t) + "(" +
+                          (family(t) == "multiset" || family(t) == "unordered_multiset" ? "true"
+                                                                                        : "false") +
+                          ", Jpp.comparator(" +
+                          comparatorPredicate(comparator->getType(), element(t), element(t),
+                                              expr(comparator)) +
+                          "))";
+            }
+            if (range)
+                return "Jpp.setFrom(" + created + ", " + asIterator(args[0]) + ", " +
+                       asIterator(args[1]) + ")";
+            if (list)
+                return "Jpp.setFrom(" + created + ", " + expr(args[0]) + ")";
+            return created;
+        }
         if (n == "greater" || n == "less")
             return "(a, b) -> Jpp.compare(a, b) " + std::string(n == "less" ? "<" : ">") + " 0";
         std::vector<std::string> a;
@@ -2031,6 +2207,8 @@ class Emitter {
                 return o + ".ensureCapacity(" + intArgument(c->getArg(0)) + ")";
             if (n == "reserve" && family(ot).starts_with("unordered_"))
                 return "Jpp.ignore(" + o + ", " + expr(c->getArg(0)) + ")";
+            if (n == "fill" && family(ot) == "array")
+                return "Jpp.fill(" + o + ", " + args[0] + ")";
             if (n == "at" && (isVec(ot) || isString(ot)))
                 return o + ".get(" + intArgument(c->getArg(0)) + ")";
             if (n == "substr" || n == "find") {
@@ -2405,6 +2583,32 @@ class Emitter {
                    ", " + expr(callback) + ", (" + fn + ", " + position + ") -> " + fn + "." +
                    callableMethod(callback->getType()) + "(" + argument + "))";
         }
+        if (n == "lower_bound" || n == "upper_bound" || n == "binary_search") {
+            auto item = iteratorElement(c->getArg(0)->getType());
+            auto key = c->getArg(2)->getType();
+            auto callback = c->getNumArgs() > 3 ? c->getArg(3) : nullptr;
+            auto predicate = [&](bool reverse, const std::string& initializer = {}) {
+                auto left = reverse ? key : item, right = reverse ? item : key;
+                return callback
+                           ? comparatorPredicate(callback->getType(), left, right,
+                                                 initializer.empty() ? expr(callback) : initializer)
+                           : comparisonPredicate(left, right);
+            };
+            auto arguments = asIterator(c->getArg(0)) + ", " + asIterator(c->getArg(1)) + ", " +
+                             expr(c->getArg(2));
+            if (n != "binary_search")
+                return "Jpp." + n + "(" + arguments + ", " + predicate(n == "upper_bound") + ")";
+            if (!callback)
+                return "Jpp.binary_search(" + arguments + ", " + predicate(false) + ", " +
+                       predicate(true) + ")";
+            return supplier([&] {
+                auto comparator = temporary("jppCompare");
+                line("final " + type(callback->getType()) + " " + comparator + " = " +
+                     expr(callback) + ";");
+                line("return Jpp.binary_search(" + arguments + ", " + predicate(false, comparator) +
+                     ", " + predicate(true, comparator) + ");");
+            });
+        }
         static const std::set<std::string> algorithms = {
             "sort",        "stable_sort",   "reverse",    "fill", "lower_bound",
             "upper_bound", "binary_search", "unique",     "find", "count",
@@ -2421,10 +2625,12 @@ class Emitter {
                     auto v = expr(a->getImplicitObjectArgument());
                     if (n == "reverse")
                         return "Collections.reverse(" + v + ")";
-                    return v + ".sort(" +
-                           (c->getNumArgs() > 2 ? "Jpp.comparator(" + expr(c->getArg(2)) + ")"
-                                                : "Jpp::compare") +
-                           ")";
+                    auto item = iteratorElement(c->getArg(0)->getType());
+                    auto predicate = c->getNumArgs() > 2
+                                         ? comparatorPredicate(c->getArg(2)->getType(), item, item,
+                                                               expr(c->getArg(2)))
+                                         : comparisonPredicate(item, item);
+                    return v + ".sort(Jpp.comparator(" + predicate + "))";
                 }
             }
             std::vector<std::string> args;
@@ -2433,7 +2639,10 @@ class Emitter {
                     auto arg = c->getArg(i);
                     if (i < 2)
                         args.push_back(asIterator(arg));
-                    else if (n == "fill") {
+                    else if (i == 2 && (n == "sort" || n == "stable_sort")) {
+                        auto item = iteratorElement(c->getArg(0)->getType());
+                        args.push_back(comparatorPredicate(arg->getType(), item, item, expr(arg)));
+                    } else if (n == "fill") {
                         auto first = bare(c->getArg(0));
                         QualType elem;
                         if (ctx.getAsArrayType(first->getType()))
@@ -2451,10 +2660,28 @@ class Emitter {
                 }
             if (n == "stable_sort")
                 n = "sort";
+            if (n == "sort" && args.size() == 2) {
+                auto item = iteratorElement(c->getArg(0)->getType());
+                args.push_back(comparisonPredicate(item, item));
+            }
             auto result = "Jpp." + n + "(" + join(args) + ")";
             return n == "count" ? integerResult(c, result) : result;
         }
-        if (n == "min" || n == "max" || n == "clamp" || n == "gcd" || n == "lcm")
+        if (n == "min" || n == "max" || n == "clamp") {
+            bool list = family(c->getArg(0)->getType()) == "initializer_list";
+            unsigned comparatorIndex = list ? 1 : n == "clamp" ? 3 : 2;
+            auto item = clean(c->getType());
+            auto predicate = c->getNumArgs() > comparatorIndex
+                                 ? comparatorPredicate(c->getArg(comparatorIndex)->getType(), item,
+                                                       item, expr(c->getArg(comparatorIndex)))
+                                 : comparisonPredicate(item, item);
+            std::vector<std::string> args;
+            for (unsigned i = 0; i < comparatorIndex; ++i)
+                args.push_back(expr(c->getArg(i)));
+            args.push_back(predicate);
+            return "Jpp." + n + "(" + join(args) + ")";
+        }
+        if (n == "gcd" || n == "lcm")
             return "Jpp." + n + "(" + arguments(c) + ")";
         fail(c, "unsupported library function '" + f->getQualifiedNameAsString() + "'");
     }
@@ -2780,6 +3007,20 @@ class Emitter {
             if (op == OO_Call) {
                 auto object = x->getArg(0);
                 auto f = x->getDirectCallee();
+                if (family(object->getType()) == "less" || family(object->getType()) == "greater") {
+                    auto left = x->getArg(1), right = x->getArg(2);
+                    auto parameter = element(object->getType());
+                    auto lhs = parameter->isVoidType() ? expr(left) : value(left, parameter);
+                    auto rhs = parameter->isVoidType() ? expr(right) : value(right, parameter);
+                    auto lhsType = parameter->isVoidType() ? left->getType() : parameter;
+                    auto rhsType = parameter->isVoidType() ? right->getType() : parameter;
+                    auto comparison = family(object->getType()) == "less"
+                                          ? lessExpression(lhs, lhsType, rhs, rhsType)
+                                          : lessExpression(rhs, rhsType, lhs, lhsType);
+                    return object->HasSideEffects(ctx)
+                               ? "Jpp.last(" + expr(object) + ", " + comparison + ")"
+                               : comparison;
+                }
                 std::vector<std::string> a;
                 for (unsigned i = 1; i < x->getNumArgs(); ++i) {
                     auto e = x->getArg(i);
@@ -2788,7 +3029,9 @@ class Emitter {
                     a.push_back(scalarReference(target) ? reference(e) : value(e, target, true));
                 }
                 auto r = record(object->getType());
-                auto method = f && user(f) && r && !r->isLambda() ? name(f) : "call";
+                auto method = f && user(f) && r && !r->isLambda()
+                                  ? name(f)
+                                  : callableMethod(object->getType());
                 return expr(object) + "." + method + "(" + join(a) + ")";
             }
             if (op == OO_PlusPlus || op == OO_MinusMinus) {
@@ -2843,6 +3086,21 @@ class Emitter {
             std::vector<std::string> a;
             if (ctx.getAsArrayType(t))
                 return newArray(t, x);
+            if (family(t) == "array") {
+                const InitListExpr* elements = x;
+                if (x->getNumInits() == 1)
+                    if (auto nested = dyn_cast<InitListExpr>(bare(x->getInit(0)));
+                        nested && ctx.getAsArrayType(nested->getType()))
+                        elements = nested;
+                if (!templateArgs(t)[1].getAsIntegral().isZero())
+                    for (auto element : elements->inits())
+                        if (!(isa<ImplicitValueInitExpr>(element) &&
+                              ctx.getAsArrayType(element->getType())))
+                            a.push_back(value(element, this->element(t), true));
+                return "Jpp.vectorInitialized(" + number(templateArgs(t)[1].getAsIntegral()) +
+                       ", () -> " + defaultValue(element(t)) + ", Arrays.<" + boxed(element(t)) +
+                       ">asList(" + join(a) + "))";
+            }
             if (isVec(t)) {
                 for (auto v : x->inits())
                     a.push_back(value(v, element(t), true));

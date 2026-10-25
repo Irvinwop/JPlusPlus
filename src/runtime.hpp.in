@@ -1,5 +1,12 @@
 #pragma once
+#include <string>
 #include <string_view>
-inline constexpr std::string_view javaRuntime = R"JPP_RUNTIME(
-@JPP_RUNTIME@
-)JPP_RUNTIME";
+inline const std::string javaRuntime = [] {
+    constexpr std::string_view parts[] = {
+@JPP_RUNTIME_PARTS@
+    };
+    std::string result;
+    for (auto part : parts)
+        result.append(part);
+    return result;
+}();

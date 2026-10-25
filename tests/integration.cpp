@@ -171,6 +171,8 @@ int main() {
         cases.emplace_back("objects", expressions.str());
         cases.emplace_back("statics", expressions.str());
         cases.emplace_back("calls", expressions.str());
+        cases.emplace_back("standard_values", expressions.str());
+        cases.emplace_back("ordering", expressions.str());
         cases.emplace_back("halt", "");
         cases.emplace_back("coverage", "-19 37 5\n");
         cases.emplace_back("constants", "-17\n");
