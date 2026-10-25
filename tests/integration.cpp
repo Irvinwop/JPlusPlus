@@ -185,20 +185,64 @@ int main() {
                       << (r(20001) - 10000) * 0.25 << " cat @ abc\n";
         formatted << "-017 0x2a 37 999Q";
         cases.emplace_back("formatted", formatted.str());
-        std::vector<std::string> tokens = {
-            "0 -2147483648", "0 2147483648", "0 -2147483649", "0 +", "0 e",
-            "1 -9223372036854775808", "1 9223372036854775808", "1 -9223372036854775809",
-            "2 4294967295", "2 4294967296", "2 -1", "3 18446744073709551615",
-            "3 18446744073709551616", "3 -1", "4 -32768", "4 32768", "5 65535",
-            "5 65536", "5 -1", "6 -1.25", "6 1e+2", "6 1e+", "6 0x1.8p1",
-            "6 inf", "6 .", "6 1e999", "6 1e-999", "7 0.100000001490116119384765625",
-            "7 1e100", "8 0", "8 1", "8 2", "8 -1"};
+        std::vector<std::string> tokens = {"0 -2147483648",
+                                           "0 2147483648",
+                                           "0 -2147483649",
+                                           "0 +",
+                                           "0 e",
+                                           "1 -9223372036854775808",
+                                           "1 9223372036854775808",
+                                           "1 -9223372036854775809",
+                                           "2 4294967295",
+                                           "2 4294967296",
+                                           "2 -1",
+                                           "3 18446744073709551615",
+                                           "3 18446744073709551616",
+                                           "3 -1",
+                                           "4 -32768",
+                                           "4 32768",
+                                           "5 65535",
+                                           "5 65536",
+                                           "5 -1",
+                                           "6 -1.25",
+                                           "6 1e+2",
+                                           "6 1e+",
+                                           "6 0x1.8p1",
+                                           "6 inf",
+                                           "6 .",
+                                           "6 1e999",
+                                           "6 1e-999",
+                                           "7 0.100000001490116119384765625",
+                                           "7 1e100",
+                                           "8 0",
+                                           "8 1",
+                                           "8 2",
+                                           "8 -1"};
         std::ostringstream inputCases;
         inputCases << "-9 17 42\n" << tokens.size() << '\n';
         for (const auto& token : tokens)
             inputCases << token << "Q\n";
         inputCases << "first\rline\nlast without newline";
         cases.emplace_back("input", inputCases.str());
+        cases.emplace_back("maths", "25\n-7.75 -7.5 -7.25 -0.75 -0.5 -0.25 -0.0 0.0 0.25 0.5 "
+                                    "0.75 7.25 7.5 7.75 2147483647.5 -2147483648.5 0x1p-1074 "
+                                    "0x1p-1022 0x1p-32 0x1p32 1.0 inf -inf nan -nan\n");
+        std::ostringstream unsignedCases;
+        std::vector<unsigned long long> boundaries = {0,
+                                                      1,
+                                                      0xffffffffULL,
+                                                      0x100000000ULL,
+                                                      0x7fffffffffffffffULL,
+                                                      0x8000000000000000ULL,
+                                                      0xffffffffffffffffULL,
+                                                      (1ULL << 63) + (1ULL << 39) + 1,
+                                                      (1ULL << 63) + (3ULL << 39) - 1,
+                                                      (1ULL << 63) + (1ULL << 10) + 1};
+        unsignedCases << 90 << '\n';
+        for (int i = 0; i < 90; ++i)
+            unsignedCases << (i % 9 == 0 ? 0xffffffffU : static_cast<unsigned>(random())) << ' '
+                          << (i < boundaries.size() ? boundaries[i] : random()) << '\n';
+        cases.emplace_back("unsigned_conversions", unsignedCases.str());
         write(p / "LibraryDriver.java", "import java.util.*; public class LibraryDriver {"
                                         "public static void main(String[] args) {"
                                         "Scanner in = new Scanner(System.in); int n = in.nextInt();"
@@ -239,9 +283,10 @@ int main() {
             must({(p / "native").string()}, p / "input");
             auto expected = read(p / "stdout");
             std::map<std::string, std::string> expectedFiles;
-            for (const auto& output : name == "files"      ? std::vector<std::string>{"jpp-io-global.txt"}
-                                      : name == "redirect" ? std::vector<std::string>{"jpp-redirect.out"}
-                                                           : std::vector<std::string>{})
+            for (const auto& output :
+                 name == "files"      ? std::vector<std::string>{"jpp-io-global.txt"}
+                 : name == "redirect" ? std::vector<std::string>{"jpp-redirect.out"}
+                                      : std::vector<std::string>{})
                 expectedFiles.emplace(output, read(p / output));
             // Generate once per requested Java release, then compile with each independent
             // compiler.
@@ -288,8 +333,8 @@ int main() {
                                                      read(p / "stdout").substr(0, 1000));
                         for (const auto& [file, contents] : expectedFiles)
                             if (!fs::exists(p / file) || read(p / file) != contents)
-                                throw std::runtime_error("file output differs from native C++: " +
-                                                         name + ", " + file);
+                                throw std::runtime_error(
+                                    "file output differs from native C++: " + name + ", " + file);
                         ++checks;
                     }
                 }
@@ -319,8 +364,8 @@ int main() {
         if (code != 7 || read(p / "stdout") != "123\n")
             throw std::runtime_error("-r did not forward output/exit status");
         ++checks;
-        write(p / "exit.cpp", "#include <iostream>\n#include <cstdlib>\nint main(){std::cout << "
-                              "321; std::exit(7);}\n");
+        write(p / "exit.cpp", "#include <iostream>\n#include <cstdlib>\nint stop(){std::exit(7);}\n"
+                              "int main(){std::cout << 321; stop();}\n");
         code = process({JPP_BINARY, (p / "exit.cpp").string(), "-r", "-v", "j8", "-o",
                         (p / "Main.java").string()},
                        p / "empty", p / "stdout", p / "stderr");

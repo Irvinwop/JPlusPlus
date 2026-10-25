@@ -192,8 +192,10 @@ std::string supportFor(const std::string& program, std::string& startup) {
     };
     std::vector<Part> parts;
     for (auto code : declarations(javaRuntime)) {
-        bool inputClass = code.find("static class JppInput implements AutoCloseable {") != std::string::npos;
-        bool outputClass = code.find("static class JppOutput implements AutoCloseable {") != std::string::npos;
+        bool inputClass =
+            code.find("static class JppInput implements AutoCloseable {") != std::string::npos;
+        bool outputClass =
+            code.find("static class JppOutput implements AutoCloseable {") != std::string::npos;
         if (inputClass || outputClass) {
             auto body = code.substr(code.find('{') + 1);
             body.resize(body.rfind('}'));
@@ -208,14 +210,21 @@ std::string supportFor(const std::string& program, std::string& startup) {
                     while (begin && (std::isalnum(static_cast<unsigned char>(decl[begin - 1])) ||
                                      decl[begin - 1] == '_'))
                         --begin;
-                    parts.push_back(
-                        {decl, {"call:" + decl.substr(begin, end - begin)}, false, false, inputClass,
-                         outputClass});
+                    parts.push_back({decl,
+                                     {"call:" + decl.substr(begin, end - begin)},
+                                     false,
+                                     false,
+                                     inputClass,
+                                     outputClass});
                 } else
                     fields += decl;
             }
-            parts.push_back({fields, {inputClass ? "JppInput" : "JppOutput"}, false, false,
-                             inputClass, outputClass});
+            parts.push_back({fields,
+                             {inputClass ? "JppInput" : "JppOutput"},
+                             false,
+                             false,
+                             inputClass,
+                             outputClass});
         } else if (code.find("static class Jpp {") != std::string::npos) {
             auto body = code.substr(code.find('{') + 1);
             body.resize(body.rfind('}'));
@@ -404,9 +413,10 @@ class Emitter {
                     return false;
                 auto function = dyn_cast<FunctionDecl>(entry.first->getDeclContext());
                 return function && std::any_of(enclosingFunctions.begin(), enclosingFunctions.end(),
-                    [&](const FunctionDecl* outer) {
-                        return outer->getCanonicalDecl() == function->getCanonicalDecl();
-                    });
+                                               [&](const FunctionDecl* outer) {
+                                                   return outer->getCanonicalDecl() ==
+                                                          function->getCanonicalDecl();
+                                               });
             });
             if (shadows)
                 base = temporary(base + "_lambda");
@@ -718,8 +728,21 @@ class Emitter {
             s = "(" + s + " ? 1 : 0)";
             from = ctx.IntTy;
         }
+        if (from->isUnsignedIntegerType() && ctx.getTypeSize(from) == 32 &&
+            (target->isRealFloatingType() ||
+             (target->isIntegerType() && ctx.getTypeSize(target) > 32))) {
+            s = "Integer.toUnsignedLong(" + s + ")";
+            from = ctx.UnsignedLongLongTy;
+        }
+        if (unsignedLong(from) && target->isRealFloatingType()) {
+            bool single = target->isSpecificBuiltinType(BuiltinType::Float);
+            s = std::string(single ? "Jpp.unsignedFloat(" : "Jpp.unsignedDouble(") + s + ")";
+            from = single ? ctx.FloatTy : ctx.DoubleTy;
+        }
         if (big(target) && !big(from))
-            s = "BigInteger.valueOf(" + s + ")";
+            s = std::string(unsignedLong(from) ? "Jpp.unsignedBigInteger("
+                                               : "BigInteger.valueOf(") +
+                s + ")";
         else if (!big(target) && big(from)) {
             auto jt = type(target);
             s = "(" + s + ")." +
@@ -1025,7 +1048,10 @@ class Emitter {
         auto jt = type(t);
         if (jt == "int" || jt == "long") {
             auto bits = ctx.getTypeSize(clean(t));
-            std::string suffix = bits <= 8 ? "Byte" : bits <= 16 ? "Short" : bits <= 32 ? "Int" : "Long";
+            std::string suffix = bits <= 8    ? "Byte"
+                                 : bits <= 16 ? "Short"
+                                 : bits <= 32 ? "Int"
+                                              : "Long";
             return source + ".next" + (clean(t)->isUnsignedIntegerType() ? "Unsigned" : "") +
                    suffix + "(" + previous + ")";
         }
@@ -1064,8 +1090,8 @@ class Emitter {
                                 input + ", " + old + ") -> " +
                                 inputValue(destination->getType(), input, old) + ")");
             } else
-                parts.push_back(assign(destination,
-                                       inputValue(destination->getType(), source, expr(destination))));
+                parts.push_back(assign(
+                    destination, inputValue(destination->getType(), source, expr(destination))));
             return source;
         }
         return sourceOverride.empty() ? expr(e) : sourceOverride;
@@ -1096,9 +1122,9 @@ class Emitter {
             if (n == "flush")
                 return left + ".flush()";
             if (n == "fixed" || n == "scientific")
-                return n == "fixed"
-                           ? left + ".fixed(true)"
-                           : (fail(right, "scientific stream formatting is not supported"), "");
+                return n == "fixed" ? left + ".fixed(true)" : left + ".scientific()";
+            if (n == "hexfloat")
+                return left + ".hexadecimal()";
             if (n == "defaultfloat")
                 return left + ".fixed(false)";
             if (n == "boolalpha" || n == "noboolalpha")
@@ -1160,7 +1186,8 @@ class Emitter {
                 {"<<", "shiftLeft"}, {">>", "shiftRight"}};
             if (auto it = ops.find(op); it != ops.end())
                 return l + "." + it->second + "(" +
-                       ((op == "<<" || op == ">>") ? converted(rhs, rightType, ctx.IntTy) : r) + ")";
+                       ((op == "<<" || op == ">>") ? converted(rhs, rightType, ctx.IntTy) : r) +
+                       ")";
         }
         if (comparison && clean(leftType)->isUnsignedIntegerType() &&
             (ctx.getTypeSize(leftType) == 32 || ctx.getTypeSize(leftType) == 64))
@@ -1398,6 +1425,25 @@ class Emitter {
         }
         return "new " + type(target) + "(" + join(values) + ")";
     }
+    std::string bitCast(const Expr* value, QualType target) {
+        auto from = clean(value->getType());
+        target = clean(target);
+        if (ctx.hasSameType(from, target))
+            return expr(value);
+        if (from->isSpecificBuiltinType(BuiltinType::Float) && target->isIntegerType() &&
+            ctx.getTypeSize(target) == 32)
+            return "Float.floatToRawIntBits(" + expr(value) + ")";
+        if (from->isSpecificBuiltinType(BuiltinType::Double) && target->isIntegerType() &&
+            ctx.getTypeSize(target) == 64)
+            return "Double.doubleToRawLongBits(" + expr(value) + ")";
+        if (target->isSpecificBuiltinType(BuiltinType::Float) && from->isIntegerType() &&
+            ctx.getTypeSize(from) == 32)
+            return "Float.intBitsToFloat(" + expr(value) + ")";
+        if (target->isSpecificBuiltinType(BuiltinType::Double) && from->isIntegerType() &&
+            ctx.getTypeSize(from) == 64)
+            return "Double.longBitsToDouble(" + expr(value) + ")";
+        fail(value, "this bit_cast needs a storage layout backend");
+    }
     std::string call(const CallExpr* c) {
         auto f = c->getDirectCallee();
         if (auto m = dyn_cast<CXXMemberCallExpr>(c)) {
@@ -1450,7 +1496,7 @@ class Emitter {
                 QualType target =
                     f && i < f->getNumParams() ? f->getParamDecl(i)->getType() : a->getType();
                 args.push_back(f && user(f) && scalarReference(target) ? reference(a)
-                                                                      : value(a, target, true));
+                                                                       : value(a, target, true));
             }
             auto o = expr(obj);
             if (n == "size" || n == "length" || n == "capacity")
@@ -1543,6 +1589,8 @@ class Emitter {
             }
             if (n == "reserve" && isVec(ot))
                 return o + ".ensureCapacity(" + intArgument(c->getArg(0)) + ")";
+            if (n == "reserve" && family(ot).starts_with("unordered_"))
+                return "Jpp.ignore(" + o + ", " + expr(c->getArg(0)) + ")";
             if (n == "at" && (isVec(ot) || isString(ot)))
                 return o + ".get(" + intArgument(c->getArg(0)) + ")";
             if (n == "substr" || n == "find") {
@@ -1637,16 +1685,15 @@ class Emitter {
                     destination = address->getSubExpr();
                 auto array = ctx.getAsArrayType(arg->getType());
                 auto target = destination ? destination->getType()
-                              : array    ? array->getElementType()
-                                         : QualType();
+                              : array     ? array->getElementType()
+                                          : QualType();
                 if (target.isNull())
                     fail(arg, "scanf destination needs an address or an array");
                 if (array && target->isCharType()) {
                     a.push_back("Jpp.scanChars(" + expr(arg) + ")");
                     continue;
                 }
-                auto ref = destination ? reference(destination)
-                                       : "JppRef.at(" + expr(arg) + ", 0)";
+                auto ref = destination ? reference(destination) : "JppRef.at(" + expr(arg) + ", 0)";
                 auto jt = type(target);
                 if (jt == "char")
                     a.push_back("Jpp.scanChar(" + ref + ")");
@@ -1669,8 +1716,10 @@ class Emitter {
             auto streamName = target ? target->getDecl()->getNameAsString() : "";
             if (streamName == "stdin" || streamName == "stdout" || streamName == "stderr")
                 return "Jpp.reopen" + std::string(streamName == "stdin" ? "Input" : "Output") +
-                       "(" + (streamName == "stdin" ? "jppIn" : streamName == "stdout" ? "jppOut"
-                                                                                       : "jppErr") +
+                       "(" +
+                       (streamName == "stdin"    ? "jppIn"
+                        : streamName == "stdout" ? "jppOut"
+                                                 : "jppErr") +
                        ", " + expr(c->getArg(0)) + ".toString(), " + expr(c->getArg(1)) +
                        ".toString())";
             fail(c, "freopen needs a supported C standard stream");
@@ -1681,6 +1730,10 @@ class Emitter {
             return "Jpp.exit(" + intArgument(c->getArg(0)) + ")";
         if (n == "_Exit")
             return "System.exit(" + intArgument(c->getArg(0)) + ")";
+        if (n == "unreachable")
+            return "Jpp.trap()";
+        if (n == "bit_cast")
+            return bitCast(c->getArg(0), c->getType());
         if (n == "__assert_fail")
             return "Jpp.assertFail()";
         if (n == "make_pair")
@@ -1710,7 +1763,8 @@ class Emitter {
                     return "Jpp.extract(" + source + ", " + reference(destination) + ", (" + input +
                            ", " + old + ") -> " + input + ".line(" + old + ", " + delimiter + "))";
                 }
-                return assign(destination, source + ".line(" + expr(destination) + ", " + delimiter + ")");
+                return assign(destination,
+                              source + ".line(" + expr(destination) + ", " + delimiter + ")");
             };
             if (c->getArg(0)->HasSideEffects(ctx))
                 return supplier([&] {
@@ -1740,6 +1794,63 @@ class Emitter {
                    "))";
         if (n == "advance")
             return expr(c->getArg(0)) + ".advance(" + intArgument(c->getArg(1)) + ")";
+        if (n == "log2" || n == "round" || n == "roundf" || n == "lround" || n == "llround" ||
+            n == "rint" || n == "nearbyint" || n == "trunc") {
+            std::string result;
+            auto runtimeType =
+                clean(c->getArg(0)->getType())->isSpecificBuiltinType(BuiltinType::Float) &&
+                        n != "log2"
+                    ? ctx.FloatTy
+                    : ctx.DoubleTy;
+            auto argument = value(c->getArg(0), runtimeType);
+            if (n == "log2")
+                result = "Jpp.log2(" + argument + ")";
+            else if (n == "rint" || n == "nearbyint")
+                result = "Jpp.rint(" + argument + ")";
+            else if (n == "trunc")
+                result = "Jpp.trunc(" + argument + ")";
+            else
+                result = "Jpp.round(" + argument + ")";
+            return converted(result, runtimeType, c->getType());
+        }
+        if (n == "isnan" || n == "isinf" || n == "isfinite") {
+            auto cls = clean(c->getArg(0)->getType())->isSpecificBuiltinType(BuiltinType::Float)
+                           ? "Float"
+                           : "Double";
+            auto argument = big(c->getArg(0)->getType()) ? value(c->getArg(0), ctx.DoubleTy)
+                                                         : expr(c->getArg(0));
+            auto result = std::string(cls) + "." +
+                          (n == "isnan"   ? "isNaN"
+                           : n == "isinf" ? "isInfinite"
+                                          : "isFinite") +
+                          "(" + argument + ")";
+            return converted(result, ctx.BoolTy, c->getType());
+        }
+        if (n == "signbit") {
+            auto arg = c->getArg(0);
+            if (big(arg->getType()) && !clean(arg->getType())->isUnsignedIntegerType())
+                return "(" + expr(arg) + ".signum() < 0)";
+            if (clean(arg->getType())->isIntegerType())
+                return clean(arg->getType())->isUnsignedIntegerType()
+                           ? "Jpp.last(" + expr(arg) + ", false)"
+                           : "(" + expr(arg) + " < 0)";
+            auto cls = clean(arg->getType())->isSpecificBuiltinType(BuiltinType::Float) ? "Float"
+                                                                                        : "Double";
+            return "(" + std::string(cls) +
+                   (std::string(cls) == "Float" ? ".floatToRawIntBits(" : ".doubleToRawLongBits(") +
+                   expr(arg) + ") < 0)";
+        }
+        if (n == "ldexp" || n == "scalbn" || n == "nextafter" || n == "copysign" ||
+            n == "remainder") {
+            auto operation = n == "nextafter"   ? "nextAfter"
+                             : n == "copysign"  ? "copySign"
+                             : n == "remainder" ? "IEEEremainder"
+                                                : "scalb";
+            auto result = "Math." + std::string(operation) + "(" + arguments(c) + ")";
+            return clean(c->getType())->isSpecificBuiltinType(BuiltinType::Float)
+                       ? "(float)(" + result + ")"
+                       : result;
+        }
         static const std::set<std::string> maths = {
             "abs", "fabs", "sqrt",  "sqrtl", "pow", "powl", "floor", "ceil",  "round",
             "log", "log2", "log10", "exp",   "sin", "cos",  "tan",   "atan2", "hypot"};
@@ -1750,7 +1861,21 @@ class Emitter {
                 n = "sqrt";
             if (n == "powl")
                 n = "pow";
-            return "Math." + n + "(" + arguments(c) + ")";
+            std::vector<std::string> arguments;
+            bool integralAbs = n == "abs" && clean(c->getType())->isIntegerType();
+            for (auto arg : c->arguments())
+                arguments.push_back(value(
+                    arg,
+                    integralAbs ? arg->getType()
+                    : n == "abs" && clean(c->getType())->isSpecificBuiltinType(BuiltinType::Float)
+                        ? ctx.FloatTy
+                        : ctx.DoubleTy));
+            if (integralAbs && big(c->getArg(0)->getType()))
+                return arguments[0] + ".abs()";
+            auto result = "Math." + n + "(" + join(arguments) + ")";
+            return clean(c->getType())->isSpecificBuiltinType(BuiltinType::Float)
+                       ? "(float)(" + result + ")"
+                       : result;
         }
         if (n == "__gcd")
             n = "gcd";
@@ -1940,7 +2065,8 @@ class Emitter {
                     return "-1L";
                 if (auto en = dyn_cast<EnumConstantDecl>(d))
                     return number(en->getInitVal());
-                if (auto v = dyn_cast<VarDecl>(d); v && v->hasInit() &&
+                if (auto v = dyn_cast<VarDecl>(d);
+                    v && v->hasInit() &&
                     v->getQualifiedNameAsString().starts_with("std::ios_base::")) {
                     Expr::EvalResult evaluated;
                     if (v->getInit()->EvaluateAsInt(evaluated, ctx))
@@ -1973,6 +2099,8 @@ class Emitter {
                 return expr(sub);
             }
         }
+        if (auto x = dyn_cast<BuiltinBitCastExpr>(e))
+            return bitCast(x->getSubExpr(), x->getType());
         if (auto x = dyn_cast<ExplicitCastExpr>(e)) {
             if (x->getType()->isVoidType() && x->getSubExpr()->getType()->isVoidType())
                 return expr(x->getSubExpr());
@@ -2078,8 +2206,7 @@ class Emitter {
             auto op = x->getOperator();
             if (op == OO_LessLess && x->getNumArgs() == 2 && stream(x->getArg(0)->getType()))
                 return outputChain(x);
-            if (op == OO_GreaterGreater && x->getNumArgs() == 2 &&
-                stream(x->getArg(0)->getType()))
+            if (op == OO_GreaterGreater && x->getNumArgs() == 2 && stream(x->getArg(0)->getType()))
                 return inputExpression(x);
             if (op == OO_Subscript) {
                 auto b = x->getArg(0);
@@ -2395,15 +2522,20 @@ class Emitter {
             (isa<BinaryOperator>(b) && !cast<BinaryOperator>(b)->isAssignmentOp()))
             s = "Jpp.ignore(" + s + ")";
         line(s + ";");
+        if (auto call = dyn_cast<CallExpr>(b);
+            call && call->getDirectCallee() && call->getDirectCallee()->isNoReturn())
+            line("throw new IllegalStateException(\"C++ noreturn function returned\");");
     }
     bool terminates(const Stmt* s) const {
         if (!s)
             return false;
-        if (isa<ReturnStmt>(s) || isa<CXXThrowExpr>(s) || isa<BreakStmt>(s) || isa<ContinueStmt>(s) ||
-            isa<GotoStmt>(s))
+        if (isa<ReturnStmt>(s) || isa<CXXThrowExpr>(s) || isa<BreakStmt>(s) ||
+            isa<ContinueStmt>(s) || isa<GotoStmt>(s))
             return true;
         if (auto label = dyn_cast<LabelStmt>(s))
             return terminates(label->getSubStmt());
+        if (auto call = dyn_cast<CallExpr>(s))
+            return call->getDirectCallee() && call->getDirectCallee()->isNoReturn();
         if (auto b = dyn_cast<CompoundStmt>(s))
             return !b->body_empty() && terminates(b->body_back());
         if (auto i = dyn_cast<IfStmt>(s))
@@ -2425,7 +2557,8 @@ class Emitter {
             std::function<void(const Stmt*, size_t)> find = [&](const Stmt* s, size_t index) {
                 if (!s || isa<LambdaExpr>(s))
                     return;
-                if (auto jump = dyn_cast<GotoStmt>(s); jump && jump->getLabel() == label->getDecl()) {
+                if (auto jump = dyn_cast<GotoStmt>(s);
+                    jump && jump->getLabel() == label->getDecl()) {
                     if (index >= target)
                         fail(jump, "backward goto requires additional control flow lowering");
                     begin = std::min(begin, index);
@@ -2444,12 +2577,13 @@ class Emitter {
                 if (exits[j].begin > exits[i].begin && exits[j].begin < exits[i].end)
                     exits[j].begin = exits[i].begin;
         for (size_t i = 0; i < statements.size(); ++i)
-            if (std::any_of(exits.begin(), exits.end(), [&](const Exit& e) { return i >= e.begin && i < e.end; }))
+            if (std::any_of(exits.begin(), exits.end(),
+                            [&](const Exit& e) { return i >= e.begin && i < e.end; }))
                 if (auto declarations = dyn_cast<DeclStmt>(statements[i]))
                     for (auto decl : declarations->decls())
-                        if (auto v = dyn_cast<VarDecl>(decl);
-                            v && v->hasLocalStorage() && !v->hasInit() &&
-                            hoistedVariables.insert(v).second)
+                        if (auto v = dyn_cast<VarDecl>(decl); v && v->hasLocalStorage() &&
+                                                              !v->hasInit() &&
+                                                              hoistedVariables.insert(v).second)
                             line(variable(v) + ";");
         auto previousLabels = jumpLabels;
         unsigned resources = 0;
@@ -2496,8 +2630,8 @@ class Emitter {
                 if (fileStream(v->getType()) && !v->getType()->isReferenceType()) {
                     if (cell(v)) {
                         line(variable(v) + ";");
-                        line("try (" + type(v->getType()) + " " + temporary("jppResource") +
-                             " = " + name(v) + ".get()) {");
+                        line("try (" + type(v->getType()) + " " + temporary("jppResource") + " = " +
+                             name(v) + ".get()) {");
                     } else
                         line("try (" + variable(v) + ") {");
                     ++indent;
@@ -2537,7 +2671,7 @@ class Emitter {
                     if (!hoistedVariables.count(v))
                         line(variable(v) + ";");
                 } else if (isa<TypedefNameDecl>(decl) || isa<UsingDecl>(decl) ||
-                         isa<UsingDirectiveDecl>(decl) || isa<StaticAssertDecl>(decl))
+                           isa<UsingDirectiveDecl>(decl) || isa<StaticAssertDecl>(decl))
                     continue;
                 else
                     fail(s, "unsupported local declaration");
@@ -2977,7 +3111,7 @@ class Emitter {
         out << "// Generated by J++ 0.1.0. Target: Java " << options.javaVersion << ".\n"
             << "// Input dialect: GNU++23. Support: "
                "https://github.com/Irvinwop/JPlusPlus/blob/main/docs/compatibility.md\n"
-            << "import java.io.*;\nimport java.util.*;\nimport java.math.BigInteger;\n\n"
+            << "import java.io.*;\nimport java.util.*;\nimport java.math.*;\n\n"
             << "@SuppressWarnings({\"unchecked\", \"rawtypes\"})\npublic class "
             << options.className << " {\n";
         auto startupAt = static_cast<size_t>(out.tellp());

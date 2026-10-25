@@ -772,10 +772,12 @@ static class JppInput implements AutoCloseable {
         boolean neg = c == '-';
         if (neg || c == '+')
             c = readByte();
-        long maximum = unsigned ? bits == 64 ? -1L : (1L << bits) - 1
-                                : bits == 64 ? Long.MAX_VALUE : (1L << (bits - 1)) - 1;
+        long maximum = unsigned     ? bits == 64 ? -1L : (1L << bits) - 1
+                       : bits == 64 ? Long.MAX_VALUE
+                                    : (1L << (bits - 1)) - 1;
         long bound = !unsigned && neg ? maximum + 1 : maximum;
-        long quotient = Long.divideUnsigned(bound, 10), remainder = Long.remainderUnsigned(bound, 10);
+        long quotient = Long.divideUnsigned(bound, 10), remainder =
+                                                            Long.remainderUnsigned(bound, 10);
         long n = 0;
         boolean digits = false, overflow = false;
         while (c >= '0' && c <= '9') {
@@ -953,8 +955,9 @@ interface JppScanTarget {
 static class JppScanner {
     static final java.util.regex.Pattern floating = java.util.regex.Pattern.compile(
         "[+-]?(?:(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
-        + "|0x(?:[0-9a-f]+(?:\\.[0-9a-f]*)?|\\.[0-9a-f]+)(?:p[+-]?[0-9]+)?"
-        + "|inf(?:inity)?|nan)", java.util.regex.Pattern.CASE_INSENSITIVE);
+            + "|0x(?:[0-9a-f]+(?:\\.[0-9a-f]*)?|\\.[0-9a-f]+)(?:p[+-]?[0-9]+)?"
+            + "|inf(?:inity)?|nan)",
+        java.util.regex.Pattern.CASE_INSENSITIVE);
     final JppInput input;
     int consumed;
     JppScanner(JppInput source) {
@@ -984,7 +987,8 @@ static class JppScanner {
     static double parseFloating(String text) {
         String lower = text.toLowerCase(Locale.ROOT);
         if (lower.equals("nan") || lower.equals("+nan") || lower.equals("-nan"))
-            return Double.NaN;
+            return lower.startsWith("-") ? Double.longBitsToDouble(0xfff8000000000000L)
+                                         : Double.NaN;
         if (lower.matches("[+-]?inf(?:inity)?"))
             return lower.startsWith("-") ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
         if (lower.indexOf("0x") >= 0 && lower.indexOf('p') < 0)
@@ -1140,7 +1144,8 @@ static class JppScanner {
 static class JppOutput implements AutoCloseable {
     private PrintWriter output;
     int precision = 6;
-    boolean fixed, boolalpha, good = true, ended;
+    char formatMode = 'g';
+    boolean boolalpha, good = true, ended;
     JppOutput(OutputStream stream) {
         output = new PrintWriter(new BufferedWriter(
             new OutputStreamWriter(stream, java.nio.charset.StandardCharsets.UTF_8)));
@@ -1161,9 +1166,9 @@ static class JppOutput implements AutoCloseable {
             return;
         }
         try {
-            output = new PrintWriter(new BufferedWriter(new OutputStreamWriter(
-                new FileOutputStream(path, (mode & 1) != 0),
-                java.nio.charset.StandardCharsets.UTF_8)));
+            output = new PrintWriter(new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(path, (mode & 1) != 0),
+                                       java.nio.charset.StandardCharsets.UTF_8)));
             good = true;
         } catch (IOException e) {
             good = false;
@@ -1191,22 +1196,16 @@ static class JppOutput implements AutoCloseable {
         if (value instanceof Boolean)
             output.print(boolalpha ? value : ((Boolean)value ? 1 : 0));
         else if (value instanceof Double || value instanceof Float) {
-            String formatted = String.format(
-                Locale.ROOT, fixed ? "%." + precision + "f" : "%." + Math.max(1, precision) + "g",
-                value);
-            if (!fixed) {
-                int exp = formatted.indexOf('e');
-                String tail = exp < 0 ? "" : formatted.substring(exp);
-                String head = exp < 0 ? formatted : formatted.substring(0, exp);
-                if (head.indexOf('.') >= 0) {
-                    while (head.endsWith("0"))
-                        head = head.substring(0, head.length() - 1);
-                    if (head.endsWith("."))
-                        head = head.substring(0, head.length() - 1);
-                }
-                formatted = head + tail;
+            String special = Jpp.nonfinite(((Number)value).doubleValue(), false, false, false);
+            if (special != null) {
+                output.print(special);
+                return this;
             }
-            output.print(formatted);
+            double number = ((Number)value).doubleValue();
+            if (Double.doubleToRawLongBits(number) < 0)
+                output.print('-');
+            output.print(Jpp.floating(Math.abs(number), formatMode,
+                                      formatMode == 'a' ? -1 : precision, false));
         } else
             output.print(value);
         return this;
@@ -1228,7 +1227,15 @@ static class JppOutput implements AutoCloseable {
         return this;
     }
     JppOutput fixed(boolean on) {
-        fixed = on;
+        formatMode = on ? 'f' : 'g';
+        return this;
+    }
+    JppOutput scientific() {
+        formatMode = 'e';
+        return this;
+    }
+    JppOutput hexadecimal() {
+        formatMode = 'a';
         return this;
     }
     JppOutput boolalpha(boolean on) {
@@ -1284,9 +1291,12 @@ static class JppOutput implements AutoCloseable {
             String text;
             boolean left = flags.indexOf('-') >= 0;
             if ("diuoxX".indexOf(c) >= 0) {
-                int bits = length.equals("hh") ? 8 : length.equals("h") ? 16
-                    : length.isEmpty() ? 32 : 64;
-                long raw = value instanceof Character ? (Character)value : ((Number)value).longValue();
+                int bits = length.equals("hh")  ? 8
+                           : length.equals("h") ? 16
+                           : length.isEmpty()   ? 32
+                                                : 64;
+                long raw =
+                    value instanceof Character ? (Character)value : ((Number)value).longValue();
                 boolean signed = c == 'd' || c == 'i';
                 BigInteger number;
                 if (signed) {
@@ -1306,8 +1316,10 @@ static class JppOutput implements AutoCloseable {
                     digits = "";
                 while (digits.length() < precision)
                     digits = '0' + digits;
-                String prefix = number.signum() < 0 ? "-" : signed && flags.indexOf('+') >= 0 ? "+"
-                    : signed && flags.indexOf(' ') >= 0 ? " " : "";
+                String prefix = number.signum() < 0                 ? "-"
+                                : signed && flags.indexOf('+') >= 0 ? "+"
+                                : signed && flags.indexOf(' ') >= 0 ? " "
+                                                                    : "";
                 if (flags.indexOf('#') >= 0) {
                     if (radix == 16 && number.signum() != 0)
                         prefix += c == 'X' ? "0X" : "0x";
@@ -1323,34 +1335,40 @@ static class JppOutput implements AutoCloseable {
                 if (precision >= 0 && text.length() > precision)
                     text = text.substring(0, precision);
             } else if (c == 'c') {
-                int code = value instanceof Character ? (Character)value : ((Number)value).intValue();
+                int code =
+                    value instanceof Character ? (Character)value : ((Number)value).intValue();
                 text = Character.toString((char)(code & 255));
             } else if (c == 'n') {
-                int count = result.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+                int count =
+                    result.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
                 Object countValue = length.isEmpty() || length.equals("h") || length.equals("hh")
-                    ? (Object)Integer.valueOf(count) : (Object)Long.valueOf(count);
+                                        ? (Object)Integer.valueOf(count)
+                                        : (Object)Long.valueOf(count);
                 ((JppRef)value).set(countValue);
                 continue;
             } else if ("aAeEfFgG".indexOf(c) >= 0) {
-                String javaFlags = "";
-                for (char flag : new char[]{'-', '+', ' ', '#', '0'})
-                    if (flags.indexOf(flag) >= 0 && !(flag == ' ' && flags.indexOf('+') >= 0)
-                        && !(flag == '0' && left) && !(flag == '#' && (c == 'g' || c == 'G')))
-                        javaFlags += flag;
-                String pattern = "%" + javaFlags + (width > 0 ? width : "")
-                    + (precision >= 0 ? "." + ((c == 'g' || c == 'G') ? Math.max(1, precision) : precision) : "") + c;
-                text = String.format(Locale.ROOT, pattern, ((Number)value).doubleValue());
-                if ((c == 'g' || c == 'G') && flags.indexOf('#') < 0) {
-                    int exp = Math.max(text.indexOf('e'), text.indexOf('E'));
-                    String tail = exp < 0 ? "" : text.substring(exp);
-                    String head = exp < 0 ? text : text.substring(0, exp);
-                    if (head.indexOf('.') >= 0) {
-                        while (head.endsWith("0"))
-                            head = head.substring(0, head.length() - 1);
-                        if (head.endsWith("."))
-                            head = head.substring(0, head.length() - 1);
+                String special =
+                    Jpp.nonfinite(((Number)value).doubleValue(), Character.isUpperCase(c),
+                                  flags.indexOf('+') >= 0, flags.indexOf(' ') >= 0);
+                if (special != null) {
+                    text = special;
+                } else {
+                    double number = ((Number)value).doubleValue();
+                    String prefix = Double.doubleToRawLongBits(number) < 0 ? "-"
+                                    : flags.indexOf('+') >= 0              ? "+"
+                                    : flags.indexOf(' ') >= 0              ? " "
+                                                                           : "";
+                    String digits =
+                        Jpp.floating(Math.abs(number), c, precision, flags.indexOf('#') >= 0);
+                    if (flags.indexOf('0') >= 0 && !left) {
+                        if ((c == 'a' || c == 'A') && digits.length() >= 2) {
+                            prefix += digits.substring(0, 2);
+                            digits = digits.substring(2);
+                        }
+                        while (prefix.length() + digits.length() < width)
+                            digits = '0' + digits;
                     }
-                    text = head + tail;
+                    text = prefix + digits;
                 }
             } else
                 throw new UnsupportedOperationException("printf conversion: " + c);
@@ -1373,6 +1391,158 @@ static final JppInput jppIn = new JppInput();
 static final JppOutput jppOut = new JppOutput(System.out), jppErr = new JppOutput(System.err);
 
 static class Jpp {
+    static double unsignedDouble(long value) {
+        return value >= 0 ? (double)value : (double)((value >>> 1) | (value & 1)) * 2.0;
+    }
+    static float unsignedFloat(long value) {
+        return value >= 0 ? (float)value : (float)((value >>> 1) | (value & 1)) * 2.0f;
+    }
+    static BigInteger unsignedBigInteger(long value) {
+        BigInteger magnitude = BigInteger.valueOf(value & Long.MAX_VALUE);
+        return value < 0 ? magnitude.setBit(63) : magnitude;
+    }
+    static String decimalPoint(String text, boolean alternate) {
+        return alternate && text.indexOf('.') < 0 ? text + '.' : text;
+    }
+    static String trimFraction(String text) {
+        if (text.indexOf('.') < 0)
+            return text;
+        int end = text.length();
+        while (end > 0 && text.charAt(end - 1) == '0')
+            --end;
+        if (end > 0 && text.charAt(end - 1) == '.')
+            --end;
+        return text.substring(0, end);
+    }
+    static String exponent(int value, char marker) {
+        int magnitude = Math.abs(value);
+        return "" + marker + (value < 0 ? '-' : '+') + (magnitude < 10 ? "0" : "") + magnitude;
+    }
+    static String hexadecimal(double value, int precision, boolean alternate) {
+        long raw = Double.doubleToRawLongBits(value);
+        int encodedExponent = (int)((raw >>> 52) & 2047);
+        int exponent = encodedExponent == 0 ? value == 0 ? 0 : -1022 : encodedExponent - 1023;
+        long significand = (raw & ((1L << 52) - 1)) | (encodedExponent == 0 ? 0 : 1L << 52);
+        String digits;
+        if (precision >= 0 && precision < 13) {
+            int discarded = 52 - 4 * precision;
+            long rounded = significand >>> discarded;
+            long remainder = significand & ((1L << discarded) - 1), halfway = 1L << (discarded - 1);
+            if (remainder > halfway || (remainder == halfway && (rounded & 1) != 0))
+                ++rounded;
+            digits = Long.toHexString(rounded);
+            while (digits.length() < precision + 1)
+                digits = '0' + digits;
+        } else {
+            digits = Long.toHexString(significand);
+            while (digits.length() < 14)
+                digits = '0' + digits;
+            if (precision < 0) {
+                while (digits.length() > 1 && digits.endsWith("0"))
+                    digits = digits.substring(0, digits.length() - 1);
+            } else
+                while (digits.length() < precision + 1)
+                    digits += '0';
+        }
+        String fraction = digits.length() > 1 ? "." + digits.substring(1) : alternate ? "." : "";
+        return "0x" + digits.charAt(0) + fraction + 'p' + (exponent < 0 ? "" : "+") + exponent;
+    }
+    static String floating(double value, char conversion, int precision, boolean alternate) {
+        char kind = Character.toLowerCase(conversion);
+        String result;
+        if (kind == 'a')
+            result = hexadecimal(value, precision, alternate);
+        else {
+            int p = precision < 0 ? 6 : precision;
+            if (kind == 'g')
+                p = Math.max(1, p);
+            BigDecimal exact = new BigDecimal(value);
+            if (kind == 'f')
+                result = decimalPoint(exact.setScale(p, RoundingMode.HALF_EVEN).toPlainString(),
+                                      alternate);
+            else {
+                int significant = kind == 'e' ? p + 1 : p;
+                BigDecimal rounded =
+                    exact.round(new MathContext(significant, RoundingMode.HALF_EVEN));
+                int exponent = value == 0 ? 0 : rounded.precision() - rounded.scale() - 1;
+                boolean scientific = kind == 'e' || exponent < -4 || exponent >= p;
+                if (scientific) {
+                    int fraction = kind == 'e' ? p : p - 1;
+                    String mantissa = rounded.scaleByPowerOfTen(-exponent)
+                                          .setScale(fraction, RoundingMode.HALF_EVEN)
+                                          .toPlainString();
+                    if (kind == 'g' && !alternate)
+                        mantissa = trimFraction(mantissa);
+                    result = decimalPoint(mantissa, alternate) + exponent(exponent, 'e');
+                } else {
+                    result = rounded.setScale(Math.max(0, p - exponent - 1), RoundingMode.HALF_EVEN)
+                                 .toPlainString();
+                    result = alternate ? decimalPoint(result, true) : trimFraction(result);
+                }
+            }
+        }
+        return Character.isUpperCase(conversion) ? result.toUpperCase(Locale.ROOT) : result;
+    }
+    static String nonfinite(double value, boolean uppercase, boolean plus, boolean space) {
+        if (Double.isFinite(value))
+            return null;
+        String sign = Double.doubleToRawLongBits(value) < 0 ? "-" : plus ? "+" : space ? " " : "";
+        return sign + (Double.isNaN(value) ? uppercase ? "NAN" : "nan" : uppercase ? "INF" : "inf");
+    }
+    static double log2(double value) {
+        if (Double.isNaN(value))
+            return quietNaN(value);
+        if (value < 0)
+            return Double.longBitsToDouble(0xfff8000000000000L);
+        if (value == 0)
+            return Double.NEGATIVE_INFINITY;
+        if (Double.isInfinite(value))
+            return value;
+        int adjustment = 0;
+        if (value < Double.MIN_NORMAL) {
+            value = Math.scalb(value, 54);
+            adjustment = -54;
+        }
+        int exponent = Math.getExponent(value);
+        return exponent + adjustment +
+            Math.log(Math.scalb(value, -exponent)) / 0x1.62e42fefa39efp-1;
+    }
+    static double round(double value) {
+        if (Double.isNaN(value))
+            return quietNaN(value);
+        double magnitude = Math.abs(value);
+        if (!Double.isFinite(value) || magnitude >= 0x1.0p52)
+            return value;
+        double integral = Math.floor(magnitude);
+        if (magnitude - integral >= 0.5)
+            ++integral;
+        return Math.copySign(integral, value);
+    }
+    static float round(float value) {
+        if (Float.isNaN(value))
+            return quietNaN(value);
+        return (float)round((double)value);
+    }
+    static double quietNaN(double value) {
+        return Double.longBitsToDouble(Double.doubleToRawLongBits(value) | 0x0008000000000000L);
+    }
+    static float quietNaN(float value) {
+        return Float.intBitsToFloat(Float.floatToRawIntBits(value) | 0x00400000);
+    }
+    static double rint(double value) {
+        return Double.isNaN(value) ? quietNaN(value) : Math.rint(value);
+    }
+    static float rint(float value) {
+        return Float.isNaN(value) ? quietNaN(value) : (float)Math.rint((double)value);
+    }
+    static double trunc(double value) {
+        if (Double.isNaN(value))
+            return quietNaN(value);
+        return Math.copySign(Math.floor(Math.abs(value)), value);
+    }
+    static float trunc(float value) {
+        return Float.isNaN(value) ? quietNaN(value) : (float)trunc((double)value);
+    }
     static <T> JppIter<T> advance(int amount, JppIter<T> position) {
         return position.advance(amount);
     }
@@ -1401,8 +1571,7 @@ static class Jpp {
             int value = new BigInteger(text, radix).intValue();
             if (bits < 32) {
                 int shift = 32 - bits;
-                value = unsigned ? value & (int)((1L << bits) - 1)
-                                 : (value << shift) >> shift;
+                value = unsigned ? value & (int)((1L << bits) - 1) : (value << shift) >> shift;
             }
             target.set(value);
         };
@@ -1417,8 +1586,9 @@ static class Jpp {
         return (text, radix, conversion) -> target.set(JppScanner.parseFloating(text));
     }
     static JppScanTarget scanChar(JppRef<Character> target) {
-        return (text, radix, conversion) -> target.set(conversion == 'c' ? text.charAt(0)
-            : (char)new BigInteger(text, radix).intValue());
+        return (text, radix, conversion)
+                   -> target.set(conversion == 'c' ? text.charAt(0)
+                                                   : (char)new BigInteger(text, radix).intValue());
     }
     static JppScanTarget scanChars(char[] target) {
         return (text, radix, conversion) -> {
@@ -1473,18 +1643,18 @@ static class Jpp {
         }
         return out;
     }
-    static <A, B, T> JppIter<T> merge(JppIter<A> first, JppIter<A> last,
-                                       JppIter<B> second, JppIter<B> secondLast, JppIter<T> result,
-                                       java.util.function.Function<A, T> left,
-                                       java.util.function.Function<B, T> right) {
+    static <A, B, T> JppIter<T> merge(JppIter<A> first, JppIter<A> last, JppIter<B> second,
+                                      JppIter<B> secondLast, JppIter<T> result,
+                                      java.util.function.Function<A, T> left,
+                                      java.util.function.Function<B, T> right) {
         return merge(first, last, second, secondLast, result, left, right,
                      (a, b) -> compare(a, b) < 0);
     }
-    static <A, B, T> JppIter<T> merge(JppIter<A> first, JppIter<A> last,
-                                       JppIter<B> second, JppIter<B> secondLast, JppIter<T> result,
-                                       java.util.function.Function<A, T> left,
-                                       java.util.function.Function<B, T> right,
-                                       java.util.function.BiPredicate<B, A> less) {
+    static <A, B, T> JppIter<T> merge(JppIter<A> first, JppIter<A> last, JppIter<B> second,
+                                      JppIter<B> secondLast, JppIter<T> result,
+                                      java.util.function.Function<A, T> left,
+                                      java.util.function.Function<B, T> right,
+                                      java.util.function.BiPredicate<B, A> less) {
         JppIter<A> a = first.plus(0);
         JppIter<B> b = second.plus(0);
         JppIter<T> out = result.plus(0);
@@ -1502,7 +1672,7 @@ static class Jpp {
         return copy(b, secondLast, out, right);
     }
     static <T, F> F for_each(JppIter<T> first, JppIter<T> last, F function,
-                               java.util.function.BiConsumer<F, JppIter<T>> invoke) {
+                             java.util.function.BiConsumer<F, JppIter<T>> invoke) {
         for (JppIter<T> at = first.plus(0); !at.same(last); at.advance(1))
             invoke.accept(function, at);
         return function;
@@ -1511,7 +1681,7 @@ static class Jpp {
                                                   java.util.function.Function<A, C> first,
                                                   java.util.function.Function<B, D> second) {
         return new JppPair<C, D>(jppCopy(first.apply(value.first)),
-                                jppCopy(second.apply(value.second)));
+                                 jppCopy(second.apply(value.second)));
     }
     static int reverseCompare(Object a, Object b) {
         return compare(b, a);

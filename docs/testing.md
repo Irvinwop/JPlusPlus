@@ -12,6 +12,8 @@ Extraction regressions compare signed and unsigned integer limits, narrow intege
 
 Forward-jump cases compare nested exits, crossing destinations, declarations used after a label, unreachable statements, switch cases, and file closing on a jump. Iterator cases exercise both operand orders of array/iterator addition, raw-array bound differences, compound iterator movement, reverse iterators, and deferred iterator assignment.
 
+Numeric cases compare raw IEEE bits for scalar bit casts, rounding, signed zero and NaNs, and unsigned-to-floating conversions. They include integer widening above the signed limit and values where conversion through `double` would change the result of a direct conversion to `float`. Formatting checks cover subnormals, infinities, NaNs, rounding ties, hexadecimal precision, and decimal precision beyond the shortest representation.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:
