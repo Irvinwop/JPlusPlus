@@ -1148,15 +1148,25 @@ static class JppAddress {
 
 // A typed view of existing storage. Collections remain Java's standard collections.
 static class JppPtr<T> extends JppIter<T> {
+    JppMemoryType elementType;
+    boolean littleEndian;
+    JppMemory memory;
     JppPtr(List<T> values, int index, Object identity) {
         super(values, index, 1, identity);
     }
     JppPtr<T> plus(int offset) {
-        return new JppPtr<T>(list, pos + offset, storage);
+        JppPtr<T> result = new JppPtr<T>(list, Math.addExact(pos, offset), storage);
+        result.elementType = elementType;
+        result.littleEndian = littleEndian;
+        result.memory = memory;
+        return result;
     }
     boolean same(JppIter<?> other) {
         if (other == null)
             return false;
+        if (elementType != null && other instanceof JppPtr &&
+            ((JppPtr<?>)other).elementType != null)
+            return Jpp.sameMemoryAddress(this, other);
         if (pos == other.pos && (storage == other.storage ||
                                  (storage instanceof JppAddress && storage.equals(other.storage))))
             return true;
@@ -1164,6 +1174,220 @@ static class JppPtr<T> extends JppIter<T> {
         return list != null && other.list != null && pos >= 0 && pos < list.size() &&
             other.pos >= 0 && other.pos < other.list.size() && get() instanceof JppCopyable &&
             get() == other.get();
+    }
+}
+
+// Clang supplies the C++ width and signedness: Java boxes alone cannot distinguish
+// a C++ short from an int, or a narrow character from char16_t.
+static class JppMemoryType {
+    final int bytes;
+    final char kind;
+    final boolean signed;
+    private JppMemoryType(int bytes, char kind, boolean signed) {
+        this.bytes = bytes;
+        this.kind = kind;
+        this.signed = signed;
+    }
+    static final JppMemoryType I8 = new JppMemoryType(1, 'i', true);
+    static final JppMemoryType U8 = new JppMemoryType(1, 'i', false);
+    static final JppMemoryType I16 = new JppMemoryType(2, 'i', true);
+    static final JppMemoryType U16 = new JppMemoryType(2, 'i', false);
+    static final JppMemoryType I32 = new JppMemoryType(4, 'i', true);
+    static final JppMemoryType U32 = new JppMemoryType(4, 'i', false);
+    static final JppMemoryType I64 = new JppMemoryType(8, 'i', true);
+    static final JppMemoryType U64 = new JppMemoryType(8, 'i', false);
+    static final JppMemoryType I128 = new JppMemoryType(16, 'n', true);
+    static final JppMemoryType U128 = new JppMemoryType(16, 'n', false);
+    static final JppMemoryType C8 = new JppMemoryType(1, 'c', false);
+    static final JppMemoryType C16 = new JppMemoryType(2, 'c', false);
+    static final JppMemoryType BOOL = new JppMemoryType(1, 'b', false);
+    static final JppMemoryType F32 = new JppMemoryType(4, 'f', false);
+    static final JppMemoryType F64 = new JppMemoryType(8, 'd', false);
+    long bits(Object value) {
+        switch (kind) {
+        case 'c':
+            return (Character)value;
+        case 'b':
+            return (Boolean)value ? 1L : 0L;
+        case 'f':
+            return Integer.toUnsignedLong(Float.floatToRawIntBits((Float)value));
+        case 'd':
+            return Double.doubleToRawLongBits((Double)value);
+        default:
+            return ((Number)value).longValue();
+        }
+    }
+    Object value(long bits) {
+        switch (kind) {
+        case 'c':
+            return Character.valueOf((char)bits);
+        case 'b':
+            if (bits != 0 && bits != 1)
+                throw new UnsupportedOperationException("noncanonical bool object representation");
+            return Boolean.valueOf(bits != 0);
+        case 'f':
+            return Float.valueOf(Float.intBitsToFloat((int)bits));
+        case 'd':
+            return Double.valueOf(Double.longBitsToDouble(bits));
+        default:
+            if (bytes == 8)
+                return Long.valueOf(bits);
+            if (bytes < 4)
+                bits = signed ? (bits << (64 - bytes * 8)) >> (64 - bytes * 8)
+                              : bits & ((1L << (bytes * 8)) - 1);
+            return Integer.valueOf((int)bits);
+        }
+    }
+    int byteAt(Object value, int index, boolean littleEndian) {
+        int shift = 8 * (littleEndian ? index : bytes - index - 1);
+        return kind == 'n' ? ((BigInteger)value).shiftRight(shift).intValue() & 255
+                           : (int)(bits(value) >>> shift) & 255;
+    }
+    Object decode(byte[] source, int offset, boolean littleEndian) {
+        if (kind == 'n') {
+            byte[] magnitude = new byte[bytes];
+            for (int i = 0; i < bytes; ++i)
+                magnitude[bytes - i - 1] = source[offset + (littleEndian ? i : bytes - i - 1)];
+            return signed ? new BigInteger(magnitude) : new BigInteger(1, magnitude);
+        }
+        long bits = 0;
+        for (int i = 0; i < bytes; ++i)
+            bits |= (long)(source[offset + i] & 255) << (8 * (littleEndian ? i : bytes - i - 1));
+        return value(bits);
+    }
+}
+
+// A byte view retains the real Java array/list/reference cell. Changes through
+// this view and ordinary generated Java accesses therefore see the same storage.
+static class JppMemory {
+    final Object identity;
+    final List<Object> values;
+    final JppMemoryType elementType;
+    final boolean littleEndian;
+    byte[] allocation;
+    boolean freed;
+    @SuppressWarnings("unchecked")
+    JppMemory(JppPtr<?> pointer) {
+        identity = pointer.storage;
+        values = (List<Object>)(List<?>)pointer.list;
+        elementType = pointer.elementType;
+        littleEndian = pointer.littleEndian;
+    }
+    JppMemory(byte[] bytes, boolean littleEndian) {
+        identity = bytes;
+        allocation = bytes;
+        values = null;
+        elementType = JppMemoryType.U8;
+        this.littleEndian = littleEndian;
+    }
+    long size() {
+        if (freed)
+            throw new IllegalStateException("access to freed C++ allocation");
+        if (values == null)
+            return allocation.length;
+        // A string's terminating NUL is addressable, but is not part of size().
+        return ((long)values.size() + (identity instanceof JppString ? 1 : 0)) * elementType.bytes;
+    }
+    void check(long offset, long count) {
+        long size = size();
+        if (offset < 0 || count < 0 || offset > size || count > size - offset)
+            throw new IndexOutOfBoundsException("C++ memory range");
+    }
+    int getByte(long offset) {
+        check(offset, 1);
+        if (values == null)
+            return allocation[(int)offset] & 255;
+        return elementType.byteAt(values.get((int)(offset / elementType.bytes)),
+                                  (int)(offset % elementType.bytes), littleEndian);
+    }
+    void read(long offset, byte[] result, int start, int count) {
+        check(offset, count);
+        if (values == null) {
+            System.arraycopy(allocation, (int)offset, result, start, count);
+            return;
+        }
+        for (int i = 0; i < count; ++i)
+            result[start + i] = (byte)getByte(offset + i);
+    }
+    void write(long offset, byte[] source, int start, int count) {
+        check(offset, count);
+        if (values == null) {
+            System.arraycopy(source, start, allocation, (int)offset, count);
+            return;
+        }
+        int width = elementType.bytes;
+        byte[] representation = new byte[width];
+        while (count > 0) {
+            int index = (int)(offset / width), first = (int)(offset % width);
+            int part = Math.min(count, width - first);
+            Object previous = values.get(index);
+            for (int i = 0; i < width; ++i)
+                representation[i] = (byte)elementType.byteAt(previous, i, littleEndian);
+            System.arraycopy(source, start, representation, first, part);
+            values.set(index, elementType.decode(representation, 0, littleEndian));
+            // A JVM may quiet a signaling NaN when it materializes a floating
+            // value. Reject that boundary explicitly instead of losing bytes.
+            Object stored = values.get(index);
+            for (int i = 0; i < width; ++i)
+                if (elementType.byteAt(stored, i, littleEndian) != (representation[i] & 255))
+                    throw new UnsupportedOperationException(
+                        "JVM changed a floating object representation");
+            offset += part;
+            start += part;
+            count -= part;
+        }
+    }
+    Object load(long offset, JppMemoryType type) {
+        check(offset, type.bytes);
+        if (values != null && type == elementType && offset % type.bytes == 0)
+            return values.get((int)(offset / type.bytes));
+        byte[] representation = new byte[type.bytes];
+        read(offset, representation, 0, representation.length);
+        return type.decode(representation, 0, littleEndian);
+    }
+    void store(long offset, JppMemoryType type, Object value) {
+        byte[] representation = new byte[type.bytes];
+        for (int i = 0; i < representation.length; ++i)
+            representation[i] = (byte)type.byteAt(value, i, littleEndian);
+        write(offset, representation, 0, representation.length);
+    }
+}
+
+static class JppMemoryPtr<T> extends JppPtr<T> {
+    final long origin;
+    @SuppressWarnings("unchecked")
+    JppMemoryPtr(JppMemory memory, long offset, JppMemoryType type) {
+        super(new AbstractList<T>() {
+            final long remainder = offset % type.bytes;
+            public int size() {
+                return Math.toIntExact((memory.size() - remainder) / type.bytes);
+            }
+            public T get(int i) {
+                return (T)memory.load(remainder + (long)i * type.bytes, type);
+            }
+            public T set(int i, T value) {
+                T old = get(i);
+                memory.store(remainder + (long)i * type.bytes, type, value);
+                return old;
+            }
+        }, Math.toIntExact(offset / type.bytes), memory.identity);
+        this.memory = memory;
+        elementType = type;
+        littleEndian = memory.littleEndian;
+        origin = offset % type.bytes;
+    }
+    long byteOffset() {
+        return origin + (long)pos * elementType.bytes;
+    }
+    JppPtr<T> plus(int offset) {
+        return new JppMemoryPtr<T>(memory, byteOffset() + (long)offset * elementType.bytes,
+                                   elementType);
+    }
+    int minus(JppIter<?> other) {
+        return Math.toIntExact(Jpp.pointerDifference(this, other));
+    }
+    boolean same(JppIter<?> other) {
+        return other != null && Jpp.sameMemoryAddress(this, other);
     }
 }
 
@@ -2566,7 +2790,153 @@ static class Jpp {
     static <T> JppPtr<T> pointer(JppIter<T> at) {
         if (at != null && at.list instanceof JppDequeStorage)
             return ((JppDequeStorage<T>)at.list).reference(at.index()).pointer();
+        if (at instanceof JppPtr)
+            return ((JppPtr<T>)at).plus(0);
         return at == null ? null : new JppPtr<T>(at.pointerStorage(), at.pos, at.pointerIdentity());
+    }
+    @SuppressWarnings("unchecked")
+    static <T> JppPtr<T> typedPointer(JppIter<?> at, JppMemoryType type, boolean littleEndian) {
+        if (at == null)
+            return null;
+        JppPtr<?> pointer = at instanceof JppPtr ? (JppPtr<?>)at : pointer(at);
+        if (pointer.elementType == null) {
+            pointer = pointer.plus(0);
+            pointer.elementType = type;
+            pointer.littleEndian = littleEndian;
+        } else if (pointer.elementType != type)
+            pointer = new JppMemoryPtr<Object>(memory(pointer), byteOffset(pointer), type);
+        return (JppPtr<T>)pointer;
+    }
+    static JppMemory memory(JppPtr<?> pointer) {
+        if (pointer.elementType == null)
+            throw new UnsupportedOperationException("byte access to this C++ object layout");
+        if (pointer.memory == null)
+            pointer.memory = new JppMemory(pointer);
+        return pointer.memory;
+    }
+    static long byteOffset(JppPtr<?> pointer) {
+        return pointer instanceof JppMemoryPtr ? ((JppMemoryPtr<?>)pointer).byteOffset()
+                                               : (long)pointer.pos * pointer.elementType.bytes;
+    }
+    static boolean sameStorage(Object left, Object right) {
+        return left == right || (left instanceof JppAddress && left.equals(right));
+    }
+    static boolean sameMemoryAddress(JppPtr<?> left, JppIter<?> right) {
+        if (right instanceof JppPtr && ((JppPtr<?>)right).elementType != null)
+            return sameStorage(left.storage, right.storage) &&
+                byteOffset(left) == byteOffset((JppPtr<?>)right);
+        return sameStorage(left.storage, right.storage) && left.pos == right.pos;
+    }
+    static long pointerDifference(JppIter<?> left, JppIter<?> right) {
+        if (left instanceof JppPtr && right instanceof JppPtr) {
+            JppPtr<?> a = (JppPtr<?>)left, b = (JppPtr<?>)right;
+            if (a.elementType != null && b.elementType != null) {
+                if (!sameStorage(a.storage, b.storage))
+                    throw new IllegalArgumentException(
+                        "subtracting pointers to different allocations");
+                return (byteOffset(a) - byteOffset(b)) / a.elementType.bytes;
+            }
+        }
+        return (long)left.pos - right.pos;
+    }
+    static JppPtr<?> malloc(long size, boolean littleEndian) {
+        if (size < 0 || size > Integer.MAX_VALUE - 8)
+            return null;
+        try {
+            JppMemory memory = new JppMemory(new byte[(int)size], littleEndian);
+            return new JppMemoryPtr<Integer>(memory, 0, JppMemoryType.U8);
+        } catch (OutOfMemoryError failure) {
+            return null;
+        }
+    }
+    static JppPtr<?> calloc(long count, long size, boolean littleEndian) {
+        if (count != 0 && Long.compareUnsigned(size, Long.divideUnsigned(-1L, count)) > 0)
+            return null;
+        return malloc(count * size, littleEndian);
+    }
+    static void free(JppPtr<?> pointer) {
+        if (pointer == null)
+            return;
+        JppMemory memory = memory(pointer);
+        if (memory.values != null || byteOffset(pointer) != 0 || memory.freed)
+            throw new IllegalArgumentException("free requires a live allocation base");
+        memory.freed = true;
+        memory.allocation = null;
+    }
+    static JppPtr<?> realloc(JppPtr<?> pointer, long size, boolean littleEndian) {
+        if (pointer == null)
+            return malloc(size, littleEndian);
+        JppMemory old = memory(pointer);
+        if (old.values != null || byteOffset(pointer) != 0 || old.freed)
+            throw new IllegalArgumentException("realloc requires a live allocation base");
+        if (size == 0) {
+            free(pointer);
+            return null;
+        }
+        JppPtr<?> result = malloc(size, littleEndian);
+        if (result != null) {
+            memcpy(result, pointer, Math.min(old.size(), size));
+            free(pointer);
+        }
+        return result;
+    }
+    static JppPtr<?> memcpy(JppPtr<?> destination, JppPtr<?> source, long count) {
+        return memoryCopy(destination, source, count, false);
+    }
+    static JppPtr<?> memmove(JppPtr<?> destination, JppPtr<?> source, long count) {
+        return memoryCopy(destination, source, count, true);
+    }
+    static JppPtr<?> memoryCopy(JppPtr<?> destination, JppPtr<?> source, long count, boolean move) {
+        JppMemory to = memory(destination), from = memory(source);
+        long target = byteOffset(destination), origin = byteOffset(source);
+        to.check(target, count);
+        from.check(origin, count);
+        boolean backwards = move && sameStorage(to.identity, from.identity) && target > origin &&
+                            target - origin < count;
+        byte[] buffer = new byte[(int)Math.min(count, 16384)];
+        long done = 0;
+        while (done < count) {
+            int part = (int)Math.min(count - done, buffer.length);
+            long offset = backwards ? count - done - part : done;
+            from.read(origin + offset, buffer, 0, part);
+            to.write(target + offset, buffer, 0, part);
+            done += part;
+        }
+        return pointer(destination);
+    }
+    static JppPtr<?> memset(JppPtr<?> destination, int byteValue, long count) {
+        JppMemory to = memory(destination);
+        long offset = byteOffset(destination);
+        to.check(offset, count);
+        byte[] buffer = new byte[(int)Math.min(count, 16384)];
+        Arrays.fill(buffer, (byte)byteValue);
+        for (long done = 0; done < count;) {
+            int part = (int)Math.min(count - done, buffer.length);
+            to.write(offset + done, buffer, 0, part);
+            done += part;
+        }
+        return pointer(destination);
+    }
+    static int memcmp(JppPtr<?> left, JppPtr<?> right, long count) {
+        JppMemory a = memory(left), b = memory(right);
+        long x = byteOffset(left), y = byteOffset(right);
+        a.check(x, count);
+        b.check(y, count);
+        for (long i = 0; i < count; ++i) {
+            int difference = a.getByte(x + i) - b.getByte(y + i);
+            if (difference != 0)
+                return difference;
+        }
+        return 0;
+    }
+    static JppPtr<?> memchr(JppPtr<?> source, int byteValue, long count) {
+        JppMemory from = memory(source);
+        long offset = byteOffset(source);
+        from.check(offset, count);
+        for (long i = 0; i < count; ++i)
+            if (from.getByte(offset + i) == (byteValue & 255))
+                return new JppMemoryPtr<Integer>(from, offset + i, JppMemoryType.U8);
+        return null;
     }
     static <T> JppPtr<T> address(JppRef<T> value, Object object, Object field) {
         List<T> view = new AbstractList<T>() {
@@ -2602,7 +2972,12 @@ static class Jpp {
         return post ? old : next;
     }
     static boolean samePointer(JppIter<?> left, JppIter<?> right) {
-        return left == null ? right == null : pointer(left).same(right);
+        if (left == null || right == null)
+            return left == right;
+        if (left instanceof JppPtr && ((JppPtr<?>)left).elementType != null &&
+            right instanceof JppPtr && ((JppPtr<?>)right).elementType != null)
+            return sameMemoryAddress((JppPtr<?>)left, right);
+        return pointer(left).same(right);
     }
     static void delete(JppPtr<?> pointer) {}
     static double unsignedDouble(long value) {

@@ -16,6 +16,7 @@ J++ is an experimental source transpiler for competitive programming. **It does 
 | Algorithms | Sort, stable sort, reverse, fill, bounds, binary search, unique/erase, find/count, extrema, accumulate, iota, next permutation, copy/copy_n/copy_backward, merge, for_each, back_inserter |
 | Objects | Global and local structs, aggregate and default-member initialization, fields, constructors and methods, scalar static data members with constant initialization, static methods, selected copy/move constructors and assignment operators, supported value copies and assignment retaining object identity |
 | Pointers | Address-taking, dereference, scalar and array allocation, arithmetic and differences within an allocation, pointer parameters and aliases, pointer reference parameters, member access, selected void-pointer conversions, vector data and string-buffer pointers |
+| Byte memory | Scalar primitive storage views with Clang-derived widths and target byte order; partial `memcpy`/`memset`, overlapping `memmove`, `memcmp`, `memchr`, corresponding GNU builtins, and primitive `malloc`/`calloc`/`realloc`/`free`; aliases remain attached to Java arrays, lists, fields, reference cells, and string buffers |
 | Functions | Instantiated function templates, `std::function` with selected callable argument/return conversions, function pointers, typed lambdas with reference and value captures, generic lambdas with one concrete instantiated signature, scalar reference parameters, aliases and results, default arguments on direct user calls and constructors, reference range loops, translation units without main |
 | Static storage | Lazy local statics with storage per template instantiation, static references and arrays, local extern declarations, owned static/global file-stream closing on normal return and `std::exit`, immediate termination with `std::_Exit` |
 | Structured bindings | Pairs, built-in arrays, `std::array`, and user structs; reference bindings, range-loop bindings, and addresses retaining their element or member identity |
@@ -30,7 +31,7 @@ Implemented paths have limits. A container appearing in this table does not impl
 
 ## Known gaps
 
-- Byte-addressed storage, pointer/integer conversions, arbitrary pointer reinterpretation, placement construction, and storage layout dependent code. Typed pointer views do not provide a complete C++ memory model.
+- Byte views of record layouts, multidimensional-array reinterpretation, pointer/integer conversions, arbitrary pointer reinterpretation, placement construction, and complete storage layout semantics. Primitive allocation sizes and byte-view indices are bounded by Java's indexed storage limits. Noncanonical bool bytes and floating representations that a JVM changes when materializing a value are explicitly rejected.
 - Backward and computed jumps, jumps into nested scopes, and full unstructured control flow.
 - Return/goto and break/continue escaping a GNU statement expression; consteval results requiring object snapshots; dynamic initialization of static data members.
 - Full object lifetimes and RAII, user-defined destructors, inheritance, unions, bitfields, RTTI, and exceptions. Deallocation currently relies on Java garbage collection for supported objects without user destructors.

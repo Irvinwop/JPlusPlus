@@ -56,6 +56,8 @@ Seed-sequence cases use empty, initializer-list, signed-integer range, and chara
 
 Deque cases grow and wrap the buffer, retain element references and pointers, and keep an iterator across front and back removals. Container swaps distinguish references to the deques from aliases to their elements. Sorting, unique/erase, insertion, prefix and middle range erasure, resizing, unsigned comparisons, value copies, and record-member aliases are compared with native C++. Range construction checks that later source mutation does not affect stored values.
 
+Byte-memory cases compare partial copies between unlike element widths, byte stores through field and local aliases, both directions of overlapping moves, and return-address identity. The native oracle also checks short signedness, 128-bit representations, allocation zeroing and resize preservation, string-buffer terminators, unsigned byte comparisons and searches, quiet-NaN payloads, signed zero, and overlapping transfers larger than the scratch buffer. Ordinary Java array and field accesses must observe mutations made through byte pointers.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

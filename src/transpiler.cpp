@@ -7,6 +7,7 @@
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/StmtCXX.h>
+#include <clang/Basic/TargetInfo.h>
 #include <clang/Format/Format.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
@@ -60,6 +61,7 @@ const std::set<std::string> javaRuntimeNames = {
     "StrictMath",
     "System",
     "Runtime",
+    "OutOfMemoryError",
     "Thread",
     "Class",
     "Arrays",
@@ -608,6 +610,25 @@ class Emitter {
     bool dataPointer(QualType t) const {
         t = clean(t);
         return t->isPointerType() && !t->getPointeeType()->isFunctionType();
+    }
+    std::string memoryType(QualType t) {
+        t = clean(t);
+        auto javaType = type(t);
+        if (t->isEnumeralType())
+            t = t->getAs<EnumType>()->getDecl()->getIntegerType();
+        if (t->isBooleanType())
+            return "JppMemoryType.BOOL";
+        if (javaType == "char")
+            return "JppMemoryType.C" + std::to_string(ctx.getTypeSize(t));
+        if (t->isIntegerType())
+            return std::string("JppMemoryType.") + (t->isSignedIntegerType() ? "I" : "U") +
+                   std::to_string(ctx.getTypeSize(t));
+        if (t->isRealFloatingType() && (ctx.getTypeSize(t) == 32 || ctx.getTypeSize(t) == 64))
+            return "JppMemoryType.F" + std::to_string(ctx.getTypeSize(t));
+        return {};
+    }
+    std::string targetLittleEndian() const {
+        return ctx.getTargetInfo().isBigEndian() ? "false" : "true";
     }
     bool big(QualType t) const {
         t = clean(t);
@@ -1903,6 +1924,11 @@ class Emitter {
         if (op == "+" && position(rhs->getType()) && lhs->getType()->isIntegerType())
             return asIterator(rhs) + ".plus(" + intArgument(lhs) + ")";
         if (op == "-" && position(lhs->getType()) && position(rhs->getType())) {
+            if (dataPointer(lhs->getType()) && dataPointer(rhs->getType())) {
+                auto difference = "Jpp.pointerDifference(" + expr(lhs) + ", " + expr(rhs) + ")";
+                return ctx.getTypeSize(clean(result)) > 32 ? difference
+                                                           : "(int)(" + difference + ")";
+            }
             auto difference = asIterator(lhs) + ".minus(" + asIterator(rhs) + ")";
             return ctx.getTypeSize(clean(result)) > 32 ? "(long)(" + difference + ")" : difference;
         }
@@ -2678,6 +2704,26 @@ class Emitter {
             }
             return prefix + name(f) + "(" + arguments(c, f) + ")";
         }
+        auto memoryOperation = n.starts_with("__builtin_") ? n.substr(10) : n;
+        if (memoryOperation == "memcpy" || memoryOperation == "memmove" ||
+            memoryOperation == "memcmp")
+            return "Jpp." + memoryOperation + "(" + expr(c->getArg(0)) + ", " + expr(c->getArg(1)) +
+                   ", " + value(c->getArg(2), ctx.UnsignedLongLongTy) + ")";
+        if (memoryOperation == "memset" || memoryOperation == "memchr")
+            return "Jpp." + memoryOperation + "(" + expr(c->getArg(0)) + ", " +
+                   intArgument(c->getArg(1)) + ", " + value(c->getArg(2), ctx.UnsignedLongLongTy) +
+                   ")";
+        if (memoryOperation == "malloc")
+            return "Jpp.malloc(" + value(c->getArg(0), ctx.UnsignedLongLongTy) + ", " +
+                   targetLittleEndian() + ")";
+        if (memoryOperation == "calloc")
+            return "Jpp.calloc(" + value(c->getArg(0), ctx.UnsignedLongLongTy) + ", " +
+                   value(c->getArg(1), ctx.UnsignedLongLongTy) + ", " + targetLittleEndian() + ")";
+        if (memoryOperation == "realloc")
+            return "Jpp.realloc(" + expr(c->getArg(0)) + ", " +
+                   value(c->getArg(1), ctx.UnsignedLongLongTy) + ", " + targetLittleEndian() + ")";
+        if (memoryOperation == "free")
+            return "Jpp.free(" + expr(c->getArg(0)) + ")";
         if (n == "sync_with_stdio") {
             auto invocation = "JppIoState.sync(" + truth(c->getArg(0)) + ")";
             if (auto member = dyn_cast<MemberExpr>(bare(c->getCallee()));
@@ -3118,7 +3164,23 @@ class Emitter {
         auto result = expression(input);
         if (auto call = dyn_cast_or_null<CallExpr>(strip(input));
             call && returnsScalarReference(call))
-            return "(" + result + ").get()";
+            result = "(" + result + ").get()";
+        auto source = input ? strip(input) : nullptr;
+        bool pointerProducer = isa_and_nonnull<CallExpr>(source) ||
+                               isa_and_nonnull<CXXNewExpr>(source) ||
+                               isa_and_nonnull<ExplicitCastExpr>(source);
+        if (auto cast = dyn_cast_or_null<ImplicitCastExpr>(source))
+            pointerProducer = cast->getCastKind() == CK_ArrayToPointerDecay;
+        if (auto unary = dyn_cast_or_null<UnaryOperator>(source))
+            pointerProducer = unary->getOpcode() == UO_AddrOf;
+        if (pointerProducer && dataPointer(input->getType())) {
+            auto element = clean(input->getType())->getPointeeType();
+            if (!element->isVoidType() && !element->isRecordType() && !element->isArrayType() &&
+                !element->isPointerType())
+                if (auto layout = memoryType(element); !layout.empty())
+                    result = "Jpp.<" + boxed(element) + ">typedPointer(" + result + ", " + layout +
+                             ", " + targetLittleEndian() + ")";
+        }
         return result;
     }
     std::string expression(const Expr* input) {
@@ -3243,12 +3305,20 @@ class Emitter {
                 fail(e, "integer-derived pointer addresses need additional storage lowering");
             if (x->getCastKind() == CK_PointerToIntegral)
                 fail(e, "converting pointer addresses to integers needs byte-addressed storage");
-            if (x->getCastKind() == CK_BitCast && dataPointer(x->getType()) &&
-                dataPointer(x->getSubExpr()->getType())) {
+            if (dataPointer(x->getType()) && dataPointer(x->getSubExpr()->getType())) {
                 auto from = clean(x->getSubExpr()->getType()->getPointeeType());
                 auto to = clean(x->getType()->getPointeeType());
-                if (!from->isVoidType() && !to->isVoidType() && !ctx.hasSameType(from, to))
-                    fail(e, "pointer reinterpretation between element types needs byte storage");
+                if (to->isVoidType() ||
+                    (!to->isRecordType() && !to->isArrayType() && !to->isPointerType() &&
+                     !memoryType(to).empty() &&
+                     (from->isVoidType() || (!from->isRecordType() && !from->isArrayType() &&
+                                             !from->isPointerType() && !memoryType(from).empty()))))
+                    return expr(x->getSubExpr());
+                if (x->getCastKind() == CK_BitCast && !from->isVoidType() &&
+                    !ctx.hasSameType(from, to))
+                    fail(
+                        e,
+                        "pointer reinterpretation of this object layout needs additional lowering");
             }
             if (x->getType()->isVoidType() && x->getSubExpr()->getType()->isVoidType())
                 return expr(x->getSubExpr());
@@ -3572,6 +3642,12 @@ class Emitter {
         if (auto x = dyn_cast<InitListExpr>(e)) {
             auto t = x->getType();
             std::vector<std::string> a;
+            if (t->isArithmeticType() || t->isEnumeralType()) {
+                if (x->getNumInits() == 0)
+                    return defaultValue(t);
+                if (x->getNumInits() == 1)
+                    return value(x->getInit(0), t);
+            }
             if (family(t) == "less" || family(t) == "greater")
                 return defaultValue(t);
             if (ctx.getAsArrayType(t))
