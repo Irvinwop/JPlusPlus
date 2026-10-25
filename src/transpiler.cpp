@@ -5753,8 +5753,7 @@ class Emitter {
                 line("final JppRef<" + boxed(v->getType()) + "> " + name(v) + " = JppRef.at(" +
                      seq + ", " + index + ");");
                 if (auto body = dyn_cast<CompoundStmt>(f->getBody()))
-                    for (auto c : body->body())
-                        stmt(c);
+                    bodyStatements(body);
                 else
                     stmt(f->getBody());
                 --indent;
@@ -5777,8 +5776,7 @@ class Emitter {
                     aliases[b] = name(b) + ".get()";
                 }
                 if (auto body = dyn_cast<CompoundStmt>(f->getBody()))
-                    for (auto c : body->body())
-                        stmt(c);
+                    bodyStatements(body);
                 else
                     stmt(f->getBody());
                 --indent;
@@ -5805,8 +5803,7 @@ class Emitter {
                         line((adapt ? type(v->getType()) + " " : "") + name(v) + " = " + init +
                              ";");
                     if (auto body = dyn_cast<CompoundStmt>(f->getBody()))
-                        for (auto c : body->body())
-                            stmt(c);
+                        bodyStatements(body);
                     else
                         stmt(f->getBody());
                     --indent;

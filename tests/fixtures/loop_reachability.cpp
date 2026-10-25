@@ -86,6 +86,42 @@ int zeroIterations(int value) {
     return value;
 }
 
+int rangeJumps(int value) {
+    int total = 0;
+    for (int index : {0, 1, 2, 3}) {
+        if (index == 2)
+            goto skip;
+        swap(value, index);
+        total += index;
+    skip:
+        total += value;
+    }
+    vector<int> numbers{value, value - 3, value + 5};
+    for (int& element : numbers) {
+        if (element < 0)
+            goto next;
+        element += 5;
+    next:
+        total += element;
+    }
+    vector<pair<int, int>> pairs{{value, 3}, {3, value}};
+    for (auto [first, second] : pairs) {
+        if (first < 0)
+            goto bindingDone;
+        second += first;
+    bindingDone:
+        total += second;
+    }
+    for (auto copied : pairs) {
+        if (copied.first > 0)
+            goto copyDone;
+        copied.second += value;
+    copyDone:
+        total += copied.second;
+    }
+    return total;
+}
+
 int main() {
     int cases;
     cin >> cases;
@@ -94,6 +130,6 @@ int main() {
         cin >> x >> y;
         cout << nestedBreaks(x) << ' ' << directBreak(y) << ' ' << constantWhile(x) << ' '
              << constantDo(y) << ' ' << constexprBreak(x) << ' ' << jumpOut(y) << ' '
-             << zeroIterations(x) << '\n';
+             << zeroIterations(x) << ' ' << rangeJumps(x) << '\n';
     }
 }
