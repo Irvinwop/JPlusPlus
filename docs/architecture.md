@@ -21,6 +21,8 @@ The implementation is C++23 and uses Clang's C++ AST API directly. It does not p
 
 C++ copies are semantically different from Java reference assignment. Copying a vector or struct must keep later mutations independent. Generated copy methods and `jppCopy` preserve that behavior in supported paths. Reference parameters and mutable lambda captures use small reference objects only where shared mutation is required.
 
+Assignment expressions retain their C++ grouping. Arithmetic compound assignments use Clang's computation types, including integer promotion of booleans and conversion back to the destination type. Simple updates stay as ordinary Java assignments. When evaluation order matters, typed helpers evaluate the right operand before the destination and evaluate the destination once, preserving C++17 sequencing in expressions such as `values[index++] += (index = 3)`.
+
 Unsigned 32/64-bit ordering, division, remainder, and right shifts use Java's unsigned operations. `__int128` arithmetic uses `BigInteger`; it is slower than native arithmetic and currently targets defined signed calculations, not an emulation of every overflow behavior.
 
 The bundled support declarations live in `runtime/Runtime.java`, a source fragment embedded into the C++ binary at build time. A declaration dependency pass selects the helpers referenced by the translated program. Clang's Java formatter formats the complete output.

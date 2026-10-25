@@ -93,7 +93,7 @@ The default Java compiler must support `--release` for the chosen target. A curr
 
 ## Testing
 
-The integration suite compiles each fixture as native GNU++23, transpiles it, compiles the Java, and compares actual output on deterministic randomized inputs. It covers arrays, sorting and bounds, nested-container copies, Dijkstra, maps and sets, strings and struct copies, recursive lambdas, references, C++23 constructs, `__int128`, unsigned arithmetic, and GNU intrinsics. It also checks CLI exit codes and output preservation on failure.
+The integration suite compiles each fixture as native GNU++23, transpiles it, compiles the Java, and compares actual output on deterministic randomized inputs. It covers arrays, sorting and bounds, nested-container copies, Dijkstra, maps and sets, strings and struct copies, recursive lambdas, references, assignment sequencing, boolean promotions, C++23 constructs, `__int128`, unsigned arithmetic, and GNU intrinsics. It also checks CLI exit codes and output preservation on failure.
 
 ```sh
 ctest --test-dir build --output-on-failure

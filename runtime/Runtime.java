@@ -52,6 +52,12 @@ static abstract class JppRef<T> {
     static JppRef<Double> at(double[] a, int i) {
         return of(() -> a[i], v -> a[i] = v);
     }
+    static JppRef<Float> at(float[] a, int i) {
+        return of(() -> a[i], v -> a[i] = v);
+    }
+    static JppRef<Boolean> at(boolean[] a, int i) {
+        return of(() -> a[i], v -> a[i] = v);
+    }
     static JppRef<Character> at(char[] a, int i) {
         return of(() -> a[i], v -> a[i] = v);
     }
@@ -735,6 +741,14 @@ static final JppInput jppIn = new JppInput();
 static final JppOutput jppOut = new JppOutput(System.out), jppErr = new JppOutput(System.err);
 
 static class Jpp {
+    // Argument order preserves C++17's RHS-before-lvalue sequencing.
+    static <T> T store(T value, JppRef<T> target) {
+        return target.set(value);
+    }
+    static <L, R> L compound(R right, JppRef<L> target,
+                             java.util.function.BiFunction<L, R, L> operation) {
+        return target.set(operation.apply(target.get(), right));
+    }
     static <T> int swap(JppRef<T> a, JppRef<T> b) {
         T value = a.get();
         a.set(b.get());

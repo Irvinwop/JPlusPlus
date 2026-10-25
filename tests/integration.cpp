@@ -156,6 +156,11 @@ int main() {
                  << random() % 9000000000000000000ULL << ' ' << random() % 9000000000000000000ULL
                  << ' ' << 1000000007 + r(1000) << '\n';
         cases.emplace_back("intrinsics", bits.str());
+        std::ostringstream expressions;
+        expressions << 48 << '\n';
+        for (int i = 0; i < 48; ++i)
+            expressions << (i % 8 == 0 ? 0 : r(101) - 50) << ' ' << r(17) - 8 << '\n';
+        cases.emplace_back("expressions", expressions.str());
 
         auto javacs = configured("JPP_TEST_JAVACS", "javac");
         auto javas = configured("JPP_TEST_JAVAS", "java");
@@ -257,6 +262,27 @@ int main() {
         if (code != 7 || read(p / "stdout") != "321")
             throw std::runtime_error("explicit C++ exit lost buffered output or its exit status");
         ++checks;
+        // Exercise compiler selection through the real CLI. Ubuntu's ECJ fails at startup
+        // without disabling annotation processing, even when the generated Java is valid.
+        const char* compilerEnvironment = std::getenv("JPP_JAVAC");
+        bool hadCompiler = compilerEnvironment != nullptr;
+        std::string previousCompiler = hadCompiler ? compilerEnvironment : "";
+        for (const auto& compiler : javacs) {
+            if (fs::path(compiler).filename().string().find("ecj") == std::string::npos)
+                continue;
+            if (setenv("JPP_JAVAC", compiler.c_str(), 1))
+                throw std::runtime_error("cannot select ECJ for CLI test");
+            code = process({JPP_BINARY, (p / "exit.cpp").string(), "-r", "-v", "j8", "-o",
+                            (p / "Main.java").string()},
+                           p / "empty", p / "stdout", p / "stderr");
+            if (code != 7 || read(p / "stdout") != "321")
+                throw std::runtime_error("ECJ failed through -r: " + read(p / "stderr"));
+            ++checks;
+        }
+        if (hadCompiler)
+            setenv("JPP_JAVAC", previousCompiler.c_str(), 1);
+        else
+            unsetenv("JPP_JAVAC");
         std::cout << checks << " compiler/runtime differential and CLI checks passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

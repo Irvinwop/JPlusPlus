@@ -8,6 +8,7 @@ J++ is an experimental source transpiler for competitive programming. **It does 
 | :-- | :-- |
 | Frontend | GNU++23, preprocessing, local includes, `bits/stdc++.h`, aliases, resolved overloads, concrete function template instantiations |
 | Control flow | Functions, recursion, blocks, `if`, `if constexpr`, runtime branches of `if consteval`, loops, switch, break, continue, return |
+| Expressions | Chained assignments, boolean arithmetic and numeric conversions, arithmetic compound assignments; RHS-before-destination sequencing and one destination evaluation for supported lvalues |
 | Types | Boolean, character, signed integer and floating primitives; common unsigned 32/64-bit operations; enums; signed `__int128` arithmetic via `BigInteger` |
 | Arrays | Fixed bounds, GNU variable length arrays, multidimensional primitive arrays, partial initialization |
 | Containers | `vector` via `ArrayList`; pairs; common map, set, multiset, queue, stack, deque, and priority-queue operations |

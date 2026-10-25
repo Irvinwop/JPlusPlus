@@ -214,7 +214,7 @@ int main(int argc, char** argv) {
             auto source = temp.path / (opt.className + ".java");
             write(source, java);
             int result =
-                run({envTool("JPP_JAVAC", "javac"), "-encoding", "UTF-8", "--release",
+                run({envTool("JPP_JAVAC", "javac"), "-proc:none", "-encoding", "UTF-8", "--release",
                      std::to_string(opt.javaVersion), "-d", temp.path.string(), source.string()});
             if (result) {
                 std::cerr << "j++: Java validation failed; output was not replaced\n";
