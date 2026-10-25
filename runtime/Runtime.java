@@ -3008,6 +3008,28 @@ static class Jpp {
             pointer.memory = new JppMemory(pointer);
         return pointer.memory;
     }
+    static JppPtr<?> voidPointer(JppIter<?> at) {
+        if (at == null)
+            return null;
+        JppPtr<?> pointer = pointer(at);
+        return pointer.elementType == null
+            ? pointer
+            : Jpp.<Integer>typedPointer(pointer, JppMemoryType.U8, pointer.littleEndian);
+    }
+    static JppPtr<?> voidPlus(JppPtr<?> pointer, int offset) {
+        if (pointer == null && offset == 0)
+            return null;
+        if (pointer.elementType == null)
+            throw new UnsupportedOperationException(
+                "void-pointer arithmetic on this C++ object layout");
+        return voidPointer(pointer).plus(offset);
+    }
+    static JppPtr<?> updateVoidPointer(JppRef<JppPtr<?>> target, int amount, boolean post) {
+        JppPtr<?> previous = target.get();
+        JppPtr<?> next = voidPlus(previous, amount);
+        target.set(next);
+        return post ? voidPointer(previous) : next;
+    }
     static long byteOffset(JppPtr<?> pointer) {
         return pointer instanceof JppMemoryPtr ? ((JppMemoryPtr<?>)pointer).byteOffset()
                                                : (long)pointer.pos * pointer.elementType.bytes;
@@ -3022,6 +3044,8 @@ static class Jpp {
         return sameStorage(left.storage, right.storage) && left.pos == right.pos;
     }
     static long pointerDifference(JppIter<?> left, JppIter<?> right) {
+        if (left == null && right == null)
+            return 0;
         if (left instanceof JppPtr && right instanceof JppPtr) {
             JppPtr<?> a = (JppPtr<?>)left, b = (JppPtr<?>)right;
             if (a.elementType != null && b.elementType != null) {

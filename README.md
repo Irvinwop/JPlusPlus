@@ -55,6 +55,8 @@ cmake --install build --prefix "$HOME/.local"
 
 Ensure `~/.local/bin` is on your `PATH`. The executable is named `j++`.
 
+For GNU `void*` offsets and the large-array frontend fix, use the optional [GNU compatibility frontend](toolchain/README.md).
+
 Try the included example:
 
 ```sh

@@ -1897,13 +1897,15 @@ class Emitter {
     }
     std::string compoundAssignment(const CompoundAssignOperator* e, bool asReference = false) {
         if (dataPointer(e->getLHS()->getType())) {
-            if (clean(e->getLHS()->getType())->getPointeeType()->isVoidType())
-                fail(e, "GNU void-pointer arithmetic needs byte-addressed storage");
+            bool bytes = clean(e->getLHS()->getType())->getPointeeType()->isVoidType();
             auto left = temporary("jppPointer"), right = temporary("jppOffset");
+            auto offset = e->getOpcode() == BO_SubAssign ? "-(" + right + ")" : right;
             return std::string(asReference ? "Jpp.compoundReference(" : "Jpp.compound(") +
-                   intArgument(e->getRHS()) + ", " + reference(e->getLHS()) +
-                   ", (" + left + ", " + right + ") -> " + left + ".plus(" +
-                   (e->getOpcode() == BO_SubAssign ? "-(" + right + ")" : right) + "))";
+                   intArgument(e->getRHS()) + ", " + reference(e->getLHS()) + ", (" + left + ", " +
+                   right + ") -> " +
+                   (bytes ? "Jpp.voidPlus(" + left + ", " + offset + ")"
+                          : left + ".plus(" + offset + ")") +
+                   ")";
         }
         auto lhs = e->getLHS(), rhs = e->getRHS();
         auto t = clean(lhs->getType());
@@ -1985,11 +1987,15 @@ class Emitter {
             }
             fail(lhs, "this chrono operator needs additional lowering");
         }
-        if ((op == "+" || op == "-") && ((dataPointer(lhs->getType()) &&
-                                          clean(lhs->getType())->getPointeeType()->isVoidType()) ||
-                                         (dataPointer(rhs->getType()) &&
-                                          clean(rhs->getType())->getPointeeType()->isVoidType())))
-            fail(lhs, "GNU void-pointer arithmetic needs byte-addressed storage");
+        bool leftVoid =
+            dataPointer(lhs->getType()) && clean(lhs->getType())->getPointeeType()->isVoidType();
+        bool rightVoid =
+            dataPointer(rhs->getType()) && clean(rhs->getType())->getPointeeType()->isVoidType();
+        if ((op == "+" || op == "-") && leftVoid && rhs->getType()->isIntegerType())
+            return "Jpp.voidPlus(" + expr(lhs) + ", " +
+                   (op == "-" ? "-(" + intArgument(rhs) + ")" : intArgument(rhs)) + ")";
+        if (op == "+" && rightVoid && lhs->getType()->isIntegerType())
+            return "Jpp.voidPlus(" + expr(rhs) + ", " + intArgument(lhs) + ")";
         auto position = [&](QualType t) { return isIter(t) || dataPointer(t); };
         if ((op == "+=" || op == "-=") && isIter(lhs->getType()))
             return "Jpp.advance(" + std::string(op == "-=" ? "-(" : "(") + intArgument(rhs) +
@@ -3319,11 +3325,14 @@ class Emitter {
                                isa_and_nonnull<CXXNewExpr>(source) ||
                                isa_and_nonnull<ExplicitCastExpr>(source);
         if (auto cast = dyn_cast_or_null<ImplicitCastExpr>(source))
-            pointerProducer = cast->getCastKind() == CK_ArrayToPointerDecay;
+            pointerProducer =
+                cast->getCastKind() == CK_ArrayToPointerDecay || cast->getCastKind() == CK_BitCast;
         if (auto unary = dyn_cast_or_null<UnaryOperator>(source))
             pointerProducer = unary->getOpcode() == UO_AddrOf;
         if (pointerProducer && dataPointer(input->getType())) {
             auto element = clean(input->getType())->getPointeeType();
+            if (element->isVoidType())
+                return "Jpp.voidPointer(" + result + ")";
             if (!element->isVoidType() && !element->isRecordType() && !element->isArrayType() &&
                 !element->isPointerType())
                 if (auto layout = memoryType(element); !layout.empty())
@@ -3557,10 +3566,10 @@ class Emitter {
             if (x->isIncrementDecrementOp()) {
                 int delta = x->isIncrementOp() ? 1 : -1;
                 if (dataPointer(a->getType())) {
-                    if (clean(a->getType())->getPointeeType()->isVoidType())
-                        fail(e, "GNU void-pointer arithmetic needs byte-addressed storage");
-                    return "Jpp.updatePointer(" + reference(a) + ", " + std::to_string(delta) +
-                           ", " + (x->isPostfix() ? "true" : "false") + ")";
+                    bool bytes = clean(a->getType())->getPointeeType()->isVoidType();
+                    return std::string(bytes ? "Jpp.updateVoidPointer(" : "Jpp.updatePointer(") +
+                           reference(a) + ", " + std::to_string(delta) + ", " +
+                           (x->isPostfix() ? "true" : "false") + ")";
                 }
                 if (isa<AbstractConditionalOperator>(bare(a)))
                     return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
@@ -3877,10 +3886,15 @@ class Emitter {
             return "new ArrayList<>(Arrays.asList(" + join(a) + "))";
         }
         if (auto x = dyn_cast<UnaryExprOrTypeTraitExpr>(e)) {
-            if (x->getKind() != UETT_SizeOf && x->getKind() != UETT_AlignOf)
+            if (x->getKind() != UETT_SizeOf && x->getKind() != UETT_AlignOf &&
+                x->getKind() != UETT_PreferredAlignOf)
                 fail(e, "unsupported type trait");
+            if (auto constant = constantValue(x); !constant.empty())
+                return constant;
             auto t = x->getTypeOfArgument();
-            if (t->isVariableArrayType()) {
+            if (t->isVoidType())
+                return "1L";
+            if (x->getKind() == UETT_SizeOf && t->isVariableArrayType()) {
                 auto a = ctx.getAsVariableArrayType(t);
                 return "((long)(" + expr(a->getSizeExpr()) + ") * " +
                        std::to_string(ctx.getTypeSizeInChars(a->getElementType()).getQuantity()) +
@@ -3888,6 +3902,8 @@ class Emitter {
             }
             return std::to_string(x->getKind() == UETT_SizeOf
                                       ? ctx.getTypeSizeInChars(t).getQuantity()
+                                  : x->getKind() == UETT_PreferredAlignOf
+                                      ? ctx.getPreferredTypeAlignInChars(t).getQuantity()
                                       : ctx.getTypeAlignInChars(t).getQuantity()) +
                    "L";
         }
@@ -5094,8 +5110,8 @@ std::string identifier(const std::string& s) {
     return r;
 }
 bool transpile(const Options& opt, std::string& java) {
-    std::vector<std::string> args = {"-std=gnu++23", "-fsyntax-only", "-Wno-unused-value",
-                                     "-DONLINE_JUDGE"};
+    std::vector<std::string> args = {"-std=gnu++23",   "-fsyntax-only", "-Wno-unused-value",
+                                     "-DONLINE_JUDGE", "-resource-dir", JPP_CLANG_RESOURCE_DIR};
     args.insert(args.end(), opt.compilerArgs.begin(), opt.compilerArgs.end());
     tooling::FixedCompilationDatabase db(std::filesystem::current_path().string(), args);
     tooling::ClangTool tool(db, {opt.input});

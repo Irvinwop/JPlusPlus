@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# LLVM 18.1.3: GNU C++ void-pointer offsets and compact trivial array values.
+# The logical array bound and nontrivial element evaluation are preserved.
+
+--- a/clang/lib/Sema/SemaExpr.cpp
++++ b/clang/lib/Sema/SemaExpr.cpp
+@@ -4381,8 +4381,10 @@
+                                            SourceLocation Loc,
+                                            SourceRange ArgRange,
+                                            UnaryExprOrTypeTrait TraitKind) {
+-  // Invalid types must be hard errors for SFINAE in C++.
+-  if (S.LangOpts.CPlusPlus)
++  // Match GCC's void-size extension in GNU C++ mode. Other invalid types
++  // retain the ordinary C++ SFINAE diagnostics.
++  if (S.LangOpts.CPlusPlus &&
++      (!S.LangOpts.GNUMode || !T->isVoidType()))
+     return true;
+ 
+   // C99 6.5.3.4p1:
+@@ -11570,8 +11572,10 @@
+ 
+ /// Diagnose invalid arithmetic on a void pointer.
+ static void diagnoseArithmeticOnVoidPointer(Sema &S, SourceLocation Loc,
+-                                            Expr *Pointer) {
+-  S.Diag(Loc, S.getLangOpts().CPlusPlus
++                                            Expr *Pointer,
++                                            bool AllowGNUCpp = false) {
++  S.Diag(Loc, S.getLangOpts().CPlusPlus &&
++                  !(AllowGNUCpp && S.getLangOpts().GNUMode)
+                 ? diag::err_typecheck_pointer_arith_void_type
+                 : diag::ext_gnu_void_ptr)
+     << 0 /* one pointer */ << Pointer->getSourceRange();
+@@ -11673,8 +11677,8 @@
+ 
+   QualType PointeeTy = ResType->getPointeeType();
+   if (PointeeTy->isVoidType()) {
+-    diagnoseArithmeticOnVoidPointer(S, Loc, Operand);
+-    return !S.getLangOpts().CPlusPlus;
++    diagnoseArithmeticOnVoidPointer(S, Loc, Operand, /*AllowGNUCpp=*/true);
++    return !S.getLangOpts().CPlusPlus || S.getLangOpts().GNUMode;
+   }
+   if (PointeeTy->isFunctionType()) {
+     diagnoseArithmeticOnFunctionPointer(S, Loc, Operand);
+--- a/clang/lib/AST/ExprConstant.cpp
++++ b/clang/lib/AST/ExprConstant.cpp
+@@ -11167,9 +11167,9 @@
+     unsigned FinalSize = CAT->getSize().getZExtValue();
+ 
+     // Preserve the array filler if we had prior zero-initialization.
+-    APValue Filler =
+-      HadZeroInit && Value->hasArrayFiller() ? Value->getArrayFiller()
+-                                             : APValue();
++    APValue Filler = HadZeroInit && Value->hasArrayFiller()
++                         ? Value->getArrayFiller()
++                         : APValue();
+ 
+     *Value = APValue(APValue::UninitArray(), 0, FinalSize);
+     if (FinalSize == 0)
+@@ -11190,6 +11190,17 @@
+       if (OldElts == N)
+         break;
+ 
++      if (HasTrivialConstructor && OldElts == 1 && N == FinalSize) {
++        // The remaining trivial default constructions produce the same value.
++        // Preserve the full logical size with a filler, without allocating one
++        // APValue (and its nested fields) for every identical array element.
++        APValue FirstResult;
++        FirstResult.swap(Value->getArrayInitializedElt(0));
++        *Value = APValue(APValue::UninitArray(), 0, FinalSize);
++        Value->getArrayFiller().swap(FirstResult);
++        return true;
++      }
++
+       // Expand the array to appropriate size.
+       APValue NewValue(APValue::UninitArray(), N, FinalSize);
+       for (unsigned I = 0; I < OldElts; ++I)
+@@ -11201,26 +11212,18 @@
+         for (unsigned I = OldElts; I < N; ++I)
+           Value->getArrayInitializedElt(I) = Filler;
+ 
+-      if (HasTrivialConstructor && N == FinalSize && FinalSize != 1) {
+-        // If we have a trivial constructor, only evaluate it once and copy
+-        // the result into all the array elements.
+-        APValue &FirstResult = Value->getArrayInitializedElt(0);
+-        for (unsigned I = OldElts; I < FinalSize; ++I)
+-          Value->getArrayInitializedElt(I) = FirstResult;
+-      } else {
+-        for (unsigned I = OldElts; I < N; ++I) {
+-          if (!VisitCXXConstructExpr(E, ArrayElt,
+-                                     &Value->getArrayInitializedElt(I),
+-                                     CAT->getElementType()) ||
+-              !HandleLValueArrayAdjustment(Info, E, ArrayElt,
+-                                           CAT->getElementType(), 1))
+-            return false;
+-          // When checking for const initilization any diagnostic is considered
+-          // an error.
+-          if (Info.EvalStatus.Diag && !Info.EvalStatus.Diag->empty() &&
+-              !Info.keepEvaluatingAfterFailure())
+-            return false;
+-        }
++      for (unsigned I = OldElts; I < N; ++I) {
++        if (!VisitCXXConstructExpr(E, ArrayElt,
++                                   &Value->getArrayInitializedElt(I),
++                                   CAT->getElementType()) ||
++            !HandleLValueArrayAdjustment(Info, E, ArrayElt,
++                                         CAT->getElementType(), 1))
++          return false;
++        // When checking for const initilization any diagnostic is considered
++        // an error.
++        if (Info.EvalStatus.Diag && !Info.EvalStatus.Diag->empty() &&
++            !Info.keepEvaluatingAfterFailure())
++          return false;
+       }
+     }
+ 

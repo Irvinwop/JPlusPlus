@@ -60,6 +60,8 @@ Byte-memory cases compare partial copies between unlike element widths, byte sto
 
 Chrono cases compare positive and negative duration casts, half-way rounding, mixed rational periods, arithmetic, comparisons, sorting, independent copies, assignment through retained references, time-point casts, epoch conversions, literals, and duration suffixes. Live readings must advance after a timed wait and fall within the expected Unix-epoch range. These properties catch constant clock stubs and incorrect timestamp units without comparing nondeterministic readings from separate executions.
 
+Frontend array cases exercise constant-evaluated array construction, sparse mutation, independent copies, self-address initialization, and global record arrays. The optional GNU frontend adds byte offsets on `void*`, reference and indexed updates, zero offsets on null pointers, and declaration alignment. Unevaluated operands must retain their side-effect counters. Compatibility testing also requires strict C++ to reject GNU-only offsets and GNU C++ to reject void-pointer differences, matching GCC.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

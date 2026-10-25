@@ -175,6 +175,10 @@ int main() {
         cases.emplace_back("pointers", expressions.str());
         cases.emplace_back("memory", expressions.str());
         cases.emplace_back("chrono", expressions.str());
+        cases.emplace_back("frontend_arrays", "");
+#ifdef JPP_TEST_GNU_FRONTEND
+        cases.emplace_back("void_memory", expressions.str());
+#endif
         cases.emplace_back("objects", expressions.str());
         cases.emplace_back("statics", expressions.str());
         cases.emplace_back("calls", expressions.str());
@@ -469,6 +473,34 @@ int main() {
             setenv("JPP_JAVAC", previousCompiler.c_str(), 1);
         else
             unsetenv("JPP_JAVAC");
+#ifdef JPP_TEST_GNU_FRONTEND
+        write(p / "gnu-offset.cpp", "void* following(void* pointer){return pointer + 1;}\n");
+        must({JPP_BINARY, (p / "gnu-offset.cpp").string(), "--check", "-v", "j8", "-o",
+              (p / "Main.java").string()},
+             p / "empty");
+        ++checks;
+        auto gnuSubmission = read(p / "Main.java");
+        code = process({JPP_BINARY, (p / "gnu-offset.cpp").string(), "-t", "--cpp-arg",
+                        "-std=c++23", "-o", (p / "Main.java").string()},
+                       p / "empty", p / "stdout", p / "stderr");
+        if (code != 1 || read(p / "Main.java") != gnuSubmission ||
+            read(p / "stderr").find("arithmetic on a pointer to void") == std::string::npos)
+            throw std::runtime_error("GNU offsets escaped strict C++ diagnostics");
+        ++checks;
+        write(p / "void-difference.cpp", "long difference(void* a,void* b){return a-b;}\n");
+        code = process({cxx, "-std=gnu++23", "-fsyntax-only", (p / "void-difference.cpp").string()},
+                       p / "empty", p / "stdout", p / "stderr");
+        if (code != 1)
+            throw std::runtime_error("native oracle unexpectedly accepts void-pointer differences");
+        ++checks;
+        code = process({JPP_BINARY, (p / "void-difference.cpp").string(), "-t", "-o",
+                        (p / "Main.java").string()},
+                       p / "empty", p / "stdout", p / "stderr");
+        if (code != 1 || read(p / "Main.java") != gnuSubmission ||
+            read(p / "stderr").find("arithmetic on pointers to void") == std::string::npos)
+            throw std::runtime_error("void-pointer differences escaped GNU C++ diagnostics");
+        ++checks;
+#endif
         std::cout << checks << " compiler/runtime differential and CLI checks passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
