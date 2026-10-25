@@ -40,6 +40,10 @@ static abstract class JppRef<T> {
     static <T> JppRef<T> at(T[] a, int i) {
         return of(() -> a[i], v -> a[i] = v);
     }
+    static <T> JppRef<T> at(JppIter<T> iterator) {
+        JppIter<T> position = iterator.plus(0);
+        return of(position::get, position::put);
+    }
     static <K, V> JppRef<V> at(JppMap<K, V> a, K i) {
         return of(() -> a.get(i), v -> a.put(i, v));
     }
@@ -275,6 +279,24 @@ static class JppIter<T> implements JppCopyable<JppIter<T>> {
 
 // TreeMap supplies the ordering and logarithmic lookup; the cursor adds C++
 // bidirectional-iterator behavior, including repeated values in a multiset.
+static class JppBackInserter<T> extends JppIter<T> {
+    final Collection<T> target;
+    JppBackInserter(Collection<T> target) {
+        super(Collections.<T>emptyList(), 0, 1);
+        this.target = target;
+    }
+    T put(T value) {
+        target.add(value);
+        return value;
+    }
+    JppIter<T> plus(int offset) {
+        return new JppBackInserter<T>(target);
+    }
+    JppIter<T> advance(int offset) {
+        return this;
+    }
+}
+
 static class JppTreeIter<T> extends JppIter<T> {
     final NavigableMap<T, Integer> tree;
     T key;
@@ -343,6 +365,24 @@ static class JppMap<K, V> implements Iterable<JppPair<K, V>>, JppCopyable<JppMap
         data.put(jppCopy(key), value);
         return value;
     }
+    JppPair<JppIter<JppPair<K, V>>, Boolean> emplace(K key, V value) {
+        boolean inserted = !data.containsKey(key);
+        if (inserted)
+            data.put(jppCopy(key), value);
+        return new JppPair<JppIter<JppPair<K, V>>, Boolean>(find(key), inserted);
+    }
+    void merge(JppMap<K, V> source) {
+        if (source == this)
+            return;
+        Iterator<Map.Entry<K, V>> entries = source.data.entrySet().iterator();
+        while (entries.hasNext()) {
+            Map.Entry<K, V> entry = entries.next();
+            if (!data.containsKey(entry.getKey())) {
+                data.put(entry.getKey(), entry.getValue());
+                entries.remove();
+            }
+        }
+    }
     int count(K key) {
         return data.containsKey(key) ? 1 : 0;
     }
@@ -405,6 +445,28 @@ static class JppSet<T> implements Iterable<T>, JppCopyable<JppSet<T>> {
             ++count;
         }
         return new JppPair<JppIter<T>, Boolean>(find(value), old == 0);
+    }
+    JppIter<T> insertMultiple(T value) {
+        return insert(value).first;
+    }
+    void merge(JppSet<T> source) {
+        if (source == this)
+            return;
+        Iterator<Map.Entry<T, Integer>> entries = source.data.entrySet().iterator();
+        while (entries.hasNext()) {
+            Map.Entry<T, Integer> entry = entries.next();
+            int moved = multiple ? entry.getValue() : contains(entry.getKey()) ? 0 : 1;
+            if (moved == 0)
+                continue;
+            data.put(entry.getKey(), count(entry.getKey()) + moved);
+            count += moved;
+            source.count -= moved;
+            int remaining = entry.getValue() - moved;
+            if (remaining == 0)
+                entries.remove();
+            else
+                entry.setValue(remaining);
+        }
     }
     int count(T value) {
         Integer n = data.get(value);
@@ -741,6 +803,86 @@ static final JppInput jppIn = new JppInput();
 static final JppOutput jppOut = new JppOutput(System.out), jppErr = new JppOutput(System.err);
 
 static class Jpp {
+    static <T> T append(List<T> values, T value) {
+        values.add(value);
+        return value;
+    }
+    static <T> JppIter<T> backInserter(Collection<T> target) {
+        return new JppBackInserter<T>(target);
+    }
+    static <S, T> JppIter<T> copy(JppIter<S> first, JppIter<S> last, JppIter<T> result,
+                                  java.util.function.Function<S, T> convert) {
+        JppIter<T> out = result.plus(0);
+        for (JppIter<S> at = first.plus(0); !at.same(last); at.advance(1)) {
+            out.put(jppCopy(convert.apply(at.get())));
+            out.advance(1);
+        }
+        return out;
+    }
+    static <S, T> JppIter<T> copy_n(JppIter<S> first, int count, JppIter<T> result,
+                                    java.util.function.Function<S, T> convert) {
+        return copy(first, first.plus(Math.max(0, count)), result, convert);
+    }
+    static <S, T> JppIter<T> copy_backward(JppIter<S> first, JppIter<S> last, JppIter<T> result,
+                                           java.util.function.Function<S, T> convert) {
+        JppIter<S> in = last.plus(0);
+        JppIter<T> out = result.plus(0);
+        while (!in.same(first)) {
+            in.advance(-1);
+            out.advance(-1);
+            out.put(jppCopy(convert.apply(in.get())));
+        }
+        return out;
+    }
+    static <A, B, T> JppIter<T> merge(JppIter<A> first, JppIter<A> last,
+                                       JppIter<B> second, JppIter<B> secondLast, JppIter<T> result,
+                                       java.util.function.Function<A, T> left,
+                                       java.util.function.Function<B, T> right) {
+        return merge(first, last, second, secondLast, result, left, right,
+                     (a, b) -> compare(a, b) < 0);
+    }
+    static <A, B, T> JppIter<T> merge(JppIter<A> first, JppIter<A> last,
+                                       JppIter<B> second, JppIter<B> secondLast, JppIter<T> result,
+                                       java.util.function.Function<A, T> left,
+                                       java.util.function.Function<B, T> right,
+                                       java.util.function.BiPredicate<B, A> less) {
+        JppIter<A> a = first.plus(0);
+        JppIter<B> b = second.plus(0);
+        JppIter<T> out = result.plus(0);
+        while (!a.same(last) && !b.same(secondLast)) {
+            if (less.test(b.get(), a.get())) {
+                out.put(jppCopy(right.apply(b.get())));
+                b.advance(1);
+            } else {
+                out.put(jppCopy(left.apply(a.get())));
+                a.advance(1);
+            }
+            out.advance(1);
+        }
+        out = copy(a, last, out, left);
+        return copy(b, secondLast, out, right);
+    }
+    static <T, F> F for_each(JppIter<T> first, JppIter<T> last, F function,
+                               java.util.function.BiConsumer<F, JppIter<T>> invoke) {
+        for (JppIter<T> at = first.plus(0); !at.same(last); at.advance(1))
+            invoke.accept(function, at);
+        return function;
+    }
+    static <A, B, C, D> JppPair<C, D> convertPair(JppPair<A, B> value,
+                                                  java.util.function.Function<A, C> first,
+                                                  java.util.function.Function<B, D> second) {
+        return new JppPair<C, D>(jppCopy(first.apply(value.first)),
+                                jppCopy(second.apply(value.second)));
+    }
+    static int reverseCompare(Object a, Object b) {
+        return compare(b, a);
+    }
+    static int bitCeil(int value) {
+        return value == 0 || value == 1 ? 1 : Integer.highestOneBit(value - 1) << 1;
+    }
+    static long bitCeil(long value) {
+        return value == 0 || value == 1 ? 1L : Long.highestOneBit(value - 1) << 1;
+    }
     // Argument order preserves C++17's RHS-before-lvalue sequencing.
     static <T> T store(T value, JppRef<T> target) {
         return target.set(value);

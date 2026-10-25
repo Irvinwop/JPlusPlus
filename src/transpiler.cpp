@@ -377,7 +377,8 @@ class Emitter {
         }
         if (base.empty())
             base = "anonymous";
-        if (auto v = dyn_cast<VarDecl>(d); v && v->isLocalVarDeclOrParm() && current) {
+        if (auto v = dyn_cast<VarDecl>(d);
+            current && ((v && v->isLocalVarDeclOrParm()) || isa<BindingDecl>(d))) {
             int count = ++localNames[current][base];
             if (count > 1)
                 base += "_" + std::to_string(count);
@@ -396,6 +397,23 @@ class Emitter {
     }
     const CXXRecordDecl* record(QualType t) const {
         return clean(t)->getAsCXXRecordDecl();
+    }
+    const CXXMethodDecl* lambdaOperator(const CXXRecordDecl* r) {
+        auto f = r->getLambdaCallOperator();
+        if (auto generic = f->getDescribedFunctionTemplate()) {
+            const CXXMethodDecl* selected = nullptr;
+            for (auto instance : generic->specializations()) {
+                if (instance->getType()->isDependentType() || !instance->hasBody())
+                    continue;
+                if (selected)
+                    fail(r->getLocation(), "generic lambda has multiple concrete call signatures");
+                selected = cast<CXXMethodDecl>(instance);
+            }
+            if (!selected)
+                fail(r->getLocation(), "generic lambda has no concrete call signature");
+            return selected;
+        }
+        return f;
     }
     std::string family(QualType t) const {
         auto r = record(t);
@@ -440,6 +458,45 @@ class Emitter {
             return a[i].getAsType();
         fail(SourceLocation(), "cannot determine element type of " + t.getAsString());
     }
+    QualType iteratorElement(QualType t) {
+        t = clean(t);
+        if (auto a = ctx.getAsArrayType(t))
+            return a->getElementType();
+        if (t->isPointerType())
+            return t->getPointeeType();
+        auto n = family(t);
+        if (n == "back_insert_iterator" || n == "front_insert_iterator" || n == "insert_iterator")
+            return element(element(t));
+        auto inner = element(t);
+        if (n == "reverse_iterator" || n == "move_iterator")
+            return iteratorElement(inner);
+        return inner->isPointerType() ? inner->getPointeeType() : inner;
+    }
+    const FunctionProtoType* callableType(QualType t) {
+        t = clean(t);
+        if (t->isPointerType())
+            t = t->getPointeeType();
+        if (auto f = t->getAs<FunctionProtoType>())
+            return f;
+        if (family(t) == "function")
+            return element(t)->getAs<FunctionProtoType>();
+        if (auto r = record(t)) {
+            if (r->isLambda())
+                return lambdaOperator(r)->getType()->getAs<FunctionProtoType>();
+            for (auto method : r->methods())
+                if (method->isOverloadedOperator() && method->getOverloadedOperator() == OO_Call &&
+                    !method->getDescribedFunctionTemplate())
+                    return method->getType()->getAs<FunctionProtoType>();
+        }
+        fail(SourceLocation(), "cannot determine callable signature of " + t.getAsString());
+    }
+    std::string callableMethod(QualType t) {
+        if (auto r = record(t); r && user(r) && !r->isLambda())
+            for (auto method : r->methods())
+                if (method->isOverloadedOperator() && method->getOverloadedOperator() == OO_Call)
+                    return name(method);
+        return "call";
+    }
     std::string boxed(QualType t) {
         auto s = type(t);
         static const std::map<std::string, std::string> boxes = {
@@ -478,7 +535,7 @@ class Emitter {
         }
         auto n = family(t);
         if (auto r = record(t); r && r->isLambda())
-            return functionType(r->getLambdaCallOperator()->getType()->getAs<FunctionProtoType>());
+            return functionType(lambdaOperator(r)->getType()->getAs<FunctionProtoType>());
         if (isString(t))
             return "JppString";
         if (isVec(t))
@@ -496,14 +553,7 @@ class Emitter {
         if (n == "function")
             return functionType(element(t)->getAs<FunctionProtoType>());
         if (isIter(t)) {
-            QualType v = element(t);
-            if (v->isPointerType())
-                v = v->getPointeeType();
-            if (family(t) == "reverse_iterator") {
-                std::string inner = type(v);
-                return inner;
-            }
-            return "JppIter<" + boxed(v) + ">";
+            return "JppIter<" + boxed(iteratorElement(t)) + ">";
         }
         if (auto r = record(t); r && user(r))
             return name(r);
@@ -556,14 +606,17 @@ class Emitter {
                    ")";
         if (family(t) == "priority_queue") {
             auto args = templateArgs(t);
-            std::string comparator = "(a, b) -> Jpp.compare(b, a)";
+            std::string comparator = "Jpp::reverseCompare";
             if (args.size() > 2) {
                 auto c = args[2].getAsType();
                 auto n = family(c);
                 if (n == "greater")
                     comparator = "Jpp::compare";
-                else if (n != "less")
-                    comparator = "Jpp.heapComparator((a, b) -> new " + type(c) + "().call(a, b))";
+                else if (n != "less") {
+                    auto a = temporary("jppLeft"), b = temporary("jppRight");
+                    comparator = "Jpp.heapComparator((" + a + ", " + b + ") -> new " + type(c) +
+                                 "().call(" + a + ", " + b + "))";
+                }
             }
             return "new " + jt + "(" + comparator + ")";
         }
@@ -612,6 +665,12 @@ class Emitter {
     std::string converted(std::string s, QualType from, QualType target) {
         from = clean(from);
         target = clean(target);
+        if (family(from) == "pair" && family(target) == "pair" && !ctx.hasSameType(from, target)) {
+            auto first = temporary("jppFirst"), second = temporary("jppSecond");
+            return "Jpp.convertPair(" + s + ", " + first + " -> " +
+                   converted(first, element(from), element(target)) + ", " + second + " -> " +
+                   converted(second, element(from, 1), element(target, 1)) + ")";
+        }
         if (target->isBooleanType())
             return booleanValue(s, from);
         if (from->isBooleanType() && (target->isArithmeticType() || target->isEnumeralType())) {
@@ -685,6 +744,10 @@ class Emitter {
         return result;
     }
     void markReference(const Expr* e) {
+        if (auto c = dyn_cast_or_null<ConditionalOperator>(bare(e))) {
+            markReference(c->getTrueExpr());
+            markReference(c->getFalseExpr());
+        }
         if (auto v = variableRef(e); v && !v->hasGlobalStorage())
             cells.insert(v);
     }
@@ -694,12 +757,18 @@ class Emitter {
         if (auto r = dyn_cast<DeclRefExpr>(s))
             reservedNames.insert(identifier(r->getDecl()->getNameAsString()));
         if (auto l = dyn_cast<LambdaExpr>(s)) {
-            for (auto p : l->getCallOperator()->parameters())
+            auto callable = lambdaOperator(l->getLambdaClass());
+            for (auto p : callable->parameters()) {
                 reservedNames.insert(identifier(p->getNameAsString()));
+                if (scalarReference(p->getType()))
+                    references.insert(p);
+            }
             for (auto capture : l->captures())
                 if (capture.capturesVariable())
                     if (auto v = dyn_cast<VarDecl>(capture.getCapturedVar()))
                         cells.insert(v);
+            if (callable->getBody() != l->getBody())
+                scan(callable->getBody());
         }
         if (auto d = dyn_cast<DeclStmt>(s))
             for (auto decl : d->decls())
@@ -722,12 +791,31 @@ class Emitter {
                 if (scalarReference(f->getParamDecl(i)->getType()))
                     markReference(c->getArg(i + offset));
         }
+        if (auto c = dyn_cast<CallExpr>(s);
+            c && !c->getDirectCallee() && !c->getCallee()->getType()->isDependentType()) {
+            auto signature = clean(c->getCallee()->getType());
+            if (signature->isPointerType())
+                signature = signature->getPointeeType();
+            if (auto prototype = signature->getAs<FunctionProtoType>())
+                for (unsigned i = 0; i < prototype->getNumParams() && i < c->getNumArgs(); ++i)
+                    if (scalarReference(prototype->getParamType(i)))
+                        markReference(c->getArg(i));
+        }
         if (auto c = dyn_cast<CompoundAssignOperator>(s); c && c->getRHS()->HasSideEffects(ctx))
             markReference(c->getLHS());
+        if (auto b = dyn_cast<BinaryOperator>(s);
+            b && b->isAssignmentOp() && isa<ConditionalOperator>(bare(b->getLHS())))
+            markReference(b->getLHS());
+        if (auto u = dyn_cast<UnaryOperator>(s);
+            u && u->isIncrementDecrementOp() && isa<ConditionalOperator>(bare(u->getSubExpr())))
+            markReference(u->getSubExpr());
         for (auto child : s->children())
             scan(child);
     }
     std::string reference(const Expr* e) {
+        if (auto c = dyn_cast<ConditionalOperator>(bare(e)))
+            return "(" + truth(c->getCond()) + " ? " + reference(c->getTrueExpr()) + " : " +
+                   reference(c->getFalseExpr()) + ")";
         if (auto d = dyn_cast<DeclRefExpr>(bare(e));
             d && aliases.count(d->getDecl()) && aliases[d->getDecl()].ends_with(".get()")) {
             auto s = aliases[d->getDecl()];
@@ -916,6 +1004,8 @@ class Emitter {
         return {};
     }
     std::string assign(const Expr* lhs, const std::string& rhs) {
+        if (isa<ConditionalOperator>(bare(lhs)))
+            return reference(lhs) + ".set(" + rhs + ")";
         if (auto d = dyn_cast<DeclRefExpr>(bare(lhs));
             d && aliases.count(d->getDecl()) && aliases[d->getDecl()].ends_with(".get()"))
             return reference(lhs) + ".set(" + rhs + ")";
@@ -1100,7 +1190,7 @@ class Emitter {
         }
         if (n == "pair") {
             if (args.size() == 1 && family(args[0]->getType()) == "pair")
-                return "jppCopy(" + expr(args[0]) + ")";
+                return converted(expr(args[0]), args[0]->getType(), t);
             std::vector<std::string> a;
             for (unsigned i = 0; i < args.size(); ++i)
                 a.push_back(value(args[i], element(t, i), true));
@@ -1132,6 +1222,39 @@ class Emitter {
             return "Jpp.begin(" + expr(b) + ")";
         return expr(e);
     }
+    std::string elementConstruction(QualType target, const std::vector<const Expr*>& args) {
+        if (args.empty())
+            return defaultValue(target);
+        if (!clean(target)->isRecordType() && args.size() == 1)
+            return value(args[0], target, true);
+        std::vector<std::string> values;
+        if (family(target) == "pair") {
+            if (args.size() == 1)
+                return value(args[0], target, true);
+            for (unsigned i = 0; i < args.size(); ++i)
+                values.push_back(value(args[i], element(target, i), true));
+        } else {
+            auto r = record(target);
+            const CXXConstructorDecl* constructor = nullptr;
+            if (r)
+                for (auto ctor : r->ctors())
+                    if (ctor->getMinRequiredArguments() <= args.size() &&
+                        ctor->getNumParams() >= args.size() && !ctor->isCopyOrMoveConstructor()) {
+                        if (constructor)
+                            fail(args[0], "emplacement needs constructor overload resolution");
+                        constructor = ctor;
+                    }
+            auto field = r ? r->field_begin() : CXXRecordDecl::field_iterator();
+            for (unsigned i = 0; i < args.size(); ++i) {
+                auto type = constructor ? constructor->getParamDecl(i)->getType()
+                            : r && r->isAggregate() && field != r->field_end()
+                                ? (*field++)->getType()
+                                : args[i]->getType();
+                values.push_back(value(args[i], type, true));
+            }
+        }
+        return "new " + type(target) + "(" + join(values) + ")";
+    }
     std::string call(const CallExpr* c) {
         auto f = c->getDirectCallee();
         if (auto m = dyn_cast<CXXMemberCallExpr>(c)) {
@@ -1161,13 +1284,39 @@ class Emitter {
                     continue;
                 QualType target =
                     f && i < f->getNumParams() ? f->getParamDecl(i)->getType() : a->getType();
-                args.push_back(value(a, target, true));
+                args.push_back(f && user(f) && scalarReference(target) ? reference(a)
+                                                                      : value(a, target, true));
             }
             auto o = expr(obj);
             if (n == "size" || n == "length" || n == "capacity")
                 return integerResult(c, o + "." + n + "()");
             bool deque = family(ot) == "queue" || family(ot) == "deque" || family(ot) == "stack";
             bool heap = family(ot) == "priority_queue";
+            if (n == "emplace" || n == "emplace_back" || n == "emplace_front") {
+                std::vector<const Expr*> values;
+                for (auto arg : c->arguments())
+                    if (!isa<CXXDefaultArgExpr>(arg))
+                        values.push_back(arg);
+                if (isMap(ot)) {
+                    if (values.size() == 2)
+                        return o + ".emplace(" + value(values[0], element(ot), true) + ", " +
+                               value(values[1], element(ot, 1), true) + ")";
+                } else {
+                    auto created = elementConstruction(element(ot), values);
+                    if (isSet(ot)) {
+                        return o +
+                               (family(c->getType()) == "pair" ? ".insert(" : ".insertMultiple(") +
+                               created + ")";
+                    }
+                    if (heap)
+                        return o + ".add(" + created + ")";
+                    if (deque)
+                        return o + (n == "emplace_front" ? ".addFirst(" : ".addLast(") + created +
+                               ")";
+                    if (isVec(ot) && n == "emplace_back")
+                        return "Jpp.append(" + o + ", " + created + ")";
+                }
+            }
             if (n == "empty")
                 return isVec(ot) || deque || heap ? o + ".isEmpty()" : o + ".empty()";
             if (deque) {
@@ -1249,7 +1398,7 @@ class Emitter {
                 "pop_front",   "begin",  "end",    "cbegin",    "cend",       "rbegin",
                 "rend",        "erase",  "insert", "count",     "contains",   "lower_bound",
                 "upper_bound", "assign", "substr", "find",      "append",     "at",
-                "swap"};
+                "swap",        "merge"};
             if (!user(me->getMemberDecl()) && !methods.count(n))
                 fail(c, "unsupported library member '" + n + "'");
             if (n == "cbegin")
@@ -1259,8 +1408,17 @@ class Emitter {
             auto result = o + "." + n + "(" + join(args) + ")";
             return n == "count" ? integerResult(c, result) : result;
         }
-        if (!f)
-            return expr(c->getCallee()) + ".call(" + arguments(c) + ")";
+        if (!f) {
+            auto prototype = callableType(c->getCallee()->getType());
+            std::vector<std::string> args;
+            for (unsigned i = 0; i < c->getNumArgs(); ++i) {
+                auto arg = c->getArg(i);
+                auto target =
+                    i < prototype->getNumParams() ? prototype->getParamType(i) : arg->getType();
+                args.push_back(scalarReference(target) ? reference(arg) : value(arg, target, true));
+            }
+            return expr(c->getCallee()) + ".call(" + join(args) + ")";
+        }
         auto n = f->getNameAsString();
         if (user(f) && !f->getBuiltinID())
             return name(f) + "(" + arguments(c, f) + ")";
@@ -1362,6 +1520,57 @@ class Emitter {
             return std::string(ctx.getTypeSize(c->getArg(0)->getType()) > 32 ? "Long" : "Integer") +
                    "." + (n == "countl_zero" ? "numberOfLeadingZeros" : "numberOfTrailingZeros") +
                    "(" + expr(c->getArg(0)) + ")";
+        if (n == "bit_ceil")
+            return "Jpp.bitCeil(" + expr(c->getArg(0)) + ")";
+        if (n == "bit_floor")
+            return std::string(ctx.getTypeSize(c->getArg(0)->getType()) > 32 ? "Long" : "Integer") +
+                   ".highestOneBit(" + expr(c->getArg(0)) + ")";
+        if (n == "bit_width") {
+            bool wide = ctx.getTypeSize(c->getArg(0)->getType()) > 32;
+            return "(" + std::string(wide ? "64 - Long" : "32 - Integer") +
+                   ".numberOfLeadingZeros(" + expr(c->getArg(0)) + "))";
+        }
+        if (n == "has_single_bit")
+            return "(" +
+                   std::string(ctx.getTypeSize(c->getArg(0)->getType()) > 32 ? "Long" : "Integer") +
+                   ".bitCount(" + expr(c->getArg(0)) + ") == 1)";
+        if (n == "back_inserter")
+            return "Jpp.backInserter(" + expr(c->getArg(0)) + ")";
+        if (n == "copy" || n == "copy_backward" || n == "copy_n") {
+            auto source = iteratorElement(c->getArg(0)->getType());
+            auto target = iteratorElement(c->getArg(2)->getType());
+            auto item = temporary("jppValue");
+            return "Jpp." + n + "(" + asIterator(c->getArg(0)) + ", " +
+                   (n == "copy_n" ? intArgument(c->getArg(1)) : asIterator(c->getArg(1))) + ", " +
+                   asIterator(c->getArg(2)) + ", " + item + " -> " +
+                   converted(item, source, target) + ")";
+        }
+        if (n == "merge") {
+            auto a = iteratorElement(c->getArg(0)->getType());
+            auto b = iteratorElement(c->getArg(2)->getType());
+            auto target = iteratorElement(c->getArg(4)->getType());
+            auto first = temporary("jppFirst"), second = temporary("jppSecond");
+            return "Jpp.merge(" + asIterator(c->getArg(0)) + ", " + asIterator(c->getArg(1)) +
+                   ", " + asIterator(c->getArg(2)) + ", " + asIterator(c->getArg(3)) + ", " +
+                   asIterator(c->getArg(4)) + ", " + first + " -> " + converted(first, a, target) +
+                   ", " + second + " -> " + converted(second, b, target) +
+                   (c->getNumArgs() > 5 ? ", " + expr(c->getArg(5)) : "") + ")";
+        }
+        if (n == "for_each") {
+            auto callback = c->getArg(2);
+            auto prototype = callableType(callback->getType());
+            auto target = prototype->getParamType(0);
+            auto fn = temporary("jppFunction"), position = temporary("jppPosition");
+            auto argument = scalarReference(target)
+                                ? "JppRef.at(" + position + ")"
+                                : converted(position + ".get()",
+                                            iteratorElement(c->getArg(0)->getType()), target);
+            if (copyType(target))
+                argument = "jppCopy(" + argument + ")";
+            return "Jpp.for_each(" + asIterator(c->getArg(0)) + ", " + asIterator(c->getArg(1)) +
+                   ", " + expr(callback) + ", (" + fn + ", " + position + ") -> " + fn + "." +
+                   callableMethod(callback->getType()) + "(" + argument + "))";
+        }
         static const std::set<std::string> algorithms = {
             "sort",        "stable_sort",   "reverse",    "fill", "lower_bound",
             "upper_bound", "binary_search", "unique",     "find", "count",
@@ -1499,6 +1708,11 @@ class Emitter {
         if (auto x = dyn_cast<ImplicitCastExpr>(e)) {
             auto sub = x->getSubExpr();
             switch (x->getCastKind()) {
+            case CK_FunctionToPointerDecay:
+                if (auto d = dyn_cast<DeclRefExpr>(bare(sub)); d && isa<FunctionDecl>(d->getDecl()))
+                    return "(" + type(x->getType()) + ") (" + options.className +
+                           "::" + name(d->getDecl()) + ")";
+                return expr(sub);
             case CK_IntegralToBoolean:
             case CK_FloatingToBoolean:
             case CK_PointerToBoolean:
@@ -1539,6 +1753,9 @@ class Emitter {
                         "instead");
             if (x->isIncrementDecrementOp()) {
                 int delta = x->isIncrementOp() ? 1 : -1;
+                if (isa<ConditionalOperator>(bare(a)))
+                    return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
+                           (x->isPostfix() ? "true" : "false") + ")";
                 if (auto d = dyn_cast<DeclRefExpr>(bare(a));
                     d && aliases.count(d->getDecl()) && aliases[d->getDecl()].ends_with(".get()"))
                     return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
@@ -1620,10 +1837,17 @@ class Emitter {
             }
             if (op == OO_Call) {
                 auto object = x->getArg(0);
+                auto f = x->getDirectCallee();
                 std::vector<std::string> a;
-                for (unsigned i = 1; i < x->getNumArgs(); ++i)
-                    a.push_back(expr(x->getArg(i)));
-                return expr(object) + ".call(" + join(a) + ")";
+                for (unsigned i = 1; i < x->getNumArgs(); ++i) {
+                    auto e = x->getArg(i);
+                    auto target = f && i <= f->getNumParams() ? f->getParamDecl(i - 1)->getType()
+                                                              : e->getType();
+                    a.push_back(scalarReference(target) ? reference(e) : value(e, target, true));
+                }
+                auto r = record(object->getType());
+                auto method = f && user(f) && r && !r->isLambda() ? name(f) : "call";
+                return expr(object) + "." + method + "(" + join(a) + ")";
             }
             if (op == OO_PlusPlus || op == OO_MinusMinus) {
                 auto a = x->getArg(0);
@@ -1707,16 +1931,14 @@ class Emitter {
         fail(e, std::string("unsupported expression ") + e->getStmtClassName());
     }
     std::string lambda(const LambdaExpr* e) {
-        auto f = e->getCallOperator();
-        if (f->getDescribedFunctionTemplate())
-            fail(e, "generic lambdas are not supported yet");
+        auto f = lambdaOperator(e->getLambdaClass());
         std::vector<std::string> params;
         for (auto p : f->parameters()) {
             auto base = identifier(p->getNameAsString());
             if (std::any_of(names.begin(), names.end(),
                             [&](const auto& n) { return n.first != p && n.second == base; }))
                 names[p] = base + "_lambda" + std::to_string(++serial);
-            params.push_back(type(p->getType()) + " " + name(p));
+            params.push_back(parameterType(p->getType()) + " " + name(p));
         }
         auto oldAliases = aliases;
         std::vector<std::string> captures;
@@ -2076,11 +2298,26 @@ class Emitter {
                     line("}");
                 }
             } else {
-                line("for (" + type(v->getType()) + " " + name(v) + " : " + expr(range) + ")");
-                if (copyType(v->getType())) {
+                auto initializer = bare(v->getInit());
+                auto sourceType = initializer->getType();
+                if (auto ctor = dyn_cast<CXXConstructExpr>(initializer);
+                    ctor && ctor->getNumArgs() == 1)
+                    sourceType = ctor->getArg(0)->getType();
+                bool adapt = !ctx.hasSameType(clean(sourceType), clean(v->getType())) || cell(v);
+                auto item = adapt ? temporary("jppItem") : name(v);
+                line("for (" + type(sourceType) + " " + item + " : " + expr(range) + ")");
+                if (adapt || copyType(v->getType())) {
                     line("{");
                     ++indent;
-                    line(name(v) + " = jppCopy(" + name(v) + ");");
+                    auto init = converted(item, sourceType, v->getType());
+                    if (copyType(v->getType()))
+                        init = "jppCopy(" + init + ")";
+                    if (cell(v))
+                        line("final JppRef<" + boxed(v->getType()) + "> " + name(v) +
+                             " = JppRef.cell(" + init + ");");
+                    else
+                        line((adapt ? type(v->getType()) + " " : "") + name(v) + " = " + init +
+                             ";");
                     if (auto body = dyn_cast<CompoundStmt>(f->getBody()))
                         for (auto c : body->body())
                             stmt(c);
@@ -2317,8 +2554,6 @@ class Emitter {
                 if (f->getNumParams())
                     fail(f->getLocation(), "main(argc, argv) is not supported yet; use main()");
             }
-        if (!main)
-            fail(SourceLocation(), "input needs a definition of main()");
         out << "// Generated by J++ 0.1.0. Target: Java " << options.javaVersion << ".\n"
             << "// Input dialect: GNU++23. Support: "
                "https://github.com/Irvinwop/JPlusPlus/blob/main/docs/compatibility.md\n"
@@ -2344,27 +2579,42 @@ class Emitter {
             std::vector<std::string> p;
             unsigned j = 0;
             for (auto t : f->param_types())
-                p.push_back(type(t) + " arg" + std::to_string(j++));
-            bool pred = f->getReturnType()->isBooleanType() && f->getNumParams() == 2;
+                p.push_back(parameterType(t) + " arg" + std::to_string(j++));
+            bool pred = f->getNumParams() == 2 && (clean(f->getReturnType())->isArithmeticType() ||
+                                                   clean(f->getReturnType())->isEnumeralType());
             auto extends = pred ? " extends java.util.function.BiPredicate<" +
                                       boxed(f->getParamType(0)) + ", " + boxed(f->getParamType(1)) +
                                       ">"
                                 : "";
+            std::vector<std::string> bridge;
+            if (pred)
+                for (unsigned i = 0; i < 2; ++i) {
+                    auto t = f->getParamType(i);
+                    auto value = std::string(i ? "b" : "a");
+                    if (scalarReference(t))
+                        value = "JppRef.cell(" + value + ")";
+                    else if (copyType(t))
+                        value = "jppCopy(" + value + ")";
+                    bridge.push_back(value);
+                }
             line("interface " + n + extends + " { " + type(f->getReturnType()) + " call(" +
                  join(p) + ");" +
                  (pred ? " default boolean test(" + boxed(f->getParamType(0)) + " a, " +
-                             boxed(f->getParamType(1)) + " b) { return call(a, b); }"
+                             boxed(f->getParamType(1)) + " b) { return " +
+                             booleanValue("call(" + join(bridge) + ")", f->getReturnType()) + "; }"
                        : "") +
                  " }");
         }
-        line("public static void main(String[] args) {");
-        ++indent;
-        line("int status;");
-        line("try { status = cppMain(); }");
-        line("finally { jppOut.flush(); jppErr.flush(); }");
-        line("if (status != 0) System.exit(status);");
-        --indent;
-        line("}");
+        if (main) {
+            line("public static void main(String[] args) {");
+            ++indent;
+            line("int status;");
+            line("try { status = cppMain(); }");
+            line("finally { jppOut.flush(); jppErr.flush(); }");
+            line("if (status != 0) System.exit(status);");
+            --indent;
+            line("}");
+        }
         line();
         auto program = out.str();
         return formatJava(program + supportFor(program) + "}\n");

@@ -161,6 +161,21 @@ int main() {
         for (int i = 0; i < 48; ++i)
             expressions << (i % 8 == 0 ? 0 : r(101) - 50) << ' ' << r(17) - 8 << '\n';
         cases.emplace_back("expressions", expressions.str());
+        cases.emplace_back("coverage", "-19 37 5\n");
+        std::ostringstream library;
+        library << 70 << '\n';
+        for (int i = 0; i < 70; ++i)
+            library << r(200001) - 100000 << ' ';
+        library << '\n';
+        cases.emplace_back("library", library.str());
+        cases.emplace_back("algorithms", sequence.str());
+        cases.emplace_back("conversions", "-9 4 1\n");
+        write(p / "LibraryDriver.java", "import java.util.*; public class LibraryDriver {"
+                                        "public static void main(String[] args) {"
+                                        "Scanner in = new Scanner(System.in); int n = in.nextInt();"
+                                        "ArrayList<Integer> values = new ArrayList<Integer>();"
+                                        "while (n-- > 0) values.add(in.nextInt());"
+                                        "System.out.println(Main.score(values)); }}\n");
 
         auto javacs = configured("JPP_TEST_JAVACS", "javac");
         auto javas = configured("JPP_TEST_JAVAS", "java");
@@ -185,7 +200,12 @@ int main() {
         for (const auto& [name, input] : cases) {
             auto source = (fs::path(JPP_SOURCE) / "tests/fixtures" / (name + ".cpp")).string();
             write(p / "input", input);
-            must({cxx, "-std=gnu++23", "-O2", source, "-o", (p / "native").string()}, p / "empty");
+            auto nativeSource =
+                name == "library"
+                    ? (fs::path(JPP_SOURCE) / "tests/fixtures/library_driver.cpp").string()
+                    : source;
+            must({cxx, "-std=gnu++23", "-O2", nativeSource, "-o", (p / "native").string()},
+                 p / "empty");
             must({(p / "native").string()}, p / "input");
             auto expected = read(p / "stdout");
             // Generate once per requested Java release, then compile with each independent
@@ -211,6 +231,8 @@ int main() {
                     } else
                         compile.insert(compile.end(), {"--release", std::to_string(release)});
                     compile.push_back((p / "Main.java").string());
+                    if (name == "library")
+                        compile.push_back((p / "LibraryDriver.java").string());
                     must(compile, p / "empty");
                     auto bytes = read(classes / "Main.class");
                     if (bytes.size() < 8 || static_cast<unsigned char>(bytes[7]) != release + 44)
@@ -218,7 +240,9 @@ int main() {
                     for (const auto& java : javas) {
                         if (release > runtimeVersions[java])
                             continue;
-                        must({java, "-cp", classes.string(), "Main"}, p / "input");
+                        must({java, "-cp", classes.string(),
+                              name == "library" ? "LibraryDriver" : "Main"},
+                             p / "input");
                         if (read(p / "stdout") != expected)
                             throw std::runtime_error("output differs from native C++: " + name +
                                                      ", release " + std::to_string(release) + ", " +
