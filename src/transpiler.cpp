@@ -12,6 +12,8 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Lex/Lexer.h>
+#include <clang/Sema/Lookup.h>
+#include <clang/Sema/Sema.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
 #include <llvm/ADT/SmallString.h>
@@ -409,6 +411,7 @@ std::string formatJava(const std::string& code) {
 
 class Emitter {
     ASTContext& ctx;
+    Sema& sema;
     const Options& options;
     SourceManager& sm;
     std::ostringstream out;
@@ -425,6 +428,7 @@ class Emitter {
     std::unordered_set<const FunctionDecl*> emittedFunctions;
     std::unordered_map<const ValueDecl*, std::string> aliases;
     std::unordered_map<const OpaqueValueExpr*, std::string> opaqueValues;
+    std::unordered_map<const OpaqueValueExpr*, std::string> opaqueReferences;
     std::unordered_map<const Expr*, std::string> arrayBounds;
     struct ArrayBoundScope {
         std::unordered_map<const Expr*, std::string>& bounds;
@@ -453,6 +457,8 @@ class Emitter {
     std::unordered_map<const Type*, std::string> constantArrayLayouts;
     std::vector<std::pair<std::string, std::string>> arrayLayoutFields;
     std::map<std::string, std::string> literalArrays;
+    std::set<unsigned> tupleArities;
+    std::map<std::vector<bool>, std::string> productReferenceKinds;
     const FunctionDecl* current = nullptr;
     std::vector<const FunctionDecl*> enclosingFunctions;
     const CXXRecordDecl* currentRecord = nullptr;
@@ -799,7 +805,378 @@ class Emitter {
             return {r->getTemplateArgs().asArray().begin(), r->getTemplateArgs().asArray().end()};
         return {};
     }
+    bool product(QualType t) const {
+        return family(t) == "tuple" || family(t) == "pair";
+    }
+    bool ordering(QualType t) const {
+        auto n = family(t);
+        return n == "strong_ordering" || n == "weak_ordering" || n == "partial_ordering";
+    }
+    bool tupleLike(QualType t) const {
+        return product(t) || family(t) == "array";
+    }
+    std::vector<QualType> productTypes(QualType t) {
+        std::vector<QualType> types;
+        auto args = templateArgs(t);
+        if (family(t) == "array") {
+            types.assign(args[1].getAsIntegral().getZExtValue(), args[0].getAsType());
+            return types;
+        }
+        std::function<void(const TemplateArgument&)> append = [&](const TemplateArgument& arg) {
+            if (arg.getKind() == TemplateArgument::Pack)
+                for (const auto& item : arg.pack_elements())
+                    append(item);
+            else if (arg.getKind() == TemplateArgument::Type)
+                types.push_back(arg.getAsType());
+        };
+        for (const auto& arg : args)
+            append(arg);
+        return types;
+    }
+    std::string productStorageType(QualType t) {
+        return t->isReferenceType() ? "JppRef<" + boxed(t) + ">" : boxed(t);
+    }
+    std::string productField(QualType t, unsigned index) const {
+        return family(t) == "pair" ? (index == 0 ? "first" : "second")
+                                   : "item" + std::to_string(index);
+    }
+    std::string productRead(const std::string& object, QualType t, unsigned index) {
+        if (family(t) == "array")
+            return object + ".get(" + std::to_string(index) + ")";
+        auto field = object + "." + productField(t, index);
+        return productTypes(t)[index]->isReferenceType() ? field + ".get()" : field;
+    }
+    std::string productReference(const std::string& object, QualType t, unsigned index) {
+        auto item = productTypes(t)[index];
+        auto ref = family(t) == "array" ? "JppRef.at(" + object + ", " + std::to_string(index) + ")"
+                                        : "Jpp.<" + boxed(item) + ">productReference(" + object +
+                                              ", " + std::to_string(index) + ")";
+        if (primitiveArray(item))
+            ref = "Jpp.arrayReference(" + ref + ", " + memoryType(item) + ", " +
+                  targetLittleEndian() + ")";
+        return ref;
+    }
+    std::string productComparisonItem(const std::string& object, QualType t, unsigned index,
+                                      QualType& item) {
+        item = productTypes(t)[index];
+        if (auto array = ctx.getAsArrayType(clean(item))) {
+            item = ctx.getPointerType(array->getElementType());
+            return "Jpp.<" + boxed(array->getElementType()) + ">arrayDecay((" +
+                   productReference(object, t, index) + ").pointer())";
+        }
+        return productRead(object, t, index);
+    }
+    bool homogeneousProduct(QualType t) {
+        auto elements = productTypes(t);
+        return elements.size() >= 16 && !ctx.getAsArrayType(clean(elements[0])) &&
+               std::all_of(elements.begin(), elements.end(), [&](QualType element) {
+                   return ctx.hasSameType(clean(elements[0]), clean(element));
+               });
+    }
+    unsigned productIndex(const CallExpr* call) {
+        auto types = productTypes(call->getArg(0)->getType());
+        auto args = call->getDirectCallee()->getTemplateSpecializationArgs();
+        if (!args || !args->size())
+            fail(call, "cannot determine tuple element selection");
+        auto selected = args->get(0);
+        if (selected.getKind() == TemplateArgument::Integral)
+            return selected.getAsIntegral().getZExtValue();
+        if (selected.getKind() == TemplateArgument::Type)
+            for (unsigned i = 0; i < types.size(); ++i)
+                if (ctx.hasSameType(types[i], selected.getAsType()))
+                    return i;
+        fail(call, "cannot determine tuple element selection");
+    }
+    bool productGet(const CallExpr* call) const {
+        return call->getDirectCallee() && !user(call->getDirectCallee()) &&
+               call->getDirectCallee()->getNameAsString() == "get" && call->getNumArgs() == 1 &&
+               tupleLike(call->getArg(0)->getType());
+    }
+    std::string productConstruct(QualType t, const std::vector<std::string>& values) {
+        auto arguments = join(values);
+        if (values.size() > 200)
+            arguments = "new Object[] {" + arguments + "}, 0";
+        std::vector<bool> references;
+        for (auto item : productTypes(t))
+            references.push_back(item->isReferenceType());
+        if (std::any_of(references.begin(), references.end(),
+                        [](bool reference) { return reference; })) {
+            auto [entry, inserted] = productReferenceKinds.try_emplace(references);
+            if (inserted)
+                entry->second = temporary("jppReferenceKinds");
+            arguments = entry->second + (arguments.empty() ? "" : ", " + arguments);
+        }
+        return "new " + type(t) + "(" + arguments + ")";
+    }
+    std::string productArgument(const Expr* e, QualType t) {
+        if (t->isReferenceType())
+            return family(e->getType()) == "reference_wrapper" && family(t) != "reference_wrapper"
+                       ? expr(e)
+                       : reference(e);
+        if (clean(t)->isRecordType())
+            return expr(resolveConstruction(t, {const_cast<Expr*>(e)}, e->getExprLoc()));
+        return value(e, t, true);
+    }
+    OpaqueValueExpr* mappedValue(QualType t, ExprValueKind kind, const std::string& value,
+                                 const std::string& location, SourceLocation loc) {
+        auto expression = new (ctx) OpaqueValueExpr(loc, t.getNonReferenceType(), kind);
+        opaqueValues[expression] = value;
+        if (!location.empty())
+            opaqueReferences[expression] = location;
+        return expression;
+    }
+    Expr* resolveConstruction(QualType t, std::vector<Expr*> arguments, SourceLocation loc) {
+        Sema::ContextRAII context(sema, ctx.getTranslationUnitDecl());
+        auto result = sema.BuildCXXTypeConstructExpr(ctx.getTrivialTypeSourceInfo(t, loc), loc,
+                                                     arguments, loc, false);
+        if (result.isInvalid())
+            fail(loc, "cannot resolve this tuple element construction");
+        return result.get();
+    }
+    Expr* resolveSwap(Expr* left, Expr* right, SourceLocation loc) {
+        Sema::ContextRAII context(sema, ctx.getTranslationUnitDecl());
+        NamespaceDecl* standard = nullptr;
+        for (auto declaration : ctx.getTranslationUnitDecl()->lookup(&ctx.Idents.get("std")))
+            if (auto ns = dyn_cast<NamespaceDecl>(declaration))
+                standard = ns;
+        if (!standard)
+            fail(loc, "cannot find the standard swap declarations");
+        LookupResult lookup(sema, &ctx.Idents.get("swap"), loc, Sema::LookupOrdinaryName);
+        sema.LookupQualifiedName(lookup, standard);
+        auto callee = sema.BuildDeclarationNameExpr(CXXScopeSpec(), lookup, true);
+        if (callee.isInvalid())
+            fail(loc, "cannot resolve tuple element swap");
+        std::vector<Expr*> arguments{left, right};
+        auto result = sema.BuildCallExpr(nullptr, callee.get(), loc, arguments, loc);
+        if (result.isInvalid())
+            fail(loc, "cannot resolve tuple element swap");
+        return result.get();
+    }
+    Expr* productElement(const std::string& object, QualType t, unsigned index,
+                         ExprValueKind category, SourceLocation loc) {
+        auto item = productTypes(t)[index];
+        auto elementType = item.getNonReferenceType();
+        if (!item->isReferenceType() && t.isConstQualified())
+            elementType = ctx.getConstType(elementType);
+        auto kind = category == VK_LValue || item->isLValueReferenceType() ? VK_LValue : VK_XValue;
+        return mappedValue(elementType, kind, productRead(object, t, index),
+                           productReference(object, t, index), loc);
+    }
+    bool referenceMember(const Expr* e) const {
+        auto member = dyn_cast_or_null<MemberExpr>(bare(e));
+        if (!member)
+            return false;
+        auto owner = member->getBase()->getType();
+        if (owner->isPointerType())
+            owner = owner->getPointeeType();
+        return family(owner) == "pair" && member->getMemberDecl()->getType()->isReferenceType();
+    }
+    std::string convertProduct(const std::string& source, QualType from, QualType to,
+                               ExprValueKind category = VK_LValue, SourceLocation loc = {}) {
+        auto sourceName = temporary("jppTuple");
+        auto sourceTypes = productTypes(from), targetTypes = productTypes(to);
+        if (sourceTypes.size() != targetTypes.size())
+            fail(SourceLocation(), "tuple conversion has different element counts");
+        std::vector<std::string> values;
+        for (unsigned i = 0; i < sourceTypes.size(); ++i) {
+            auto target = targetTypes[i];
+            if (target->isReferenceType())
+                values.push_back(family(sourceTypes[i]) == "reference_wrapper" &&
+                                         family(target) != "reference_wrapper"
+                                     ? productRead(sourceName, from, i)
+                                     : productReference(sourceName, from, i));
+            else {
+                auto item =
+                    clean(target)->isRecordType()
+                        ? expr(resolveConstruction(
+                              target, {productElement(sourceName, from, i, category, loc)}, loc))
+                        : converted(productRead(sourceName, from, i), sourceTypes[i], target);
+                values.push_back(item);
+            }
+        }
+        return "Jpp.convertProduct(" + source + ", " + sourceName + " -> " +
+               productConstruct(to, values) + ")";
+    }
+    std::string assignProduct(const Expr* target, const Expr* source) {
+        auto from = source->getType(), to = target->getType();
+        auto sourceTypes = productTypes(from), targetTypes = productTypes(to);
+        if (sourceTypes.size() != targetTypes.size())
+            fail(target, "tuple assignment size mismatch");
+        auto a = temporary("jppSource"), b = temporary("jppTarget");
+        std::string body;
+        for (unsigned i = 0; i < sourceTypes.size(); ++i) {
+            auto accepted = targetTypes[i];
+            if ((clean(accepted)->isRecordType() || clean(sourceTypes[i])->isRecordType()) &&
+                family(accepted) != "_Swallow_assign" && family(accepted) != "reference_wrapper") {
+                auto left = productElement(b, to, i, VK_LValue, target->getExprLoc());
+                auto right =
+                    productElement(a, from, i, source->getValueKind(), source->getExprLoc());
+                Sema::ContextRAII context(sema, ctx.getTranslationUnitDecl());
+                auto assignment =
+                    sema.BuildBinOp(nullptr, target->getExprLoc(), BO_Assign, left, right);
+                if (assignment.isInvalid())
+                    fail(target, "cannot resolve this tuple element assignment");
+                body += statementValue(assignment.get()) + "; ";
+                continue;
+            }
+            auto item = productRead(a, from, i);
+            if (family(accepted) == "reference_wrapper" &&
+                family(sourceTypes[i]) != "reference_wrapper")
+                item = productReference(a, from, i);
+            else if (family(accepted) != "_Swallow_assign")
+                item = converted(item, sourceTypes[i], accepted);
+            body += "Jpp.storeProductField(" + b + ", " + std::to_string(i) + ", " + item + "); ";
+        }
+        return "Jpp.assignProduct(" + expr(source) + ", " + expr(target) + ", (" + a + ", " + b +
+               ") -> { " + body + "})";
+    }
+    std::string swapProduct(const Expr* left, const Expr* right) {
+        return supplier([&] {
+            auto leftType = left->getType(), rightType = right->getType();
+            if (leftType->isPointerType())
+                leftType = leftType->getPointeeType();
+            if (rightType->isPointerType())
+                rightType = rightType->getPointeeType();
+            auto a = temporary("jppLeft"), b = temporary("jppRight");
+            line("final " + type(leftType) + " " + a + " = " + expr(left) +
+                 (left->getType()->isPointerType() ? ".get()" : "") + ";");
+            line("final " + type(rightType) + " " + b + " = " + expr(right) +
+                 (right->getType()->isPointerType() ? ".get()" : "") + ";");
+            auto elements = productTypes(leftType);
+            for (unsigned i = 0; i < elements.size(); ++i)
+                expressionStatement(
+                    resolveSwap(productElement(a, leftType, i, VK_LValue, left->getExprLoc()),
+                                productElement(b, rightType, i, VK_LValue, right->getExprLoc()),
+                                left->getExprLoc()));
+            line("return null;");
+        });
+    }
+    std::string swapArrays(const Expr* left, const Expr* right) {
+        return supplier([&] {
+            auto t = left->getType();
+            auto array = ctx.getAsArrayType(t);
+            auto item = array->getElementType();
+            auto a = temporary("jppLeft"), b = temporary("jppRight"), index = temporary("jppIndex"),
+                 ar = temporary("jppLeftElement"), br = temporary("jppRightElement");
+            bool primitive = primitiveArray(t);
+            auto storage = primitive ? "JppPtr<" + boxed(item) + ">" : type(t);
+            line("final " + storage + " " + a + " = " +
+                 (primitive ? arrayDecay(left) : expr(left)) + ";");
+            line("final " + storage + " " + b + " = " +
+                 (primitive ? arrayDecay(right) : expr(right)) + ";");
+            line("for (int " + index + " = 0; " + index + " < " + arrayBound(array) + "; ++" +
+                 index + ") {");
+            ++indent;
+            for (const auto& [reference, object] :
+                 std::vector<std::pair<std::string, std::string>>{{ar, a}, {br, b}})
+                line("final JppRef<" + boxed(item) + "> " + reference + " = JppRef.at(" +
+                     (primitive ? object + ".plus(" + index + ")" : object + ", " + index) + ");");
+            expressionStatement(
+                resolveSwap(mappedValue(item, VK_LValue, ar + ".get()", ar, left->getExprLoc()),
+                            mappedValue(item, VK_LValue, br + ".get()", br, right->getExprLoc()),
+                            left->getExprLoc()));
+            --indent;
+            line("}");
+            line("return null;");
+        });
+    }
+    std::string swapObjects(const Expr* left, const Expr* right) {
+        return supplier([&] {
+            auto t = left->getType().getNonReferenceType();
+            auto a = temporary("jppLeft"), b = temporary("jppRight"), saved = temporary("jppSaved");
+            line("final " + type(t) + " " + a + " = " + expr(left) + ";");
+            line("final " + type(t) + " " + b + " = " + expr(right) + ";");
+            auto source = [&](const std::string& object) {
+                return mappedValue(t, VK_XValue, object, "JppRef.object(" + object + ")",
+                                   left->getExprLoc());
+            };
+            line(type(t) + " " + saved + " = " +
+                 expr(resolveConstruction(t, {source(a)}, left->getExprLoc())) + ";");
+            for (const auto& [target, value] :
+                 std::vector<std::pair<std::string, std::string>>{{a, b}, {b, saved}}) {
+                auto destination = mappedValue(t, VK_LValue, target,
+                                               "JppRef.object(" + target + ")", left->getExprLoc());
+                Sema::ContextRAII context(sema, ctx.getTranslationUnitDecl());
+                auto assignment = sema.BuildBinOp(nullptr, left->getExprLoc(), BO_Assign,
+                                                  destination, source(value));
+                if (assignment.isInvalid())
+                    fail(left, "cannot resolve this swap assignment");
+                expressionStatement(assignment.get());
+            }
+            line("return null;");
+        });
+    }
+    std::string tupleDefinitions() {
+        std::string code;
+        for (unsigned n : tupleArities) {
+            std::vector<std::string> types, params, copies, arguments;
+            for (unsigned i = 0; i < n; ++i) {
+                auto item = "item" + std::to_string(i), t = "A" + std::to_string(i);
+                types.push_back(t);
+                params.push_back(t + " " + item);
+                copies.push_back("jppCopy(" + item + ")");
+                arguments.push_back(item);
+            }
+            auto name = "JppTuple" + std::to_string(n);
+            auto self = name + (n ? "<" + join(types) + ">" : "");
+            code += "static class " + self + " implements JppProduct, JppAssignable<" + self +
+                    ">, Comparable<" + self + "> {\n";
+            for (unsigned i = 0; i < n; ++i)
+                code += types[i] + " item" + std::to_string(i) + ";\n";
+            code += "final boolean[] referenceKinds;\n";
+            auto parameters = n > 200 ? "Object[] values, int marker" : join(params);
+            auto forwarded = n > 200 ? "values, marker" : join(arguments);
+            code +=
+                name + "(" + parameters + ") { this(null" + (n ? ", " + forwarded : "") + "); }\n";
+            code += name + "(boolean[] referenceKinds" + (n ? ", " + parameters : "") + ") {\n";
+            code += "this.referenceKinds = referenceKinds;\n";
+            for (unsigned i = 0; i < n; ++i) {
+                auto field = "item" + std::to_string(i);
+                code += "this." + field + " = " +
+                        (n > 200 ? "(" + types[i] + ")values[" + std::to_string(i) + "]" : field) +
+                        ";\n";
+            }
+            auto copied = n > 200 ? "new Object[] {" + join(copies) + "}, 0" : join(copies);
+            code += "}\npublic " + self + " copy() { return new " + self + "(referenceKinds" +
+                    (n ? ", " + copied : "") + "); }\n";
+            code += "public " + self + " jppAssignFrom(" + self + " source) {\n";
+            for (unsigned i = 0; i < n; ++i) {
+                auto field = "item" + std::to_string(i);
+                code += field + " = (" + types[i] + ")Jpp.assignProductField(" + field +
+                        ", Jpp.productValue(source, " + std::to_string(i) + "), binding(" +
+                        std::to_string(i) + "));\n";
+            }
+            code += "return this; }\npublic int arity() { return " + std::to_string(n) + "; }\n";
+            code += "public boolean binding(int index) { return referenceKinds != null && "
+                    "referenceKinds[index]; }\n";
+            code += "public String memberName(int index) { return \"item\" + index; }\n";
+            code += "public Object raw(int index) { switch (index) {\n";
+            for (unsigned i = 0; i < n; ++i)
+                code += "case " + std::to_string(i) + ": return item" + std::to_string(i) + ";\n";
+            code += "default: throw new IndexOutOfBoundsException(); }}\n";
+            code += "public void raw(int index, Object value) { switch (index) {\n";
+            for (unsigned i = 0; i < n; ++i)
+                code += "case " + std::to_string(i) + ": item" + std::to_string(i) + " = (" +
+                        types[i] + ")value; return;\n";
+            code += "default: throw new IndexOutOfBoundsException(); }}\n";
+            code += "public int compareTo(" + self +
+                    " other) { for (int i=0; i<arity(); ++i) { "
+                    "int order = Jpp.compare(Jpp.productValue(this, i), "
+                    "Jpp.productValue(other, i)); "
+                    "if (order != 0) return order; } return 0; }\n";
+            code += "public boolean equals(Object other) { if (!(other instanceof " + name +
+                    ")) return false; JppProduct tuple = (JppProduct)other; "
+                    "for (int i=0; i<arity(); ++i) if (!Jpp.valueEquals(Jpp.productValue(this, i), "
+                    "Jpp.productValue(tuple, i))) return false; return true; }\n";
+            code +=
+                "public int hashCode() { int result=1; for (int i=0; i<arity(); ++i) "
+                "result=31*result+Jpp.valueHash(Jpp.productValue(this, i)); return result; }\n}\n";
+        }
+        return code;
+    }
     QualType element(QualType t, unsigned i = 0) {
+        if (family(t) == "tuple")
+            return productTypes(t).at(i);
         auto a = templateArgs(t);
         if (i < a.size() && a[i].getKind() == TemplateArgument::Type)
             return a[i].getAsType();
@@ -879,6 +1256,8 @@ class Emitter {
         }
         if (auto a = ctx.getAsArrayType(t))
             return type(a->getElementType()) + "[]";
+        if (t->isFunctionType())
+            return functionType(t->getAs<FunctionProtoType>());
         if (t->isPointerType()) {
             auto p = t->getPointeeType();
             if (p->isFunctionType())
@@ -890,6 +1269,8 @@ class Emitter {
             chronoPeriod(t);
             return n == "duration" ? "JppDuration" : "JppTimePoint";
         }
+        if (ordering(t))
+            return "JppOrdering";
         if (n == "basic_ifstream" || n == "basic_istream")
             return "JppInput";
         if (n == "basic_ofstream" || n == "basic_ostream")
@@ -914,8 +1295,22 @@ class Emitter {
             return "JppBitRef";
         if (isVec(t))
             return "ArrayList<" + boxed(element(t)) + ">";
+        if (n == "reference_wrapper")
+            return "JppRef<" + boxed(element(t)) + ">";
+        if (n == "_Swallow_assign")
+            return "JppIgnore";
+        if (n == "tuple") {
+            auto elements = productTypes(t);
+            tupleArities.insert(elements.size());
+            std::vector<std::string> arguments;
+            for (auto item : elements)
+                arguments.push_back(productStorageType(item));
+            return "JppTuple" + std::to_string(elements.size()) +
+                   (elements.empty() ? "" : "<" + join(arguments) + ">");
+        }
         if (n == "pair")
-            return "JppPair<" + boxed(element(t)) + ", " + boxed(element(t, 1)) + ">";
+            return "JppPair<" + productStorageType(element(t)) + ", " +
+                   productStorageType(element(t, 1)) + ">";
         if (isMap(t))
             return "JppMap<" + boxed(element(t)) + ", " + boxed(element(t, 1)) + ">";
         if (isSet(t))
@@ -1046,9 +1441,14 @@ class Emitter {
             return "Jpp.vectorDefault(" + number(a[1].getAsIntegral()) + ", () -> " +
                    defaultValue(element(t)) + ")";
         }
-        if (family(t) == "pair")
-            return "new " + jt + "(" + defaultValue(element(t)) + ", " +
-                   defaultValue(element(t, 1)) + ")";
+        if (product(t)) {
+            std::vector<std::string> elements;
+            for (auto item : productTypes(t))
+                elements.push_back(defaultValue(item));
+            return productConstruct(t, elements);
+        }
+        if (family(t) == "_Swallow_assign")
+            return "new JppIgnore()";
         if (auto r = record(t); r && user(r))
             for (auto constructor : r->ctors())
                 if (constructor->isDefaultConstructor() && constructor->getNumParams()) {
@@ -1117,6 +1517,10 @@ class Emitter {
     std::string converted(std::string s, QualType from, QualType target) {
         from = clean(from);
         target = clean(target);
+        if (family(from) == "reference_wrapper" && family(target) != "reference_wrapper") {
+            s += ".get()";
+            from = clean(element(from));
+        }
         if (family(target) == "function" && !from->isNullPtrType() && type(from) != type(target)) {
             auto source = callableType(from), destination = callableType(target);
             if (source->getNumParams() != destination->getNumParams())
@@ -1163,12 +1567,8 @@ class Emitter {
                 line("return (" + type(target) + ") ((" + join(parameters) + ") -> " + body + ");");
             });
         }
-        if (family(from) == "pair" && family(target) == "pair" && !ctx.hasSameType(from, target)) {
-            auto first = temporary("jppFirst"), second = temporary("jppSecond");
-            return "Jpp.convertPair(" + s + ", " + first + " -> " +
-                   converted(first, element(from), element(target)) + ", " + second + " -> " +
-                   converted(second, element(from, 1), element(target, 1)) + ")";
-        }
+        if (product(target) && tupleLike(from) && !ctx.hasSameType(from, target))
+            return convertProduct(s, from, target);
         if (target->isBooleanType())
             return booleanValue(s, from);
         if (from->isCharType() && ctx.getTypeSize(from) == 8)
@@ -1221,6 +1621,14 @@ class Emitter {
         }
         if (target->isCharType() && ctx.getTypeSize(target) == 8)
             s = "(char)((int)(" + s + ") & 255)";
+        if (target->isIntegerType() && type(target) == "int" && ctx.getTypeSize(target) < 32 &&
+            !ctx.hasSameType(from, target)) {
+            auto width = ctx.getTypeSize(target);
+            if (target->isUnsignedIntegerType())
+                s = "((int)(" + s + ") & " + std::to_string((1ULL << width) - 1) + ")";
+            else
+                s = "(int)(" + std::string(width == 8 ? "byte" : "short") + ")(int)(" + s + ")";
+        }
         return s;
     }
     std::string value(const Expr* e, QualType target, bool copy = false) {
@@ -1406,6 +1814,35 @@ class Emitter {
                 if (referenceABI(f->getParamDecl(i)->getType()))
                     markReference(c->getArg(i + offset));
         }
+        if (auto call = dyn_cast<CallExpr>(s);
+            call && call->getDirectCallee() && !user(call->getDirectCallee())) {
+            auto method = call->getDirectCallee()->getNameAsString();
+            if (method == "tie" || method == "forward_as_tuple" || method == "ref" ||
+                method == "cref")
+                for (auto argument : call->arguments())
+                    markReference(argument);
+            if (method == "tuple_cat" || method == "apply" || method == "make_from_tuple")
+                markCapturedVariables(call);
+            if (method == "swap")
+                markCapturedVariables(call);
+            if (method == "emplace" || method == "emplace_back" || method == "emplace_front")
+                if (auto member = dyn_cast<CXXMemberCallExpr>(call)) {
+                    auto container = clean(member->getImplicitObjectArgument()->getType());
+                    if (container->isPointerType())
+                        container = container->getPointeeType();
+                    if (isVec(container) || family(container) == "deque" ||
+                        family(container) == "queue" || family(container) == "stack" ||
+                        family(container) == "priority_queue") {
+                        auto item = element(container);
+                        if (product(item)) {
+                            auto elements = productTypes(item);
+                            for (unsigned i = 0; i < call->getNumArgs() && i < elements.size(); ++i)
+                                if (elements[i]->isReferenceType())
+                                    markReference(call->getArg(i));
+                        }
+                    }
+                }
+        }
         if (auto c = dyn_cast<CXXOperatorCallExpr>(s); c && c->getOperator() == OO_Call)
             if (auto function = c->getDirectCallee())
                 for (unsigned i = 0; i < function->getNumParams() && i + 1 < c->getNumArgs(); ++i)
@@ -1416,6 +1853,14 @@ class Emitter {
                  ++i)
                 if (referenceABI(c->getConstructor()->getParamDecl(i)->getType()))
                     markReference(c->getArg(i));
+        if (auto constructor = dyn_cast<CXXConstructExpr>(s);
+            constructor && product(constructor->getType())) {
+            auto elements = productTypes(constructor->getType());
+            if (constructor->getNumArgs() == elements.size())
+                for (unsigned i = 0; i < elements.size(); ++i)
+                    if (elements[i]->isReferenceType())
+                        markReference(constructor->getArg(i));
+        }
         if (auto c = dyn_cast<CallExpr>(s);
             c && c->getDirectCallee() && c->getDirectCallee()->getNameAsString() == "getline" &&
             c->getNumArgs() >= 2 && isString(c->getArg(1)->getType())) {
@@ -1499,18 +1944,54 @@ class Emitter {
         if (auto function = call->getDirectCallee()) {
             if (user(function))
                 return referenceABI(function->getReturnType());
+            if (productGet(call))
+                return referenceABI(function->getReturnType());
+            if (function->getNameAsString() == "apply" ||
+                function->getNameAsString() == "make_from_tuple")
+                return referenceABI(function->getReturnType());
+            if (auto member = dyn_cast<CXXMemberCallExpr>(call);
+                member &&
+                (function->getNameAsString() == "get" || isa<CXXConversionDecl>(function)) &&
+                family(member->getImplicitObjectArgument()->getType()) == "reference_wrapper")
+                return referenceABI(function->getReturnType());
             if (auto op = dyn_cast<CXXOperatorCallExpr>(call);
                 op && op->getOperator() == OO_Call && op->getNumArgs() &&
-                family(op->getArg(0)->getType()) == "function")
+                (family(op->getArg(0)->getType()) == "function" ||
+                 family(op->getArg(0)->getType()) == "reference_wrapper"))
                 return referenceABI(function->getReturnType());
             return false;
         }
         return referenceABI(callableType(call->getCallee()->getType())->getReturnType());
     }
     std::string reference(const Expr* e) {
+        if (auto opaque = dyn_cast_or_null<OpaqueValueExpr>(bare(e));
+            opaque && opaqueReferences.count(opaque))
+            return opaqueReferences.at(opaque);
+        if (auto cast = dyn_cast_or_null<ExplicitCastExpr>(bare(e));
+            cast && cast->getCastKind() == CK_NoOp && cast->isGLValue())
+            return reference(cast->getSubExpr());
+        if (auto declaration = dyn_cast_or_null<DeclRefExpr>(bare(e));
+            declaration && isa<FunctionDecl>(declaration->getDecl()))
+            return "JppRef.object(" +
+                   functionPointer(cast<FunctionDecl>(declaration->getDecl()),
+                                   ctx.getPointerType(e->getType())) +
+                   ")";
         auto wrapped = referenceSource(e);
         if (isa<MaterializeTemporaryExpr>(wrapped))
             return "JppRef.cell(" + expr(e) + ")";
+        if (auto call = dyn_cast<CallExpr>(bare(e)); call && productGet(call))
+            return productReference(expr(call->getArg(0)), call->getArg(0)->getType(),
+                                    productIndex(call));
+        if (auto call = dyn_cast<CXXMemberCallExpr>(bare(e));
+            call && family(call->getImplicitObjectArgument()->getType()) == "reference_wrapper" &&
+            (call->getMethodDecl()->getNameAsString() == "get" ||
+             isa<CXXConversionDecl>(call->getMethodDecl())))
+            return expr(call->getImplicitObjectArgument());
+        if (auto assignment = dyn_cast<CXXOperatorCallExpr>(bare(e));
+            assignment && assignment->getOperator() == OO_Equal && assignment->getNumArgs() == 2 &&
+            product(assignment->getArg(0)->getType()))
+            return "JppRef.object(" + assignProduct(assignment->getArg(0), assignment->getArg(1)) +
+                   ")";
         if (auto call = dyn_cast<CallExpr>(bare(e)); call && returnsReference(call))
             return expression(call);
         if (auto compound = dyn_cast<CompoundAssignOperator>(bare(e)))
@@ -1601,6 +2082,10 @@ class Emitter {
             return "JppRef.at(" + arrayLocation(e) + ")";
         }
         if (auto v = variableRef(e)) {
+            if (!user(v) && v->getName() == "ignore")
+                return "JppRef.object(JppIgnore.INSTANCE)";
+            if (!user(v) && ordering(v->getType()))
+                return "JppRef.object(" + expr(e) + ")";
             if (!user(v) && stream(v->getType()))
                 return "JppRef.object(" + expr(e) + ")";
             if (cell(v)) {
@@ -1633,6 +2118,13 @@ class Emitter {
             dereference->getNumArgs() == 1 && isIter(dereference->getArg(0)->getType()))
             return "JppRef.at(" + expr(dereference->getArg(0)) + ")";
         if (auto m = dyn_cast<MemberExpr>(bare(e))) {
+            auto owner = m->getBase()->getType();
+            if (owner->isPointerType())
+                owner = owner->getPointeeType();
+            if (family(owner) == "pair" && (m->getMemberDecl()->getName() == "first" ||
+                                            m->getMemberDecl()->getName() == "second"))
+                return productReference(expr(m->getBase()) + (m->isArrow() ? ".get()" : ""), owner,
+                                        m->getMemberDecl()->getName() == "first" ? 0 : 1);
             auto base = isa<CXXThisExpr>(bare(m->getBase()))
                             ? (constructionThis.empty() ? "this" : constructionThis)
                             : expr(m->getBase());
@@ -1675,6 +2167,9 @@ class Emitter {
     }
     std::string arrayLocation(const Expr* input) {
         auto e = bare(input);
+        if (auto opaque = dyn_cast_or_null<OpaqueValueExpr>(e);
+            opaque && opaqueReferences.count(opaque))
+            return "(" + opaqueReferences.at(opaque) + ").pointer()";
         if (auto literal = dyn_cast<StringLiteral>(e)) {
             auto element = ctx.getAsArrayType(e->getType())->getElementType();
             if (!element->isCharType())
@@ -1744,7 +2239,14 @@ class Emitter {
             return "(" + s + ".good)";
         fail(SourceLocation(), "condition cannot be represented as a Java boolean");
     }
+    bool foldedCondition(const Expr* e, bool& value) {
+        return e && !e->HasSideEffects(ctx) && !expressionBounds(e, false) &&
+               e->EvaluateAsBooleanCondition(value, ctx);
+    }
     std::string truth(const Expr* e) {
+        bool value;
+        if (foldedCondition(e, value))
+            return value ? "true" : "false";
         e = strip(e);
         if (auto cast = dyn_cast<ImplicitCastExpr>(e)) {
             if (cast->getCastKind() == CK_IntegralToBoolean ||
@@ -1759,6 +2261,14 @@ class Emitter {
                 return result ? "true" : "false";
         }
         return booleanValue(expr(e), e->getType());
+    }
+    std::string loopCondition(const Expr* e) {
+        bool value;
+        // Java rejects a loop body guarded by a compile-time false expression.
+        // Unboxing Boolean.FALSE keeps the C++ body legal and never executes it.
+        if (foldedCondition(e, value) && !value)
+            return "Boolean.FALSE";
+        return truth(e);
     }
     std::string newArray(QualType t, const Expr* init, bool initializeObjects = true) {
         auto a = ctx.getAsArrayType(t);
@@ -1931,6 +2441,11 @@ class Emitter {
         return {};
     }
     std::string assign(const Expr* lhs, const std::string& rhs) {
+        if (auto opaque = dyn_cast_or_null<OpaqueValueExpr>(bare(lhs));
+            opaque && opaqueReferences.count(opaque))
+            return reference(lhs) + ".set(" + rhs + ")";
+        if (referenceMember(lhs))
+            return reference(lhs) + ".set(" + rhs + ")";
         if (auto call = dyn_cast<CallExpr>(bare(lhs)); call && returnsReference(call))
             return reference(lhs) + ".set(" + rhs + ")";
         if (isa<AbstractConditionalOperator>(bare(lhs)))
@@ -2026,18 +2541,17 @@ class Emitter {
     }
     std::string lessExpression(const std::string& left, QualType leftType, const std::string& right,
                                QualType rightType) {
+        if (family(leftType) == "reference_wrapper")
+            return lessExpression(left + ".get()", element(leftType), right, rightType);
+        if (family(rightType) == "reference_wrapper")
+            return lessExpression(left, leftType, right + ".get()", element(rightType));
         if (auto common = commonArithmeticType(leftType, rightType); !common.isNull())
             return arithmetic(converted(left, leftType, common), common,
                               converted(right, rightType, common), common, "<");
-        if (family(leftType) == "pair" && family(rightType) == "pair") {
-            auto first = lessExpression(left + ".first", element(leftType), right + ".first",
-                                        element(rightType));
-            auto reverse = lessExpression(right + ".first", element(rightType), left + ".first",
-                                          element(leftType));
-            auto second = lessExpression(left + ".second", element(leftType, 1), right + ".second",
-                                         element(rightType, 1));
-            return "(" + first + " || (!" + reverse + " && " + second + "))";
-        }
+        if (dataPointer(leftType) && dataPointer(rightType))
+            return "(Jpp.pointerDifference(" + left + ", " + right + ") < 0)";
+        if (product(leftType) && product(rightType))
+            return orderingExpression(left, leftType, right, rightType) + ".is_lt()";
         if ((isVec(leftType) || family(leftType) == "deque") &&
             (isVec(rightType) || family(rightType) == "deque"))
             return "Jpp.lexicographicalLess(" + left + ", " + right + ", " +
@@ -2049,6 +2563,94 @@ class Emitter {
                     return booleanValue(left + "." + name(method) + "(" + right + ")",
                                         method->getReturnType());
         return "(Jpp.compare(" + left + ", " + right + ") < 0)";
+    }
+    std::string equalExpression(const std::string& left, QualType leftType,
+                                const std::string& right, QualType rightType) {
+        if (family(leftType) == "reference_wrapper")
+            return equalExpression(left + ".get()", element(leftType), right, rightType);
+        if (family(rightType) == "reference_wrapper")
+            return equalExpression(left, leftType, right + ".get()", element(rightType));
+        if (ordering(leftType) && ordering(rightType))
+            return "(" + left + ".rank == " + right + ".rank)";
+        if (auto common = commonArithmeticType(leftType, rightType); !common.isNull())
+            return arithmetic(converted(left, leftType, common), common,
+                              converted(right, rightType, common), common, "==");
+        if (dataPointer(leftType) || dataPointer(rightType))
+            return "Jpp.samePointer(" + left + ", " + right + ")";
+        if (product(leftType) && product(rightType)) {
+            auto a = productTypes(leftType), b = productTypes(rightType);
+            if (homogeneousProduct(leftType) && homogeneousProduct(rightType)) {
+                auto x = temporary("jppLeft"), y = temporary("jppRight");
+                return "Jpp.equalProducts(" + left + ", " + right + ", (" + x + ", " + y + ") -> " +
+                       equalExpression("((" + boxed(a[0]) + ")" + x + ")", a[0],
+                                       "((" + boxed(b[0]) + ")" + y + ")", b[0]) +
+                       ")";
+            }
+            std::vector<std::string> checks;
+            for (unsigned i = 0; i < a.size(); ++i) {
+                QualType lhsType, rhsType;
+                auto lhs = productComparisonItem(left, leftType, i, lhsType);
+                auto rhs = productComparisonItem(right, rightType, i, rhsType);
+                checks.push_back(equalExpression(lhs, lhsType, rhs, rhsType));
+            }
+            return checks.empty() ? "true" : "(" + join(checks, " && ") + ")";
+        }
+        if ((isVec(leftType) || family(leftType) == "deque") &&
+            (isVec(rightType) || family(rightType) == "deque")) {
+            auto a = temporary("jppElement"), b = temporary("jppElement");
+            return "Jpp.sequenceEqual(" + left + ", " + right + ", (" + a + ", " + b + ") -> " +
+                   equalExpression(a, element(leftType), b, element(rightType)) + ")";
+        }
+        if (auto r = record(leftType); r && user(r))
+            for (auto method : r->methods())
+                if (method->isOverloadedOperator() &&
+                    method->getOverloadedOperator() == OO_EqualEqual)
+                    return booleanValue(left + "." + name(method) + "(" + right + ")",
+                                        method->getReturnType());
+        return "Jpp.valueEquals(" + left + ", " + right + ")";
+    }
+    std::string orderingExpression(const std::string& left, QualType leftType,
+                                   const std::string& right, QualType rightType) {
+        if (family(leftType) == "reference_wrapper")
+            return orderingExpression(left + ".get()", element(leftType), right, rightType);
+        if (family(rightType) == "reference_wrapper")
+            return orderingExpression(left, leftType, right + ".get()", element(rightType));
+        if (product(leftType) && product(rightType)) {
+            auto a = productTypes(leftType), b = productTypes(rightType);
+            auto x = temporary("jppLeft"), y = temporary("jppRight");
+            if (homogeneousProduct(leftType) && homogeneousProduct(rightType))
+                return "Jpp.orderProducts(" + left + ", " + right + ", (" + x + ", " + y + ") -> " +
+                       orderingExpression("((" + boxed(a[0]) + ")" + x + ")", a[0],
+                                          "((" + boxed(b[0]) + ")" + y + ")", b[0]) +
+                       ")";
+            std::string body;
+            for (unsigned i = 0; i < a.size(); ++i) {
+                auto order = temporary("jppOrder");
+                QualType lhsType, rhsType;
+                auto lhs = productComparisonItem(x, leftType, i, lhsType);
+                auto rhs = productComparisonItem(y, rightType, i, rhsType);
+                body += "JppOrdering " + order + " = " +
+                        orderingExpression(lhs, lhsType, rhs, rhsType) + "; if (" + order +
+                        ".rank != 0) return " + order + "; ";
+            }
+            return "Jpp.orderValues(" + left + ", " + right + ", (" + x + ", " + y + ") -> { " +
+                   body + "return JppOrdering.EQUIVALENT; })";
+        }
+        if (auto r = record(leftType); r && user(r))
+            for (auto method : r->methods())
+                if (method->isOverloadedOperator() &&
+                    method->getOverloadedOperator() == OO_Spaceship)
+                    return left + "." + name(method) + "(" + right + ")";
+        auto x = temporary("jppLeft"), y = temporary("jppRight");
+        auto less = lessExpression(x, leftType, y, rightType);
+        auto greater = lessExpression(y, rightType, x, leftType);
+        std::string otherwise = "JppOrdering.EQUIVALENT";
+        if (auto common = commonArithmeticType(leftType, rightType);
+            !common.isNull() && common->isRealFloatingType())
+            otherwise = equalExpression(x, leftType, y, rightType) +
+                        " ? JppOrdering.EQUIVALENT : JppOrdering.UNORDERED";
+        return "Jpp.orderValues(" + left + ", " + right + ", (" + x + ", " + y + ") -> " + less +
+               " ? JppOrdering.LESS : " + greater + " ? JppOrdering.GREATER : " + otherwise + ")";
     }
     std::string comparisonPredicate(QualType leftType, QualType rightType, bool reverse = false,
                                     QualType parameterType = {}) {
@@ -2149,6 +2751,7 @@ class Emitter {
             auto indexed = dyn_cast<ArraySubscriptExpr>(bare(lhs));
             bool javaLvalue =
                 dr || isa<MemberExpr>(bare(lhs)) || (indexed && javaArray(indexed->getBase()));
+            javaLvalue &= !referenceMember(lhs);
             if (javaLvalue && !t->isBooleanType() && !big(t) &&
                 ctx.hasSameType(t, clean(computeResult)) &&
                 !(t->isUnsignedIntegerType() && (op == "/" || op == "%"))) {
@@ -2165,6 +2768,50 @@ class Emitter {
                calculate(left, right) + ")";
     }
     std::string binary(const Expr* lhs, const Expr* rhs, std::string op, QualType result) {
+        if ((ordering(lhs->getType()) || ordering(rhs->getType())) && op != "=" && op != ",") {
+            bool left = ordering(lhs->getType()), right = ordering(rhs->getType());
+            if (left && right)
+                return "(" + expr(lhs) + ".rank " + op + " " + expr(rhs) + ".rank)";
+            auto value = expr(left ? lhs : rhs);
+            if (op == "<=>")
+                return left ? "jppCopy(" + value + ")" : value + ".reversed()";
+            if (!left) {
+                if (op == "<")
+                    op = ">";
+                else if (op == ">")
+                    op = "<";
+                else if (op == "<=")
+                    op = ">=";
+                else if (op == ">=")
+                    op = "<=";
+            }
+            return value + (op == "=="   ? ".is_eq()"
+                            : op == "!=" ? ".is_neq()"
+                            : op == "<"  ? ".is_lt()"
+                            : op == "<=" ? ".is_lteq()"
+                            : op == ">"  ? ".is_gt()"
+                                         : ".is_gteq()");
+        }
+        bool relation =
+            op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=";
+        if (product(lhs->getType()) && product(rhs->getType()) && (relation || op == "<=>")) {
+            auto left = expr(lhs), right = expr(rhs);
+            if (op == "<=>")
+                return orderingExpression(left, lhs->getType(), right, rhs->getType());
+            if (op == "==" || op == "!=") {
+                auto a = temporary("jppLeft"), b = temporary("jppRight");
+                return std::string(op == "!=" ? "!" : "") + "Jpp.testProducts(" + left + ", " +
+                       right + ", (" + a + ", " + b + ") -> " +
+                       equalExpression(a, lhs->getType(), b, rhs->getType()) + ")";
+            }
+            return orderingExpression(left, lhs->getType(), right, rhs->getType()) +
+                   (op == "<"    ? ".is_lt()"
+                    : op == "<=" ? ".is_lteq()"
+                    : op == ">"  ? ".is_gt()"
+                                 : ".is_gteq()");
+        }
+        if (op == "<=>")
+            return orderingExpression(expr(lhs), lhs->getType(), expr(rhs), rhs->getType());
         if ((chrono(lhs->getType()) || chrono(rhs->getType())) && op != "=" && op != ",") {
             bool leftPoint = family(lhs->getType()) == "time_point";
             bool rightPoint = family(rhs->getType()) == "time_point";
@@ -2234,6 +2881,8 @@ class Emitter {
             return ctx.getTypeSize(clean(result)) > 32 ? "(long)(" + difference + ")" : difference;
         }
         if (op == "=") {
+            if (product(lhs->getType()) && tupleLike(rhs->getType()))
+                return assignProduct(lhs, rhs);
             if (clean(lhs->getType())->isRecordType())
                 return "Jpp.assignRecord(" + value(rhs, lhs->getType(), false) + ", " +
                        reference(lhs) + ")";
@@ -2320,6 +2969,9 @@ class Emitter {
                 args.push_back(a);
         if (c->getConstructor()->isCopyOrMoveConstructor() && !args.empty()) {
             auto constructor = c->getConstructor();
+            if (product(t) && constructor->isMoveConstructor())
+                return convertProduct(expr(args[0]), args[0]->getType(), t, args[0]->getValueKind(),
+                                      c->getExprLoc());
             if (user(constructor) && !constructor->isImplicit() && !constructor->isDefaulted()) {
                 std::vector<std::string> bound;
                 for (unsigned i = 0; i < args.size(); ++i) {
@@ -2451,16 +3103,35 @@ class Emitter {
             return "Jpp.dequeDefault(" + intArgument(args[0]) + ", () -> " +
                    defaultValue(element(t)) + ")";
         }
-        if (n == "pair") {
-            if (args.size() == 1 && family(args[0]->getType()) == "pair")
-                return ctx.hasSameType(clean(args[0]->getType()), clean(t))
-                           ? "jppCopy(" + expr(args[0]) + ")"
-                           : converted(expr(args[0]), args[0]->getType(), t);
+        if (product(t)) {
+            auto elements = productTypes(t);
+            bool converting =
+                args.size() == 1 && tupleLike(args[0]->getType()) && elements.size() != 1;
+            if (args.size() == 1 && tupleLike(args[0]->getType()))
+                if (auto primary = c->getConstructor()->getPrimaryTemplate();
+                    primary && primary->getTemplatedDecl()->getNumParams()) {
+                    auto parameter = primary->getTemplatedDecl()
+                                         ->getParamDecl(0)
+                                         ->getType()
+                                         .getNonReferenceType();
+                    if (auto specialization = parameter->getAs<TemplateSpecializationType>())
+                        if (auto declaration =
+                                specialization->getTemplateName().getAsTemplateDecl())
+                            converting |= declaration->getName() == "tuple" ||
+                                          declaration->getName() == "pair";
+                }
+            if (converting)
+                return convertProduct(expr(args[0]), args[0]->getType(), t, args[0]->getValueKind(),
+                                      c->getExprLoc());
+            if (args.size() != elements.size())
+                fail(c, "this tuple constructor needs additional lowering");
             std::vector<std::string> a;
             for (unsigned i = 0; i < args.size(); ++i)
-                a.push_back(value(args[i], element(t, i), true));
-            return "new " + type(t) + "(" + join(a) + ")";
+                a.push_back(productArgument(args[i], elements[i]));
+            return productConstruct(t, a);
         }
+        if (n == "reference_wrapper")
+            return reference(args[0]);
         if (n == "function")
             return converted(expr(args[0]), args[0]->getType(), t);
         if (isIter(t))
@@ -2486,9 +3157,11 @@ class Emitter {
             if (range) {
                 auto source = iteratorElement(args[0]->getType());
                 auto entry = temporary("jppEntry");
-                auto pair = "new JppPair<" + boxed(element(t)) + ", " + boxed(element(t, 1)) +
-                            ">(" + converted(entry + ".first", element(source), element(t)) + ", " +
-                            converted(entry + ".second", element(source, 1), element(t, 1)) + ")";
+                auto pair =
+                    "new JppPair<" + boxed(element(t)) + ", " + boxed(element(t, 1)) + ">(" +
+                    converted(productRead(entry, source, 0), element(source), element(t)) + ", " +
+                    converted(productRead(entry, source, 1), element(source, 1), element(t, 1)) +
+                    ")";
                 return "Jpp.mapFrom(" + created + ", " + asIterator(args[0]) + ", " +
                        asIterator(args[1]) + ", " + entry + " -> " + pair + ")";
             }
@@ -2560,6 +3233,8 @@ class Emitter {
         auto result = value(e, target);
         if (!copyType(target))
             return result;
+        if (move && product(target))
+            return convertProduct(result, e->getType(), target, e->getValueKind(), e->getExprLoc());
         if (auto r = record(target); move && r && user(r))
             for (auto constructor : r->ctors())
                 if (constructor->isMoveConstructor() && !constructor->isImplicit() &&
@@ -2581,11 +3256,11 @@ class Emitter {
         if (!clean(target)->isRecordType() && args.size() == 1)
             return value(args[0], target, true);
         std::vector<std::string> values;
-        if (family(target) == "pair") {
-            if (args.size() == 1)
-                return value(args[0], target, true);
-            for (unsigned i = 0; i < args.size(); ++i)
-                values.push_back(value(args[i], element(target, i), true));
+        if (product(target)) {
+            std::vector<Expr*> arguments;
+            for (auto argument : args)
+                arguments.push_back(const_cast<Expr*>(argument));
+            return expr(resolveConstruction(target, arguments, args[0]->getExprLoc()));
         } else {
             auto r = record(target);
             const CXXConstructorDecl* constructor = nullptr;
@@ -2740,6 +3415,16 @@ class Emitter {
                 return object + "." + allocatedName + "(" + arguments(c, f) + ")";
             }
             auto n = me->getMemberDecl()->getNameAsString();
+            if (ordering(ot) && ordering(c->getType()) &&
+                isa<CXXConversionDecl>(me->getMemberDecl()))
+                return "jppCopy(" + expr(obj) + (me->isArrow() ? ".get()" : "") + ")";
+            if (family(ot) == "reference_wrapper" &&
+                (n == "get" || isa<CXXConversionDecl>(me->getMemberDecl()))) {
+                auto object = expr(obj) + (me->isArrow() ? ".get()" : "");
+                return referenceABI(f->getReturnType()) ? object : object + ".get()";
+            }
+            if (product(ot) && n == "swap")
+                return swapProduct(m->getImplicitObjectArgument(), c->getArg(0));
             if (chrono(ot)) {
                 auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
                 if (n == "count" || n == "time_since_epoch")
@@ -3217,16 +3902,109 @@ class Emitter {
             return "Jpp.trap()";
         if (n == "bit_cast")
             return bitCast(c->getArg(0), c->getType());
+        if (n == "tuple_cat")
+            return supplier([&] {
+                auto targets = productTypes(c->getType());
+                std::vector<std::string> values;
+                for (auto argument : c->arguments()) {
+                    if (!tupleLike(argument->getType()))
+                        fail(argument, "this tuple-like source needs additional lowering");
+                    auto object = temporary("jppTuple");
+                    line("final " + type(argument->getType()) + " " + object + " = " +
+                         expr(argument) + ";");
+                    auto elements = productTypes(argument->getType());
+                    for (unsigned i = 0; i < elements.size(); ++i) {
+                        auto element = productElement(object, argument->getType(), i,
+                                                      argument->getValueKind(), c->getExprLoc());
+                        values.push_back(productArgument(element, targets.at(values.size())));
+                    }
+                }
+                line("return " + productConstruct(c->getType(), values) + ";");
+            });
+        if (n == "apply" || n == "make_from_tuple")
+            return supplier([&] {
+                auto argument = c->getArg(n == "apply" ? 1 : 0);
+                if (!tupleLike(argument->getType()))
+                    fail(argument, "this tuple-like argument needs additional lowering");
+                auto tuple = temporary("jppTuple");
+                auto function = temporary("jppFunction");
+                if (n == "apply") {
+                    if (auto name = dyn_cast<DeclRefExpr>(bare(c->getArg(0)));
+                        name && isa<FunctionDecl>(name->getDecl()))
+                        line("final " + type(c->getArg(0)->getType()) + " " + function + " = " +
+                             functionPointer(cast<FunctionDecl>(name->getDecl()),
+                                             ctx.getPointerType(c->getArg(0)->getType())) +
+                             ";");
+                    else
+                        line("final " + type(c->getArg(0)->getType()) + " " + function + " = " +
+                             expr(c->getArg(0)) + ";");
+                }
+                line("final " + type(argument->getType()) + " " + tuple + " = " + expr(argument) +
+                     ";");
+                std::vector<Expr*> arguments;
+                for (unsigned i = 0; i < productTypes(argument->getType()).size(); ++i)
+                    arguments.push_back(productElement(tuple, argument->getType(), i,
+                                                       argument->getValueKind(), c->getExprLoc()));
+                Expr* invocation;
+                if (n == "apply") {
+                    auto callable = c->getArg(0);
+                    auto opaque =
+                        mappedValue(callable->getType(), callable->getValueKind(), function,
+                                    "JppRef.object(" + function + ")", c->getExprLoc());
+                    Sema::ContextRAII context(sema, ctx.getTranslationUnitDecl());
+                    auto resolved = sema.BuildCallExpr(nullptr, opaque, c->getExprLoc(), arguments,
+                                                       c->getExprLoc());
+                    if (resolved.isInvalid())
+                        fail(c, "cannot resolve this tuple invocation");
+                    invocation = resolved.get();
+                } else {
+                    auto target = f->getTemplateSpecializationArgs()->get(0).getAsType();
+                    invocation = resolveConstruction(target, arguments, c->getExprLoc());
+                }
+                if (c->getType()->isVoidType()) {
+                    expressionStatement(invocation);
+                    line("return null;");
+                } else
+                    line("return " +
+                         (referenceABI(f->getReturnType()) ? reference(invocation)
+                                                           : expr(invocation)) +
+                         ";");
+            });
         if (n == "__assert_fail")
             return "Jpp.assertFail()";
-        if (n == "make_pair")
-            return "new " + type(c->getType()) + "(" + arguments(c) + ")";
+        if (n == "make_pair" || n == "make_tuple" || n == "tie" || n == "forward_as_tuple") {
+            auto elements = productTypes(c->getType());
+            std::vector<std::string> values;
+            for (unsigned i = 0; i < c->getNumArgs(); ++i)
+                values.push_back(productArgument(c->getArg(i), elements[i]));
+            return productConstruct(c->getType(), values);
+        }
+        if (n == "ref" || n == "cref")
+            return family(c->getArg(0)->getType()) == "reference_wrapper" ? expr(c->getArg(0))
+                                                                          : reference(c->getArg(0));
+        if ((n == "is_eq" || n == "is_neq" || n == "is_lt" || n == "is_lteq" || n == "is_gt" ||
+             n == "is_gteq") &&
+            c->getNumArgs() == 1 && ordering(c->getArg(0)->getType()))
+            return expr(c->getArg(0)) + "." + n + "()";
+        if (productGet(c)) {
+            auto index = productIndex(c);
+            auto t = c->getArg(0)->getType();
+            return referenceABI(f->getReturnType()) ? productReference(expr(c->getArg(0)), t, index)
+                                                    : productRead(expr(c->getArg(0)), t, index);
+        }
+        if (n == "swap" && product(c->getArg(0)->getType()))
+            return swapProduct(c->getArg(0), c->getArg(1));
+        if (n == "swap" && ctx.getAsArrayType(c->getArg(0)->getType()))
+            return swapArrays(c->getArg(0), c->getArg(1));
         if (n == "swap" && isMap(c->getArg(0)->getType()))
             return expr(c->getArg(0)) + ".swap(" + expr(c->getArg(1)) + ")";
         if (n == "swap" && family(c->getArg(0)->getType()) == "deque")
             return expr(c->getArg(0)) + ".swap(" + expr(c->getArg(1)) + ")";
         if (n == "swap" && family(c->getArg(0)->getType()) == "bitset")
             return "JppBitset.swap(" + expr(c->getArg(0)) + ", " + expr(c->getArg(1)) + ")";
+        if (n == "swap")
+            if (auto r = record(c->getArg(0)->getType()); r && user(r))
+                return swapObjects(c->getArg(0), c->getArg(1));
         if (n == "swap")
             return "Jpp.swap(" + reference(c->getArg(0)) + ", " + reference(c->getArg(1)) + ")";
         if (n == "flush")
@@ -3579,6 +4357,9 @@ class Emitter {
         return exprValue(input);
     }
     std::string exprValue(const Expr* input) {
+        if (auto call = dyn_cast_or_null<CallExpr>(strip(input)); call && productGet(call))
+            return productRead(expr(call->getArg(0)), call->getArg(0)->getType(),
+                               productIndex(call));
         auto result = expression(input);
         if (auto call = dyn_cast_or_null<CallExpr>(strip(input)); call && returnsReference(call))
             result = "(" + result + ").get()";
@@ -3655,6 +4436,16 @@ class Emitter {
             auto d = x->getDecl();
             auto n = d->getNameAsString();
             if (!user(d)) {
+                if (n == "ignore")
+                    return "JppIgnore.INSTANCE";
+                if (ordering(d->getType())) {
+                    auto category = family(d->getType());
+                    category = category.substr(0, category.find('_'));
+                    std::transform(category.begin(), category.end(), category.begin(), ::toupper);
+                    auto value = n;
+                    std::transform(value.begin(), value.end(), value.begin(), ::toupper);
+                    return "JppOrdering." + category + "_" + value;
+                }
                 if (n == "cin")
                     return "jppIn";
                 if (n == "cout")
@@ -3838,6 +4629,9 @@ class Emitter {
                 return address(a);
             if (x->isIncrementDecrementOp()) {
                 int delta = x->isIncrementOp() ? 1 : -1;
+                if (referenceMember(a))
+                    return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
+                           (x->isPostfix() ? "true" : "false") + ")";
                 if (dataPointer(a->getType())) {
                     bool bytes = clean(a->getType())->getPointeeType()->isVoidType();
                     return std::string(bytes ? "Jpp.updateVoidPointer(" : "Jpp.updatePointer(") +
@@ -3920,8 +4714,13 @@ class Emitter {
                 base += ".get()";
             if (!user(x->getMemberDecl())) {
                 auto n = x->getMemberDecl()->getNameAsString();
-                if (n == "first" || n == "second")
-                    return base + "." + n;
+                if (n == "first" || n == "second") {
+                    auto owner = x->getBase()->getType();
+                    if (owner->isPointerType())
+                        owner = owner->getPointeeType();
+                    return family(owner) == "pair" ? productRead(base, owner, n == "first" ? 0 : 1)
+                                                   : base + "." + n;
+                }
                 if (n == "npos")
                     return "-1L";
                 fail(e, "unsupported library field " + n);
@@ -3930,6 +4729,27 @@ class Emitter {
         }
         if (auto x = dyn_cast<CXXOperatorCallExpr>(e)) {
             auto op = x->getOperator();
+            if (op == OO_Call && x->getNumArgs() &&
+                family(x->getArg(0)->getType()) == "reference_wrapper") {
+                auto object = x->getArg(0);
+                auto wrapper = expr(object);
+                auto callable = mappedValue(element(object->getType()), VK_LValue,
+                                            wrapper + ".get()", wrapper, x->getExprLoc());
+                std::vector<Expr*> arguments;
+                for (unsigned i = 1; i < x->getNumArgs(); ++i)
+                    arguments.push_back(const_cast<Expr*>(x->getArg(i)));
+                Sema::ContextRAII context(sema, ctx.getTranslationUnitDecl());
+                auto invocation = sema.BuildCallExpr(nullptr, callable, x->getExprLoc(), arguments,
+                                                     x->getExprLoc());
+                if (invocation.isInvalid())
+                    fail(x, "cannot resolve this reference-wrapper invocation");
+                return expression(invocation.get());
+            }
+            if (op == OO_Equal && x->getNumArgs() == 2 && product(x->getArg(0)->getType()))
+                return assignProduct(x->getArg(0), x->getArg(1));
+            if (op == OO_Equal && x->getNumArgs() == 2 &&
+                family(x->getArg(0)->getType()) == "_Swallow_assign")
+                return "Jpp.last(" + expr(x->getArg(1)) + ", " + expr(x->getArg(0)) + ")";
             if (auto function = x->getDirectCallee();
                 function && user(function) && !function->isImplicit() && !function->isDefaulted() &&
                 !(isa<CXXMethodDecl>(function) &&
@@ -4095,6 +4915,13 @@ class Emitter {
                 return defaultValue(t);
             if (ctx.getAsArrayType(t))
                 return newArray(t, x);
+            if (product(t)) {
+                auto elements = productTypes(t);
+                for (unsigned i = 0; i < elements.size(); ++i)
+                    a.push_back(i < x->getNumInits() ? productArgument(x->getInit(i), elements[i])
+                                                     : defaultValue(elements[i]));
+                return productConstruct(t, a);
+            }
             if (family(t) == "array") {
                 const InitListExpr* elements = x;
                 if (x->getNumInits() == 1)
@@ -4329,6 +5156,8 @@ class Emitter {
     }
     std::string bindingReference(const std::string& object, QualType t, unsigned index) {
         t = clean(t);
+        if (product(t))
+            return productReference(object, t, index);
         if (primitiveArray(t)) {
             auto item = ctx.getAsArrayType(t)->getElementType();
             return "JppRef.at(Jpp.<" + boxed(item) + ">arrayDecay(Jpp.arrayAddress(" + object +
@@ -4338,9 +5167,7 @@ class Emitter {
         if (ctx.getAsArrayType(t) || isVec(t))
             return "JppRef.at(" + object + ", " + std::to_string(index) + ")";
         std::string field;
-        if (family(t) == "pair")
-            field = index == 0 ? "first" : "second";
-        else if (auto r = record(t); r && user(r)) {
+        if (auto r = record(t); r && user(r)) {
             auto selected = r->field_begin();
             std::advance(selected, index);
             field = name(*selected);
@@ -4388,7 +5215,31 @@ class Emitter {
         if (auto op = dyn_cast<CXXOperatorCallExpr>(b))
             assignment =
                 op->getOperator() == OO_Equal || isCompoundAssignmentOperator(op->getOperator());
-        if (assignment && s.starts_with('('))
+        auto enclosed = [&] {
+            if (!s.starts_with('(') || !s.ends_with(')'))
+                return false;
+            unsigned depth = 0;
+            char quoted = 0;
+            bool escaped = false;
+            for (size_t i = 0; i < s.size(); ++i) {
+                auto c = s[i];
+                if (quoted) {
+                    if (escaped)
+                        escaped = false;
+                    else if (c == '\\')
+                        escaped = true;
+                    else if (c == quoted)
+                        quoted = 0;
+                } else if (c == '\'' || c == '"')
+                    quoted = c;
+                else if (c == '(')
+                    ++depth;
+                else if (c == ')' && --depth == 0 && i + 1 != s.size())
+                    return false;
+            }
+            return depth == 0 && !quoted;
+        };
+        while (assignment && enclosed())
             s = s.substr(1, s.size() - 2);
         if (assignment || e->getType()->isVoidType())
             return s;
@@ -4495,7 +5346,29 @@ class Emitter {
             call && call->getDirectCallee() && call->getDirectCallee()->isNoReturn())
             line("throw new IllegalStateException(\"C++ noreturn function returned\");");
     }
-    bool terminates(const Stmt* s) const {
+    bool escapesLoop(const Stmt* s) {
+        if (!s || isa<LambdaExpr>(s))
+            return false;
+        if (isa<BreakStmt>(s))
+            return true;
+        if (isa<ForStmt>(s) || isa<WhileStmt>(s) || isa<DoStmt>(s) || isa<CXXForRangeStmt>(s) ||
+            isa<SwitchStmt>(s))
+            return false;
+        if (auto branch = dyn_cast<IfStmt>(s)) {
+            if (branch->isConstexpr())
+                return escapesLoop(branch->getCond()->EvaluateKnownConstInt(ctx).getBoolValue()
+                                       ? branch->getThen()
+                                       : branch->getElse());
+            if (branch->isConsteval())
+                return escapesLoop(branch->isNegatedConsteval() ? branch->getThen()
+                                                                : branch->getElse());
+        }
+        for (auto child : s->children())
+            if (escapesLoop(child))
+                return true;
+        return false;
+    }
+    bool terminates(const Stmt* s) {
         if (!s)
             return false;
         if (isa<ReturnStmt>(s) || isa<CXXThrowExpr>(s) || isa<BreakStmt>(s) ||
@@ -4513,6 +5386,22 @@ class Emitter {
             return !b->body_empty() && terminates(b->body_back());
         if (auto i = dyn_cast<IfStmt>(s))
             return i->getElse() && terminates(i->getThen()) && terminates(i->getElse());
+        if (auto loop = dyn_cast<ForStmt>(s)) {
+            bool condition = true;
+            return (!loop->getCond() ||
+                    (foldedCondition(loop->getCond(), condition) && condition)) &&
+                   !escapesLoop(loop->getBody());
+        }
+        if (auto loop = dyn_cast<WhileStmt>(s)) {
+            bool condition;
+            return foldedCondition(loop->getCond(), condition) && condition &&
+                   !escapesLoop(loop->getBody());
+        }
+        if (auto loop = dyn_cast<DoStmt>(s)) {
+            bool condition;
+            return foldedCondition(loop->getCond(), condition) && condition &&
+                   !escapesLoop(loop->getBody());
+        }
         return false;
     }
     void bodyStatements(const CompoundStmt* body, bool returnValue = false) {
@@ -4734,7 +5623,7 @@ class Emitter {
         if (auto w = dyn_cast<WhileStmt>(s)) {
             if (w->getConditionVariable())
                 fail(s, "while condition declarations are not supported");
-            line("while (" + truth(w->getCond()) + ")");
+            line("while (" + loopCondition(w->getCond()) + ")");
             block(w->getBody());
             return;
         }
@@ -4750,8 +5639,8 @@ class Emitter {
                     v && !isa<DecompositionDecl>(v)) {
                     auto declaration = variable(v);
                     auto inc = f->getInc() ? statementValue(f->getInc()) : "";
-                    line("for (" + declaration + "; " + (f->getCond() ? truth(f->getCond()) : "") +
-                         "; " + inc + ")");
+                    line("for (" + declaration + "; " +
+                         (f->getCond() ? loopCondition(f->getCond()) : "") + "; " + inc + ")");
                     block(f->getBody());
                     return;
                 }
@@ -4772,8 +5661,8 @@ class Emitter {
                     increments.push_back(statementValue(e));
             };
             inc(f->getInc());
-            line("for (; " + (f->getCond() ? truth(f->getCond()) : "") + "; " + join(increments) +
-                 ")");
+            line("for (; " + (f->getCond() ? loopCondition(f->getCond()) : "") + "; " +
+                 join(increments) + ")");
             block(f->getBody());
             --indent;
             line("}");
@@ -5303,7 +6192,8 @@ class Emitter {
     }
 
   public:
-    Emitter(ASTContext& c, const Options& o) : ctx(c), options(o), sm(c.getSourceManager()) {}
+    Emitter(ASTContext& c, Sema& s, const Options& o)
+        : ctx(c), sema(s), options(o), sm(c.getSourceManager()) {}
     std::string generate() {
         collect(ctx.getTranslationUnitDecl());
         for (auto f : functions) {
@@ -5388,6 +6278,7 @@ class Emitter {
                        : "") +
                  " }");
         }
+        out << tupleDefinitions();
         if (main) {
             line("public static void main(String[] args) {");
             ++indent;
@@ -5432,6 +6323,12 @@ class Emitter {
                              (t->isReferenceType() ? "false" : "true") + ");\n";
         }
         std::string layouts;
+        for (const auto& [references, name] : productReferenceKinds) {
+            std::vector<std::string> values;
+            for (bool reference : references)
+                values.push_back(reference ? "true" : "false");
+            layouts += "static final boolean[] " + name + " = {" + join(values) + "};\n";
+        }
         for (const auto& [name, initializer] : arrayLayoutFields)
             layouts += "static final JppMemoryType " + name + " = " + initializer + ";\n";
         for (const auto& [bytes, name] : literalArrays)
@@ -5446,17 +6343,19 @@ class Emitter {
 };
 
 class Consumer final : public ASTConsumer {
+    CompilerInstance& compiler;
     const Options& opt;
     std::string& output;
     bool& success;
 
   public:
-    Consumer(const Options& o, std::string& s, bool& b) : opt(o), output(s), success(b) {}
+    Consumer(CompilerInstance& c, const Options& o, std::string& s, bool& b)
+        : compiler(c), opt(o), output(s), success(b) {}
     void HandleTranslationUnit(ASTContext& ctx) override {
         if (ctx.getDiagnostics().hasErrorOccurred())
             return;
         try {
-            output = Emitter(ctx, opt).generate();
+            output = Emitter(ctx, compiler.getSema(), opt).generate();
             success = true;
         } catch (const Unsupported&) {
             success = false;
@@ -5471,8 +6370,9 @@ class Action final : public ASTFrontendAction {
 
   public:
     Action(const Options& o, std::string& s, bool& b) : opt(o), output(s), success(b) {}
-    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, llvm::StringRef) override {
-        return std::make_unique<Consumer>(opt, output, success);
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance& compiler,
+                                                   llvm::StringRef) override {
+        return std::make_unique<Consumer>(compiler, opt, output, success);
     }
 };
 class Factory final : public tooling::FrontendActionFactory {

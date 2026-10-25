@@ -215,33 +215,92 @@ static <T> T jppCopy(T value) {
     return value;
 }
 
-static class JppPair<A, B> implements Comparable<JppPair<A, B>>, JppAssignable<JppPair<A, B>> {
+interface JppProduct {
+    int arity();
+    boolean binding(int index);
+    Object raw(int index);
+    void raw(int index, Object value);
+    String memberName(int index);
+}
+
+static class JppIgnore implements JppAssignable<JppIgnore> {
+    static final JppIgnore INSTANCE = new JppIgnore();
+    public JppIgnore copy() { return new JppIgnore(); }
+    public JppIgnore jppAssignFrom(JppIgnore other) { return this; }
+}
+
+static class JppOrdering implements JppAssignable<JppOrdering> {
+    int rank;
+    private JppOrdering(int rank) { this.rank = rank; }
+    public JppOrdering copy() { return new JppOrdering(rank); }
+    public JppOrdering jppAssignFrom(JppOrdering source) { rank = source.rank; return this; }
+    JppOrdering reversed() { return new JppOrdering(rank == 2 ? 2 : -rank); }
+    static final JppOrdering LESS = new JppOrdering(-1), EQUIVALENT = new JppOrdering(0),
+                             GREATER = new JppOrdering(1), UNORDERED = new JppOrdering(2);
+    static final JppOrdering STRONG_LESS = new JppOrdering(-1), STRONG_EQUAL = new JppOrdering(0),
+                             STRONG_EQUIVALENT = new JppOrdering(0), STRONG_GREATER = new JppOrdering(1);
+    static final JppOrdering WEAK_LESS = new JppOrdering(-1), WEAK_EQUIVALENT = new JppOrdering(0),
+                             WEAK_GREATER = new JppOrdering(1);
+    static final JppOrdering PARTIAL_LESS = new JppOrdering(-1), PARTIAL_EQUIVALENT = new JppOrdering(0),
+                             PARTIAL_GREATER = new JppOrdering(1), PARTIAL_UNORDERED = new JppOrdering(2);
+    boolean is_eq() { return rank == 0; }
+    boolean is_neq() { return rank != 0; }
+    boolean is_lt() { return rank == -1; }
+    boolean is_lteq() { return rank == -1 || rank == 0; }
+    boolean is_gt() { return rank == 1; }
+    boolean is_gteq() { return rank == 0 || rank == 1; }
+}
+
+static class JppPair<A, B> implements Comparable<JppPair<A, B>>, JppAssignable<JppPair<A, B>>, JppProduct {
     A first;
     B second;
+    final boolean[] referenceKinds;
     JppPair(A a, B b) {
+        this(null, a, b);
+    }
+    JppPair(boolean[] referenceKinds, A a, B b) {
+        this.referenceKinds = referenceKinds;
         first = a;
         second = b;
     }
     public JppPair<A, B> copy() {
-        return new JppPair<A, B>(jppCopy(first), jppCopy(second));
+        return new JppPair<A, B>(referenceKinds, jppCopy(first), jppCopy(second));
     }
     public JppPair<A, B> jppAssignFrom(JppPair<A, B> source) {
-        first = Jpp.assignValue(first, source.first);
-        second = Jpp.assignValue(second, source.second);
+        first = (A)Jpp.assignProductField(first, Jpp.productValue(source, 0), binding(0));
+        second = (B)Jpp.assignProductField(second, Jpp.productValue(source, 1), binding(1));
         return this;
     }
+    public int arity() { return 2; }
+    public boolean binding(int index) { return referenceKinds != null && referenceKinds[index]; }
+    public String memberName(int index) { return index == 0 ? "first" : "second"; }
+    public Object raw(int index) {
+        switch (index) {
+        case 0: return first;
+        case 1: return second;
+        default: throw new IndexOutOfBoundsException();
+        }
+    }
+    public void raw(int index, Object value) {
+        switch (index) {
+        case 0: first = (A)value; return;
+        case 1: second = (B)value; return;
+        default: throw new IndexOutOfBoundsException();
+        }
+    }
     public int compareTo(JppPair<A, B> other) {
-        int c = Jpp.compare(first, other.first);
-        return c != 0 ? c : Jpp.compare(second, other.second);
+        int c = Jpp.compare(Jpp.productValue(this, 0), Jpp.productValue(other, 0));
+        return c != 0 ? c : Jpp.compare(Jpp.productValue(this, 1), Jpp.productValue(other, 1));
     }
     public boolean equals(Object o) {
         if (!(o instanceof JppPair))
             return false;
         JppPair<?, ?> p = (JppPair<?, ?>)o;
-        return Objects.equals(first, p.first) && Objects.equals(second, p.second);
+        return Jpp.valueEquals(Jpp.productValue(this, 0), Jpp.productValue(p, 0)) &&
+            Jpp.valueEquals(Jpp.productValue(this, 1), Jpp.productValue(p, 1));
     }
     public int hashCode() {
-        return Objects.hash(first, second);
+        return 31 * Jpp.valueHash(Jpp.productValue(this, 0)) + Jpp.valueHash(Jpp.productValue(this, 1));
     }
 }
 
@@ -3027,6 +3086,88 @@ static final JppOutput jppOut = new JppOutput(System.out),
                       jppLog = new JppOutput(jppErr);
 
 static class Jpp {
+    static Object productValue(JppProduct product, int index) {
+        Object value = product.raw(index);
+        return product.binding(index) ? ((JppRef<?>)value).get() : value;
+    }
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    static Object assignProductField(Object target, Object value, boolean reference) {
+        if (reference) {
+            JppRef binding = (JppRef)target;
+            binding.set(assignProductField(binding.get(), value, false));
+            return target;
+        }
+        if (target instanceof JppIgnore)
+            return target;
+        return assignValue(target, value);
+    }
+    static void storeProductField(JppProduct product, int index, Object value) {
+        product.raw(index, assignProductField(product.raw(index), value, product.binding(index)));
+    }
+    @SuppressWarnings("unchecked")
+    static <T> JppRef<T> productReference(JppProduct product, int index) {
+        Object value = product.raw(index);
+        if (product.binding(index))
+            return (JppRef<T>)value;
+        return JppRef.of(() -> (T)product.raw(index), v -> product.raw(index, v),
+                         product, product.memberName(index));
+    }
+    static <T> JppRef<T> arrayReference(JppRef<T> reference, JppMemoryType type, boolean littleEndian) {
+        return JppRef.of(reference::get, reference::set,
+                         () -> Jpp.<T>typedPointer(reference.pointer(), type, littleEndian));
+    }
+    static <S, T> T assignProduct(S source, T target, java.util.function.BiConsumer<S, T> assign) {
+        assign.accept(source, target);
+        return target;
+    }
+    static <S, T> T convertProduct(S source, java.util.function.Function<S, T> convert) {
+        return convert.apply(source);
+    }
+    static <A, B> boolean testProducts(A left, B right, java.util.function.BiPredicate<A, B> test) {
+        return test.test(left, right);
+    }
+    static <A, B> JppOrdering orderValues(A left, B right,
+            java.util.function.BiFunction<A, B, JppOrdering> compare) {
+        return compare.apply(left, right).copy();
+    }
+    static boolean equalProducts(JppProduct left, JppProduct right,
+            java.util.function.BiPredicate<Object, Object> equal) {
+        for (int i = 0; i < left.arity(); ++i)
+            if (!equal.test(productValue(left, i), productValue(right, i))) return false;
+        return true;
+    }
+    static JppOrdering orderProducts(JppProduct left, JppProduct right,
+            java.util.function.BiFunction<Object, Object, JppOrdering> compare) {
+        for (int i = 0; i < left.arity(); ++i) {
+            JppOrdering result = compare.apply(productValue(left, i), productValue(right, i));
+            if (result.rank != 0) return result;
+        }
+        return JppOrdering.EQUIVALENT.copy();
+    }
+    static <A, B> boolean sequenceEqual(List<A> left, List<B> right,
+            java.util.function.BiPredicate<A, B> equal) {
+        if (left.size() != right.size()) return false;
+        for (int i = 0; i < left.size(); ++i)
+            if (!equal.test(left.get(i), right.get(i))) return false;
+        return true;
+    }
+    static boolean valueEquals(Object left, Object right) {
+        if ((left instanceof Float || left instanceof Double) && right instanceof Number)
+            return ((Number)left).doubleValue() == ((Number)right).doubleValue();
+        if (left instanceof List && right instanceof List) {
+            List<?> a = (List<?>)left, b = (List<?>)right;
+            if (a.size() != b.size()) return false;
+            for (int i = 0; i < a.size(); ++i)
+                if (!valueEquals(a.get(i), b.get(i))) return false;
+            return true;
+        }
+        return Objects.equals(left, right);
+    }
+    static int valueHash(Object value) {
+        if (value instanceof Double && (Double)value == 0.0) return 0;
+        if (value instanceof Float && (Float)value == 0.0f) return 0;
+        return Objects.hashCode(value);
+    }
     static int stringSize(long size) {
         if (Long.compareUnsigned(size, Integer.MAX_VALUE) > 0)
             throw new IllegalArgumentException("string length exceeds Java's limit");

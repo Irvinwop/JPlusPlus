@@ -29,6 +29,7 @@ Your algorithm stays in ordinary Java methods. `vector<T>` becomes `ArrayList<T>
 | `vector<int> scores;` | `ArrayList<Integer> scores = new ArrayList<Integer>();` |
 | `scores.push_back(value);` | `scores.add(value);` |
 | `scores[i]` | `scores.get(i)` |
+| `get<0>(edge)` | `edge.item0` for a value tuple |
 | `long long answer` | `long answer` |
 | `int values[n];` | `int[] values = new int[n];` |
 | `__builtin_popcountll(mask)` | `Long.bitCount(mask)` |

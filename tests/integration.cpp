@@ -178,6 +178,14 @@ int main() {
         cases.emplace_back("array_literals", expressions.str());
         cases.emplace_back("vla_bounds", expressions.str());
         cases.emplace_back("vla_types", expressions.str());
+        cases.emplace_back("tuples", expressions.str());
+        cases.emplace_back("tuple_references", expressions.str());
+        cases.emplace_back("tuple_wrappers", expressions.str());
+        cases.emplace_back("tuple_ordering", expressions.str());
+        cases.emplace_back("tuple_calls", expressions.str());
+        cases.emplace_back("tuple_objects", expressions.str());
+        cases.emplace_back("tuple_large", expressions.str());
+        cases.emplace_back("loop_reachability", expressions.str());
         cases.emplace_back("chrono", expressions.str());
         cases.emplace_back("frontend_arrays", "");
 #ifdef JPP_TEST_GNU_FRONTEND
@@ -370,7 +378,9 @@ int main() {
                 must({JPP_BINARY, source, "-t", "-v", "j" + std::to_string(release), "-o",
                       (p / "Main.java").string()},
                      p / "empty");
-                if (read(p / "Main.java").size() > 200000)
+                // The deliberate 201-field case has a larger typed class definition.
+                auto sourceLimit = name == "tuple_large" ? 300000U : 200000U;
+                if (read(p / "Main.java").size() > sourceLimit)
                     throw std::runtime_error("unexpectedly large output for " + name);
                 for (const auto& javac : javacs) {
                     bool ecj = fs::path(javac).filename().string().find("ecj") != std::string::npos;
