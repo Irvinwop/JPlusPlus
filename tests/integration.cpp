@@ -46,7 +46,7 @@ void write(const fs::path& p, const std::string& s) {
 }
 
 int process(const std::vector<std::string>& args, const fs::path& input, const fs::path& output,
-            const fs::path& errors) {
+            const fs::path& errors, const fs::path& directory = {}) {
     pid_t pid = fork();
     if (pid < 0)
         throw std::runtime_error("fork");
@@ -56,6 +56,8 @@ int process(const std::vector<std::string>& args, const fs::path& input, const f
             out = open(output.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600),
             err = open(errors.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (in < 0 || out < 0 || err < 0)
+            _exit(125);
+        if (!directory.empty() && chdir(directory.c_str()))
             _exit(125);
         dup2(in, 0);
         dup2(out, 1);
@@ -103,7 +105,7 @@ int main() {
         write(p / "empty", "");
         int checks = 0;
         auto must = [&](const std::vector<std::string>& args, const fs::path& input) {
-            int code = process(args, input, p / "stdout", p / "stderr");
+            int code = process(args, input, p / "stdout", p / "stderr", p);
             if (code) {
                 std::ostringstream s;
                 s << "command failed (" << code << "): ";
@@ -168,8 +170,33 @@ int main() {
             library << r(200001) - 100000 << ' ';
         library << '\n';
         cases.emplace_back("library", library.str());
+        cases.emplace_back("files", library.str());
+        cases.emplace_back("redirect", library.str());
         cases.emplace_back("algorithms", sequence.str());
         cases.emplace_back("conversions", "-9 4 1\n");
+        cases.emplace_back("sequencing", "37\n");
+        std::ostringstream formatted;
+        formatted << 25 << '\n';
+        for (int i = 0; i < 25; ++i)
+            formatted << r(20001) - 10000 << ',' << static_cast<unsigned>(random()) << ' '
+                      << static_cast<long long>(r(200001) - 100000) * 1000000007LL << ' '
+                      << (r(20001) - 10000) * 0.25 << " cat @ abc\n";
+        formatted << "-017 0x2a 37 999Q";
+        cases.emplace_back("formatted", formatted.str());
+        std::vector<std::string> tokens = {
+            "0 -2147483648", "0 2147483648", "0 -2147483649", "0 +", "0 e",
+            "1 -9223372036854775808", "1 9223372036854775808", "1 -9223372036854775809",
+            "2 4294967295", "2 4294967296", "2 -1", "3 18446744073709551615",
+            "3 18446744073709551616", "3 -1", "4 -32768", "4 32768", "5 65535",
+            "5 65536", "5 -1", "6 -1.25", "6 1e+2", "6 1e+", "6 0x1.8p1",
+            "6 inf", "6 .", "6 1e999", "6 1e-999", "7 0.100000001490116119384765625",
+            "7 1e100", "8 0", "8 1", "8 2", "8 -1"};
+        std::ostringstream inputCases;
+        inputCases << "-9 17 42\n" << tokens.size() << '\n';
+        for (const auto& token : tokens)
+            inputCases << token << "Q\n";
+        inputCases << "first\rline\nlast without newline";
+        cases.emplace_back("input", inputCases.str());
         write(p / "LibraryDriver.java", "import java.util.*; public class LibraryDriver {"
                                         "public static void main(String[] args) {"
                                         "Scanner in = new Scanner(System.in); int n = in.nextInt();"
@@ -200,6 +227,7 @@ int main() {
         for (const auto& [name, input] : cases) {
             auto source = (fs::path(JPP_SOURCE) / "tests/fixtures" / (name + ".cpp")).string();
             write(p / "input", input);
+            write(p / "jpp-redirect.in", input);
             auto nativeSource =
                 name == "library"
                     ? (fs::path(JPP_SOURCE) / "tests/fixtures/library_driver.cpp").string()
@@ -208,6 +236,11 @@ int main() {
                  p / "empty");
             must({(p / "native").string()}, p / "input");
             auto expected = read(p / "stdout");
+            std::map<std::string, std::string> expectedFiles;
+            for (const auto& output : name == "files"      ? std::vector<std::string>{"jpp-io-global.txt"}
+                                      : name == "redirect" ? std::vector<std::string>{"jpp-redirect.out"}
+                                                           : std::vector<std::string>{})
+                expectedFiles.emplace(output, read(p / output));
             // Generate once per requested Java release, then compile with each independent
             // compiler.
             for (int release : {8, 17, 21}) {
@@ -240,6 +273,8 @@ int main() {
                     for (const auto& java : javas) {
                         if (release > runtimeVersions[java])
                             continue;
+                        for (const auto& [file, contents] : expectedFiles)
+                            fs::remove(p / file);
                         must({java, "-cp", classes.string(),
                               name == "library" ? "LibraryDriver" : "Main"},
                              p / "input");
@@ -249,6 +284,10 @@ int main() {
                                                      javac + ", " + java + "\nexpected:\n" +
                                                      expected.substr(0, 1000) + "\nactual:\n" +
                                                      read(p / "stdout").substr(0, 1000));
+                        for (const auto& [file, contents] : expectedFiles)
+                            if (!fs::exists(p / file) || read(p / file) != contents)
+                                throw std::runtime_error("file output differs from native C++: " +
+                                                         name + ", " + file);
                         ++checks;
                     }
                 }

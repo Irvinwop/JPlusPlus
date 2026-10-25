@@ -6,6 +6,10 @@ Randomized inputs have a fixed seed so failures can be reproduced. Fixtures exer
 
 Algorithm and conversion fixtures exercise reference callbacks, returned stateful function objects, generic comparators, overlapping backward copies, cross-type output iterators, pair conversions, conditional lvalues, emplacement, and map/set merging. Library translation units without `main` are checked using separate native and Java drivers that call the translated methods.
 
+File fixtures run in an isolated working directory and compare both console output and files against native C++. They cover I/O during global initialization, closing on return, append mode, stream conditions, missing files, and C stream redirection. Formatted I/O fixtures cover unsigned boundaries, assignment counts, field widths, scansets, suppressed conversions, `%n`, matching failures, and EOF. Sequencing fixtures exercise void calls in comma expressions and conditional branches with mutable locals.
+
+Extraction regressions compare signed and unsigned integer limits, narrow integer overflow, boolean failure states, floating prefixes and overflow, unchanged destinations after failure, and source/destination expressions with side effects. Line-reading cases include carriage returns and a final line without a newline.
+
 ## Cross-compiler and cross-VM checks
 
 The local torture matrix has been exercised with these independent compilers and runtimes:

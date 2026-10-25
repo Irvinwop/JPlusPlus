@@ -242,6 +242,9 @@ static class JppIter<T> implements JppCopyable<JppIter<T>> {
     final List<T> list;
     int pos;
     final int step;
+    JppIter() {
+        this(null, 0, 1);
+    }
     JppIter(List<T> values, int index, int direction) {
         list = values;
         pos = index;
@@ -642,16 +645,85 @@ static class JppHeap<T> implements JppCopyable<JppHeap<T>> {
     }
 }
 
-static class JppInput {
-    private final InputStream input = System.in;
+static class JppInput implements AutoCloseable {
+    private InputStream input;
     private final byte[] buffer = new byte[1 << 16];
     private int pos, size, saved = -2;
-    boolean good = true;
+    boolean good = true, ended;
+    JppInput() {
+        this(System.in);
+    }
+    JppInput(InputStream stream) {
+        input = stream;
+    }
+    JppInput(String path) {
+        this(path, 8);
+    }
+    JppInput(String path, int mode) {
+        if (path != null)
+            open(path, mode);
+    }
+    void open(String path) {
+        open(path, 8);
+    }
+    void open(String path, int mode) {
+        if (input != null) {
+            good = false;
+            return;
+        }
+        try {
+            input = new FileInputStream(path);
+            pos = size = 0;
+            saved = -2;
+            good = true;
+            ended = false;
+        } catch (IOException e) {
+            good = false;
+        }
+    }
+    boolean is_open() {
+        return input != null;
+    }
+    public void close() {
+        if (input == null) {
+            good = false;
+            return;
+        }
+        try {
+            input.close();
+        } catch (IOException e) {
+            good = false;
+        }
+        input = null;
+    }
+    void clear() {
+        good = true;
+        ended = false;
+    }
+    JppInput ignore() {
+        return ignore(1, -1);
+    }
+    JppInput ignore(long count) {
+        return ignore(count, -1);
+    }
+    JppInput ignore(long count, int delimiter) {
+        if (good)
+            while (count-- > 0) {
+                int c = readByte();
+                if (c < 0 || c == delimiter)
+                    break;
+            }
+        return this;
+    }
     private int readByte() {
         if (saved != -2) {
             int c = saved;
             saved = -2;
             return c;
+        }
+        if (input == null) {
+            good = false;
+            return -1;
         }
         if (pos >= size) {
             try {
@@ -660,8 +732,10 @@ static class JppInput {
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
-            if (size < 0)
+            if (size < 0) {
+                ended = true;
                 return -1;
+            }
         }
         return buffer[pos++] & 255;
     }
@@ -669,7 +743,7 @@ static class JppInput {
         int c;
         do {
             c = readByte();
-        } while (c >= 0 && c <= 32);
+        } while (c == ' ' || (c >= 9 && c <= 13));
         return c;
     }
     boolean hasNext() {
@@ -679,39 +753,105 @@ static class JppInput {
         return good;
     }
     long nextLong() {
+        return nextLong(0);
+    }
+    long nextLong(long previous) {
+        return nextInteger(previous, 64, false);
+    }
+    long nextUnsignedLong(long previous) {
+        return nextInteger(previous, 64, true);
+    }
+    private long nextInteger(long previous, int bits, boolean unsigned) {
+        if (!good)
+            return previous;
         int c = skip();
         if (c < 0) {
             good = false;
-            return 0;
+            return previous;
         }
         boolean neg = c == '-';
         if (neg || c == '+')
             c = readByte();
+        long maximum = unsigned ? bits == 64 ? -1L : (1L << bits) - 1
+                                : bits == 64 ? Long.MAX_VALUE : (1L << (bits - 1)) - 1;
+        long bound = !unsigned && neg ? maximum + 1 : maximum;
+        long quotient = Long.divideUnsigned(bound, 10), remainder = Long.remainderUnsigned(bound, 10);
         long n = 0;
+        boolean digits = false, overflow = false;
         while (c >= '0' && c <= '9') {
-            n = n * 10 + c - '0';
+            digits = true;
+            int digit = c - '0';
+            if (Long.compareUnsigned(n, quotient) > 0 || (n == quotient && digit > remainder))
+                overflow = true;
+            if (!overflow)
+                n = n * 10 + digit;
             c = readByte();
         }
         saved = c;
-        return neg ? -n : n;
+        if (!digits) {
+            good = false;
+            return 0;
+        }
+        if (overflow) {
+            good = false;
+            return unsigned || !neg ? maximum : -bound;
+        }
+        long value = neg ? -n : n;
+        return unsigned && bits < 64 ? value & ((1L << bits) - 1) : value;
     }
     int nextInt() {
-        return (int)nextLong();
+        return nextInt(0);
+    }
+    int nextInt(int previous) {
+        return (int)nextInteger(previous, 32, false);
+    }
+    int nextUnsignedInt(int previous) {
+        return (int)nextInteger(previous, 32, true);
+    }
+    int nextShort(int previous) {
+        return (int)nextInteger(previous, 16, false);
+    }
+    int nextUnsignedShort(int previous) {
+        return (int)nextInteger(previous, 16, true);
+    }
+    int nextByte(int previous) {
+        return (int)nextInteger(previous, 8, false);
+    }
+    int nextUnsignedByte(int previous) {
+        return (int)nextInteger(previous, 8, true);
+    }
+    boolean nextBoolean(boolean previous) {
+        long value = nextLong(previous ? 1 : 0);
+        if (value != 0 && value != 1)
+            good = false;
+        return value != 0;
     }
     char nextChar() {
-        int c = skip();
-        if (c < 0)
-            good = false;
-        return (char)c;
+        return nextChar('\0');
     }
-    JppString nextString() {
+    char nextChar(char previous) {
+        if (!good)
+            return previous;
         int c = skip();
         if (c < 0) {
             good = false;
-            return new JppString();
+            return previous;
+        }
+        return (char)c;
+    }
+    JppString nextString() {
+        return nextString(new JppString());
+    }
+    JppString nextString(JppString previous) {
+        if (!good)
+            return previous;
+        int c = skip();
+        if (c < 0) {
+            good = false;
+            return previous;
         }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        while (c > 32) {
+        while (c >= 0 && c != ' ' && (c < 9 || c > 13)) {
             bytes.write(c);
             c = readByte();
         }
@@ -720,30 +860,334 @@ static class JppInput {
             new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8));
     }
     double nextDouble() {
-        return Double.parseDouble(nextString().toString());
+        return nextDouble(0);
+    }
+    private String floatingToken() {
+        if (!good)
+            return null;
+        int c = skip();
+        if (c < 0) {
+            good = false;
+            return null;
+        }
+        StringBuilder text = new StringBuilder();
+        if (c == '+' || c == '-') {
+            text.append((char)c);
+            c = readByte();
+        }
+        boolean point = false, exponent = false, exponentSign = false, digits = false;
+        while (c >= 0) {
+            if (c >= '0' && c <= '9') {
+                exponentSign = false;
+                digits = true;
+            } else if (c == '.' && !point && !exponent)
+                point = true;
+            else if ((c == 'e' || c == 'E') && !exponent && digits) {
+                exponent = true;
+                exponentSign = true;
+            } else if ((c == '+' || c == '-') && exponentSign)
+                exponentSign = false;
+            else
+                break;
+            text.append((char)c);
+            c = readByte();
+        }
+        saved = c;
+        return text.toString();
+    }
+    double nextDouble(double previous) {
+        String token = floatingToken();
+        if (token == null)
+            return previous;
+        try {
+            double value = Double.parseDouble(token);
+            if (Double.isInfinite(value)) {
+                good = false;
+                return Math.copySign(Double.MAX_VALUE, value);
+            }
+            return value;
+        } catch (NumberFormatException e) {
+            good = false;
+            return 0;
+        }
+    }
+    float nextFloat(float previous) {
+        String token = floatingToken();
+        if (token == null)
+            return previous;
+        try {
+            float value = Float.parseFloat(token);
+            if (Float.isInfinite(value)) {
+                good = false;
+                return Math.copySign(Float.MAX_VALUE, value);
+            }
+            return value;
+        } catch (NumberFormatException e) {
+            good = false;
+            return 0;
+        }
     }
     JppString line() {
+        return line(new JppString(), '\n');
+    }
+    JppString line(JppString previous, int delimiter) {
+        if (!good || ended) {
+            good = false;
+            return previous;
+        }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         int c;
-        while ((c = readByte()) >= 0 && c != '\n')
-            if (c != '\r')
-                bytes.write(c);
-        if (c < 0)
+        while ((c = readByte()) >= 0 && c != delimiter)
+            bytes.write(c);
+        if (c < 0 && bytes.size() == 0)
             good = false;
         return new JppString(
             new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8));
     }
 }
 
-static class JppOutput {
-    private final PrintWriter output;
+interface JppScanTarget {
+    void accept(String text, int radix, char conversion);
+}
+
+static class JppScanner {
+    static final java.util.regex.Pattern floating = java.util.regex.Pattern.compile(
+        "[+-]?(?:(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+        + "|0x(?:[0-9a-f]+(?:\\.[0-9a-f]*)?|\\.[0-9a-f]+)(?:p[+-]?[0-9]+)?"
+        + "|inf(?:inity)?|nan)", java.util.regex.Pattern.CASE_INSENSITIVE);
+    final JppInput input;
+    int consumed;
+    JppScanner(JppInput source) {
+        input = source;
+    }
+    int read() {
+        int c = input.readByte();
+        if (c >= 0)
+            ++consumed;
+        return c;
+    }
+    void unread(int c) {
+        input.saved = c;
+        if (c >= 0)
+            --consumed;
+    }
+    static boolean space(int c) {
+        return c == 32 || (c >= 9 && c <= 13);
+    }
+    int skip() {
+        int c;
+        do {
+            c = read();
+        } while (space(c));
+        return c;
+    }
+    static double parseFloating(String text) {
+        String lower = text.toLowerCase(Locale.ROOT);
+        if (lower.equals("nan") || lower.equals("+nan") || lower.equals("-nan"))
+            return Double.NaN;
+        if (lower.matches("[+-]?inf(?:inity)?"))
+            return lower.startsWith("-") ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
+        if (lower.indexOf("0x") >= 0 && lower.indexOf('p') < 0)
+            text += "p0";
+        return Double.parseDouble(text);
+    }
+    int scan(String format, JppScanTarget... targets) {
+        int assigned = 0, argument = 0;
+        for (int at = 0; at < format.length();) {
+            char spec = format.charAt(at++);
+            if (space(spec)) {
+                int c = skip();
+                unread(c);
+                continue;
+            }
+            if (spec != '%') {
+                int c = read();
+                if (c != spec) {
+                    unread(c);
+                    return c < 0 && assigned == 0 ? -1 : assigned;
+                }
+                continue;
+            }
+            if (format.charAt(at) == '%') {
+                ++at;
+                int c = read();
+                if (c != '%') {
+                    unread(c);
+                    return c < 0 && assigned == 0 ? -1 : assigned;
+                }
+                continue;
+            }
+            boolean suppressed = format.charAt(at) == '*';
+            if (suppressed)
+                ++at;
+            int width = 0;
+            while (at < format.length() && Character.isDigit(format.charAt(at)))
+                width = width * 10 + format.charAt(at++) - '0';
+            if (width == 0)
+                width = Integer.MAX_VALUE;
+            String length = "";
+            while (at < format.length() && "hljztL".indexOf(format.charAt(at)) >= 0)
+                length += format.charAt(at++);
+            spec = format.charAt(at++);
+            if (spec == 'n') {
+                if (!suppressed)
+                    targets[argument++].accept(Integer.toString(consumed), 10, spec);
+                continue;
+            }
+            String set = "";
+            boolean inverse = false;
+            if (spec == '[') {
+                inverse = format.charAt(at) == '^';
+                if (inverse)
+                    ++at;
+                if (format.charAt(at) == ']')
+                    set += format.charAt(at++);
+                while (at < format.length() && format.charAt(at) != ']')
+                    set += format.charAt(at++);
+                ++at;
+            }
+            if (length.indexOf('l') >= 0 && (spec == 's' || spec == 'c' || spec == '['))
+                throw new UnsupportedOperationException("wide-character scanf conversion");
+            int c = spec == 'c' || spec == '[' ? read() : skip();
+            if (c < 0)
+                return assigned == 0 ? -1 : assigned;
+            StringBuilder text = new StringBuilder();
+            int radix = 10;
+            if (spec == 's' || spec == 'c' || spec == '[') {
+                if (spec == 'c' && width == Integer.MAX_VALUE)
+                    width = 1;
+                while (c >= 0 && width > 0) {
+                    boolean take = spec == 'c' || (spec == 's' && !space(c));
+                    if (spec == '[') {
+                        boolean found = false;
+                        for (int i = 0; i < set.length(); ++i) {
+                            if (i + 2 < set.length() && set.charAt(i + 1) == '-') {
+                                found |= c >= set.charAt(i) && c <= set.charAt(i + 2);
+                                i += 2;
+                            } else
+                                found |= c == set.charAt(i);
+                        }
+                        take = found != inverse;
+                    }
+                    if (!take)
+                        break;
+                    text.append((char)c);
+                    --width;
+                    if (width == 0) {
+                        c = -2;
+                        break;
+                    }
+                    c = read();
+                }
+                if (c != -2)
+                    unread(c);
+            } else if ("diuoxX".indexOf(spec) >= 0) {
+                radix = spec == 'o' ? 8 : spec == 'x' || spec == 'X' ? 16 : 10;
+                boolean negative = c == '-';
+                if (negative || c == '+') {
+                    if (negative)
+                        text.append('-');
+                    --width;
+                    c = width > 0 ? read() : -2;
+                }
+                if (width > 0 && c == '0' && (spec == 'i' || radix == 16)) {
+                    text.append('0');
+                    --width;
+                    c = width > 0 ? read() : -2;
+                    if (width > 0 && (c == 'x' || c == 'X')) {
+                        radix = 16;
+                        --width;
+                        c = width > 0 ? read() : -2;
+                    } else if (spec == 'i')
+                        radix = 8;
+                }
+                while (width > 0 && c >= 0 && Character.digit((char)c, radix) >= 0) {
+                    text.append((char)c);
+                    --width;
+                    c = width > 0 ? read() : -2;
+                }
+                if (c != -2)
+                    unread(c);
+                if (text.length() == 1 && text.charAt(0) == '-')
+                    text.setLength(0);
+            } else if ("aAeEfFgG".indexOf(spec) >= 0) {
+                while (c >= 0 && width > 0) {
+                    String candidate = text.toString() + (char)c;
+                    java.util.regex.Matcher match = floating.matcher(candidate);
+                    if (!match.matches() && !match.hitEnd())
+                        break;
+                    text.append((char)c);
+                    --width;
+                    c = width > 0 ? read() : -2;
+                }
+                if (c != -2)
+                    unread(c);
+                if (!floating.matcher(text).matches())
+                    return assigned;
+            } else
+                throw new UnsupportedOperationException("scanf conversion: " + spec);
+            if (text.length() == 0)
+                return assigned;
+            if (!suppressed) {
+                targets[argument++].accept(text.toString(), radix, spec);
+                ++assigned;
+            }
+        }
+        return assigned;
+    }
+}
+
+static class JppOutput implements AutoCloseable {
+    private PrintWriter output;
     int precision = 6;
-    boolean fixed, boolalpha;
+    boolean fixed, boolalpha, good = true, ended;
     JppOutput(OutputStream stream) {
         output = new PrintWriter(new BufferedWriter(
             new OutputStreamWriter(stream, java.nio.charset.StandardCharsets.UTF_8)));
     }
+    JppOutput(String path) {
+        this(path, 16);
+    }
+    JppOutput(String path, int mode) {
+        if (path != null)
+            open(path, mode);
+    }
+    void open(String path) {
+        open(path, 16);
+    }
+    void open(String path, int mode) {
+        if (output != null) {
+            good = false;
+            return;
+        }
+        try {
+            output = new PrintWriter(new BufferedWriter(new OutputStreamWriter(
+                new FileOutputStream(path, (mode & 1) != 0),
+                java.nio.charset.StandardCharsets.UTF_8)));
+            good = true;
+        } catch (IOException e) {
+            good = false;
+        }
+    }
+    boolean is_open() {
+        return output != null;
+    }
+    public void close() {
+        if (output == null) {
+            good = false;
+            return;
+        }
+        output.close();
+        if (output.checkError())
+            good = false;
+        output = null;
+    }
+    void clear() {
+        good = true;
+    }
     JppOutput print(Object value) {
+        if (!good || output == null)
+            return this;
         if (value instanceof Boolean)
             output.print(boolalpha ? value : ((Boolean)value ? 1 : 0));
         else if (value instanceof Double || value instanceof Float) {
@@ -768,7 +1212,11 @@ static class JppOutput {
         return this;
     }
     JppOutput flush() {
-        output.flush();
+        if (output != null) {
+            output.flush();
+            if (output.checkError())
+                good = false;
+        }
         return this;
     }
     JppOutput endl() {
@@ -788,14 +1236,136 @@ static class JppOutput {
         return this;
     }
     int printf(String format, Object... args) {
-        format = format.replaceAll("%([0-9.+\\-# ]*)ll([diuoxX])", "%$1$2")
-                     .replace("%ld", "%d")
-                     .replace("%zu", "%d")
-                     .replace("%Lf", "%f")
-                     .replace("%u", "%d");
-        String text = String.format(Locale.ROOT, format, args);
+        if (!good || output == null)
+            return -1;
+        StringBuilder result = new StringBuilder();
+        int argument = 0;
+        for (int at = 0; at < format.length();) {
+            char c = format.charAt(at++);
+            if (c != '%') {
+                result.append(c);
+                continue;
+            }
+            if (format.charAt(at) == '%') {
+                result.append('%');
+                ++at;
+                continue;
+            }
+            String flags = "";
+            while (at < format.length() && "-+ #0".indexOf(format.charAt(at)) >= 0)
+                flags += format.charAt(at++);
+            int width = 0;
+            if (format.charAt(at) == '*') {
+                width = ((Number)args[argument++]).intValue();
+                ++at;
+                if (width < 0) {
+                    flags += '-';
+                    width = -width;
+                }
+            } else
+                while (at < format.length() && Character.isDigit(format.charAt(at)))
+                    width = width * 10 + format.charAt(at++) - '0';
+            int precision = -1;
+            if (format.charAt(at) == '.') {
+                ++at;
+                precision = 0;
+                if (format.charAt(at) == '*') {
+                    precision = ((Number)args[argument++]).intValue();
+                    ++at;
+                } else
+                    while (at < format.length() && Character.isDigit(format.charAt(at)))
+                        precision = precision * 10 + format.charAt(at++) - '0';
+            }
+            String length = "";
+            while (at < format.length() && "hljztL".indexOf(format.charAt(at)) >= 0)
+                length += format.charAt(at++);
+            c = format.charAt(at++);
+            Object value = args[argument++];
+            String text;
+            boolean left = flags.indexOf('-') >= 0;
+            if ("diuoxX".indexOf(c) >= 0) {
+                int bits = length.equals("hh") ? 8 : length.equals("h") ? 16
+                    : length.isEmpty() ? 32 : 64;
+                long raw = value instanceof Character ? (Character)value : ((Number)value).longValue();
+                boolean signed = c == 'd' || c == 'i';
+                BigInteger number;
+                if (signed) {
+                    if (bits < 64) {
+                        int shift = 64 - bits;
+                        raw = (raw << shift) >> shift;
+                    }
+                    number = BigInteger.valueOf(raw);
+                } else
+                    number = bits == 64 ? new BigInteger(Long.toUnsignedString(raw))
+                                        : BigInteger.valueOf(raw & ((1L << bits) - 1));
+                int radix = c == 'o' ? 8 : c == 'x' || c == 'X' ? 16 : 10;
+                String digits = number.abs().toString(radix);
+                if (c == 'X')
+                    digits = digits.toUpperCase(Locale.ROOT);
+                if (precision == 0 && number.signum() == 0)
+                    digits = "";
+                while (digits.length() < precision)
+                    digits = '0' + digits;
+                String prefix = number.signum() < 0 ? "-" : signed && flags.indexOf('+') >= 0 ? "+"
+                    : signed && flags.indexOf(' ') >= 0 ? " " : "";
+                if (flags.indexOf('#') >= 0) {
+                    if (radix == 16 && number.signum() != 0)
+                        prefix += c == 'X' ? "0X" : "0x";
+                    if (radix == 8 && !digits.startsWith("0"))
+                        digits = '0' + digits;
+                }
+                if (!left && precision < 0 && flags.indexOf('0') >= 0)
+                    while (prefix.length() + digits.length() < width)
+                        digits = '0' + digits;
+                text = prefix + digits;
+            } else if (c == 's') {
+                text = Jpp.cString(value);
+                if (precision >= 0 && text.length() > precision)
+                    text = text.substring(0, precision);
+            } else if (c == 'c') {
+                int code = value instanceof Character ? (Character)value : ((Number)value).intValue();
+                text = Character.toString((char)(code & 255));
+            } else if (c == 'n') {
+                int count = result.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+                Object countValue = length.isEmpty() || length.equals("h") || length.equals("hh")
+                    ? (Object)Integer.valueOf(count) : (Object)Long.valueOf(count);
+                ((JppRef)value).set(countValue);
+                continue;
+            } else if ("aAeEfFgG".indexOf(c) >= 0) {
+                String javaFlags = "";
+                for (char flag : new char[]{'-', '+', ' ', '#', '0'})
+                    if (flags.indexOf(flag) >= 0 && !(flag == ' ' && flags.indexOf('+') >= 0)
+                        && !(flag == '0' && left) && !(flag == '#' && (c == 'g' || c == 'G')))
+                        javaFlags += flag;
+                String pattern = "%" + javaFlags + (width > 0 ? width : "")
+                    + (precision >= 0 ? "." + ((c == 'g' || c == 'G') ? Math.max(1, precision) : precision) : "") + c;
+                text = String.format(Locale.ROOT, pattern, ((Number)value).doubleValue());
+                if ((c == 'g' || c == 'G') && flags.indexOf('#') < 0) {
+                    int exp = Math.max(text.indexOf('e'), text.indexOf('E'));
+                    String tail = exp < 0 ? "" : text.substring(exp);
+                    String head = exp < 0 ? text : text.substring(0, exp);
+                    if (head.indexOf('.') >= 0) {
+                        while (head.endsWith("0"))
+                            head = head.substring(0, head.length() - 1);
+                        if (head.endsWith("."))
+                            head = head.substring(0, head.length() - 1);
+                    }
+                    text = head + tail;
+                }
+            } else
+                throw new UnsupportedOperationException("printf conversion: " + c);
+            int padding = Math.max(0, width - text.length());
+            if (!left)
+                while (padding-- > 0)
+                    result.append(' ');
+            result.append(text);
+            if (left)
+                while (padding-- > 0)
+                    result.append(' ');
+        }
+        String text = result.toString();
         output.print(text);
-        return text.length();
+        return text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
     }
 }
 
@@ -803,6 +1373,72 @@ static final JppInput jppIn = new JppInput();
 static final JppOutput jppOut = new JppOutput(System.out), jppErr = new JppOutput(System.err);
 
 static class Jpp {
+    static <T> T extract(JppInput source, JppRef<T> destination,
+                         java.util.function.BiFunction<JppInput, T, T> reader) {
+        return destination.set(reader.apply(source, destination.get()));
+    }
+    static char[] charArray(String value, int size) {
+        return Arrays.copyOf(value.toCharArray(), size);
+    }
+    static String cString(Object value) {
+        if (value instanceof char[]) {
+            char[] chars = (char[])value;
+            int length = 0;
+            while (length < chars.length && chars[length] != '\0')
+                ++length;
+            return new String(chars, 0, length);
+        }
+        return value.toString();
+    }
+    static <T> T sequence(java.util.function.Supplier<T> action) {
+        return action.get();
+    }
+    static JppScanTarget scanInt(JppRef<Integer> target, int bits, boolean unsigned) {
+        return (text, radix, conversion) -> {
+            int value = new BigInteger(text, radix).intValue();
+            if (bits < 32) {
+                int shift = 32 - bits;
+                value = unsigned ? value & (int)((1L << bits) - 1)
+                                 : (value << shift) >> shift;
+            }
+            target.set(value);
+        };
+    }
+    static JppScanTarget scanLong(JppRef<Long> target) {
+        return (text, radix, conversion) -> target.set(new BigInteger(text, radix).longValue());
+    }
+    static JppScanTarget scanFloat(JppRef<Float> target) {
+        return (text, radix, conversion) -> target.set((float)JppScanner.parseFloating(text));
+    }
+    static JppScanTarget scanDouble(JppRef<Double> target) {
+        return (text, radix, conversion) -> target.set(JppScanner.parseFloating(text));
+    }
+    static JppScanTarget scanChar(JppRef<Character> target) {
+        return (text, radix, conversion) -> target.set(conversion == 'c' ? text.charAt(0)
+            : (char)new BigInteger(text, radix).intValue());
+    }
+    static JppScanTarget scanChars(char[] target) {
+        return (text, radix, conversion) -> {
+            for (int i = 0; i < text.length(); ++i)
+                target[i] = text.charAt(i);
+            if (conversion != 'c')
+                target[text.length()] = '\0';
+        };
+    }
+    static JppInput reopenInput(JppInput stream, String path, String mode) {
+        if (!mode.startsWith("r"))
+            throw new UnsupportedOperationException("input freopen mode: " + mode);
+        stream.close();
+        stream.open(path);
+        return stream.good ? stream : null;
+    }
+    static JppOutput reopenOutput(JppOutput stream, String path, String mode) {
+        if (!mode.startsWith("w") && !mode.startsWith("a"))
+            throw new UnsupportedOperationException("output freopen mode: " + mode);
+        stream.close();
+        stream.open(path, mode.startsWith("a") ? 17 : 16);
+        return stream.good ? stream : null;
+    }
     static <T> T append(List<T> values, T value) {
         values.add(value);
         return value;
@@ -1259,8 +1895,8 @@ static class Jpp {
     static int ignore(Object... values) {
         return 0;
     }
-    static boolean input(Object... values) {
-        return jppIn.good;
+    static JppInput input(JppInput source, Object... values) {
+        return source;
     }
     static <T> T last(Object unused, T result) {
         return result;

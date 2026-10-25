@@ -8,6 +8,9 @@ if(LLVM_VERSION_MAJOR LESS 18)
 endif()
 find_package(Clang REQUIRED CONFIG HINTS "${LLVM_INSTALL_PREFIX}/lib/cmake/clang")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/runtime/Runtime.java" JPP_RUNTIME)
+# The emitted source is formatted separately. Strip indentation in the embedded copy
+# to keep the C++ string literal within the standard's required supported length.
+string(REGEX REPLACE "\n[ \t]+" "\n" JPP_RUNTIME "${JPP_RUNTIME}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS runtime/Runtime.java)
 configure_file(src/runtime.hpp.in generated/runtime.hpp @ONLY)
 add_executable(jpp src/main.cpp src/transpiler.cpp)
