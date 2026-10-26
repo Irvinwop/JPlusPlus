@@ -678,6 +678,19 @@ class Emitter {
     bool isString(QualType t) const {
         return family(t) == "basic_string" || family(t) == "basic_string_view";
     }
+    bool jumpBuffer(QualType t) const {
+        auto r = record(t);
+        return r && !user(r) && r->getQualifiedNameAsString() == "__jmp_buf_tag";
+    }
+    const CallExpr* checkpoint(const Stmt* statement) const {
+        auto e = dyn_cast_or_null<Expr>(statement);
+        auto call = e ? dyn_cast<CallExpr>(bare(e)) : nullptr;
+        auto function = call ? call->getDirectCallee() : nullptr;
+        if (!function || user(function) || call->getNumArgs() != 1)
+            return nullptr;
+        auto n = function->getNameAsString();
+        return n == "_setjmp" || n == "setjmp" ? call : nullptr;
+    }
     bool bitReference(QualType t) const {
         auto r = record(t);
         if (!r || user(r) || r->getName() != "reference")
@@ -1620,6 +1633,8 @@ class Emitter {
             return "JppPtr<" + (p->isVoidType() ? std::string("?") : boxed(p)) + ">";
         }
         auto n = family(t);
+        if (jumpBuffer(t))
+            return "JppJumpBuffer";
         if (iotaView(t))
             return "JppIota<" + boxed(iotaElement(t)) + ">";
         if (iotaPositionOwner(t))
@@ -4590,6 +4605,11 @@ class Emitter {
             });
         if (n == "__assert_fail")
             return "Jpp.assertFail()";
+        if (n == "_setjmp" || n == "setjmp")
+            fail(c, "this setjmp context needs additional continuation lowering");
+        if (n == "longjmp" || n == "_longjmp")
+            return "Jpp.longJump(" + expr(c->getArg(0)) + ", " + value(c->getArg(1), ctx.IntTy) +
+                   ")";
         if (n == "make_pair" || n == "make_tuple" || n == "tie" || n == "forward_as_tuple") {
             auto elements = productTypes(c->getType());
             std::vector<std::string> values;
@@ -6207,12 +6227,42 @@ class Emitter {
         }
         return false;
     }
-    void bodyStatements(const CompoundStmt* body, bool returnValue = false) {
+    void requireCheckpointFlow(const Stmt* statement, unsigned loops = 0, unsigned breaks = 0) {
+        if (!statement || isa<LambdaExpr>(statement))
+            return;
+        if ((isa<BreakStmt>(statement) && !breaks) || (isa<ContinueStmt>(statement) && !loops) ||
+            isa<GotoStmt>(statement) || (isa<SwitchCase>(statement) && !breaks))
+            fail(statement, "this control-flow exit around setjmp needs additional lowering");
+        if (auto branch = dyn_cast<IfStmt>(statement)) {
+            if (branch->isConstexpr()) {
+                requireCheckpointFlow(branch->getCond()->EvaluateKnownConstInt(ctx).getBoolValue()
+                                          ? branch->getThen()
+                                          : branch->getElse(),
+                                      loops, breaks);
+                return;
+            }
+            if (branch->isConsteval()) {
+                requireCheckpointFlow(branch->isNegatedConsteval() ? branch->getThen()
+                                                                   : branch->getElse(),
+                                      loops, breaks);
+                return;
+            }
+        }
+        if (isa<ForStmt>(statement) || isa<WhileStmt>(statement) || isa<DoStmt>(statement) ||
+            isa<CXXForRangeStmt>(statement)) {
+            ++loops;
+            ++breaks;
+        } else if (isa<SwitchStmt>(statement))
+            ++breaks;
+        for (auto child : statement->children())
+            requireCheckpointFlow(child, loops, breaks);
+    }
+    bool bodyStatements(const CompoundStmt* body, bool returnValue = false, size_t first = 0) {
         struct Exit {
             const LabelDecl* label;
             size_t begin, end;
         };
-        std::vector<const Stmt*> statements(body->body_begin(), body->body_end());
+        std::vector<const Stmt*> statements(body->body_begin() + first, body->body_end());
         std::vector<Exit> exits;
         for (size_t target = 0; target < statements.size(); ++target) {
             auto label = dyn_cast<LabelStmt>(statements[target]);
@@ -6273,6 +6323,39 @@ class Emitter {
                 dead = false;
             if (dead)
                 continue;
+            if (auto saved = checkpoint(child)) {
+                if (returnValue || !exits.empty())
+                    fail(child, "this setjmp context needs additional continuation lowering");
+                for (size_t suffix = i + 1; suffix < statements.size(); ++suffix)
+                    requireCheckpointFlow(statements[suffix]);
+                auto target = temporary("jppCheckpoint"), jump = temporary("jppJump");
+                line("final JppJumpTarget " + target + " = Jpp.checkpoint(" +
+                     expr(saved->getArg(0)) + ");");
+                line("try {");
+                ++indent;
+                line("while (true) {");
+                ++indent;
+                line("try {");
+                ++indent;
+                dead = bodyStatements(body, false, first + i + 1);
+                if (!dead)
+                    line("break;");
+                --indent;
+                line("} catch (JppLongJump " + jump + ") {");
+                ++indent;
+                line("if (" + jump + ".target != " + target + ") throw " + jump + ";");
+                --indent;
+                line("}");
+                --indent;
+                line("}");
+                --indent;
+                line("} finally {");
+                ++indent;
+                line(target + ".active = false;");
+                --indent;
+                line("}");
+                break;
+            }
             if (returnValue && i + 1 == statements.size())
                 if (auto e = dyn_cast<Expr>(child); e && !e->getType()->isVoidType()) {
                     line("return " + value(e, e->getType(), true) + ";");
@@ -6320,6 +6403,7 @@ class Emitter {
             line("}");
         }
         jumpLabels = std::move(previousLabels);
+        return dead;
     }
     void block(const Stmt* s) {
         line("{");

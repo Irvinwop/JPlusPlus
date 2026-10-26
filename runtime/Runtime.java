@@ -9,6 +9,24 @@ interface JppAssignable<T> extends JppCopyable<T> {
 interface JppUninitialized {}
 interface JppMove {}
 
+static class JppJumpTarget {
+    boolean active = true;
+}
+
+static class JppJumpBuffer {
+    JppJumpTarget target;
+}
+
+static class JppLongJump extends Error {
+    final JppJumpTarget target;
+    final int value;
+    JppLongJump(JppJumpTarget target, int value) {
+        super(null, null, false, false);
+        this.target = target;
+        this.value = value == 0 ? 1 : value;
+    }
+}
+
 // Clone the callable's Java class, then give its owned captures independent cells.
 static abstract class JppClosure<F> implements JppCopyable<F>, java.lang.Cloneable {
     protected abstract void jppCopyCaptures();
@@ -5099,6 +5117,17 @@ static class Jpp {
         JppOrderSet<T> temporary = first.copy();
         first.jppAssignFrom(second);
         second.jppAssignFrom(temporary);
+    }
+    static JppJumpTarget checkpoint(JppPtr<JppJumpBuffer> buffer) {
+        JppJumpTarget target = new JppJumpTarget();
+        buffer.get().target = target;
+        return target;
+    }
+    static void longJump(JppPtr<JppJumpBuffer> buffer, int value) {
+        JppJumpTarget target = buffer.get().target;
+        if (target == null || !target.active)
+            throw new IllegalStateException("longjmp requires a live C++ checkpoint");
+        throw new JppLongJump(target, value);
     }
     static <T> JppSet<T> setFrom(JppSet<T> destination, JppIter<T> first, JppIter<T> last) {
         for (JppIter<T> position = first.plus(0); !position.same(last); position.advance(1))

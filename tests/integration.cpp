@@ -159,6 +159,7 @@ int main() {
         for (int i = 0; i < 2000; ++i)
             policyOperations << r(8) << ' ' << r(401) - 200 << '\n';
         cases.emplace_back("pbds", policyOperations.str());
+        cases.emplace_back("checkpoints", "31\n");
         cases.emplace_back("cpp23", "-9\n");
         std::ostringstream bits;
         bits << 70 << '\n';
