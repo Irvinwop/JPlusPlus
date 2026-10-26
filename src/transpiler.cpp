@@ -435,6 +435,7 @@ class Emitter {
     std::unordered_map<const ValueDecl*, std::string> aliases;
     std::unordered_map<const OpaqueValueExpr*, std::string> opaqueValues;
     std::unordered_map<const OpaqueValueExpr*, std::string> opaqueReferences;
+    std::unordered_map<const CallExpr*, std::string> checkpointValues;
     std::unordered_map<const Expr*, std::string> arrayBounds;
     std::unordered_set<const CXXBindTemporaryExpr*> localInitializers;
     std::unordered_set<const CXXRecordDecl*> byteRecords;
@@ -682,14 +683,44 @@ class Emitter {
         auto r = record(t);
         return r && !user(r) && r->getQualifiedNameAsString() == "__jmp_buf_tag";
     }
-    const CallExpr* checkpoint(const Stmt* statement) const {
-        auto e = dyn_cast_or_null<Expr>(statement);
+    const CallExpr* checkpointCall(const Expr* e) const {
         auto call = e ? dyn_cast<CallExpr>(bare(e)) : nullptr;
         auto function = call ? call->getDirectCallee() : nullptr;
         if (!function || user(function) || call->getNumArgs() != 1)
             return nullptr;
-        auto n = function->getNameAsString();
+        auto n = function->getQualifiedNameAsString();
         return n == "_setjmp" || n == "setjmp" ? call : nullptr;
+    }
+    const CallExpr* checkpointCondition(const Expr* condition) const {
+        if (auto direct = checkpointCall(condition))
+            return direct;
+        auto e = bare(condition);
+        if (auto negation = dyn_cast<UnaryOperator>(e);
+            negation && negation->getOpcode() == UO_LNot)
+            return checkpointCall(negation->getSubExpr());
+        if (auto comparison = dyn_cast<BinaryOperator>(e);
+            comparison && comparison->isComparisonOp()) {
+            if (auto call = checkpointCall(comparison->getLHS());
+                call && comparison->getRHS()->isIntegerConstantExpr(ctx))
+                return call;
+            if (auto call = checkpointCall(comparison->getRHS());
+                call && comparison->getLHS()->isIntegerConstantExpr(ctx))
+                return call;
+        }
+        return nullptr;
+    }
+    const CallExpr* checkpoint(const Stmt* statement) const {
+        const CallExpr* result = nullptr;
+        if (auto e = dyn_cast_or_null<Expr>(statement))
+            result = checkpointCall(e);
+        else if (auto branch = dyn_cast_or_null<IfStmt>(statement);
+                 branch && !branch->getInit() && !branch->getConditionVariable() &&
+                 !branch->isConstexpr() && !branch->isConsteval())
+            result = checkpointCondition(branch->getCond());
+        else if (auto selection = dyn_cast_or_null<SwitchStmt>(statement);
+                 selection && !selection->getInit() && !selection->getConditionVariable())
+            result = checkpointCondition(selection->getCond());
+        return result && !checkpointValues.count(result) ? result : nullptr;
     }
     bool bitReference(QualType t) const {
         auto r = record(t);
@@ -3905,6 +3936,8 @@ class Emitter {
         return constantValue(result.Val, t);
     }
     std::string call(const CallExpr* c) {
+        if (auto saved = checkpointValues.find(c); saved != checkpointValues.end())
+            return saved->second;
         auto f = c->getDirectCallee();
         if (f && f->isConsteval()) {
             if (auto constant = constantValue(c, true); !constant.empty())
@@ -6326,24 +6359,35 @@ class Emitter {
             if (auto saved = checkpoint(child)) {
                 if (returnValue || !exits.empty())
                     fail(child, "this setjmp context needs additional continuation lowering");
-                for (size_t suffix = i + 1; suffix < statements.size(); ++suffix)
+                bool hasValue = !isa<Expr>(child);
+                for (size_t suffix = i + (hasValue ? 0 : 1); suffix < statements.size(); ++suffix)
                     requireCheckpointFlow(statements[suffix]);
                 auto target = temporary("jppCheckpoint"), jump = temporary("jppJump");
+                std::string resumed;
                 line("final JppJumpTarget " + target + " = Jpp.checkpoint(" +
                      expr(saved->getArg(0)) + ");");
+                if (hasValue) {
+                    resumed = temporary("jppResumeValue");
+                    line("int " + resumed + " = 0;");
+                    checkpointValues[saved] = resumed;
+                }
                 line("try {");
                 ++indent;
                 line("while (true) {");
                 ++indent;
                 line("try {");
                 ++indent;
-                dead = bodyStatements(body, false, first + i + 1);
+                dead = bodyStatements(body, false, first + i + (hasValue ? 0 : 1));
+                if (hasValue)
+                    checkpointValues.erase(saved);
                 if (!dead)
                     line("break;");
                 --indent;
                 line("} catch (JppLongJump " + jump + ") {");
                 ++indent;
                 line("if (" + jump + ".target != " + target + ") throw " + jump + ";");
+                if (hasValue)
+                    line(resumed + " = " + jump + ".value;");
                 --indent;
                 line("}");
                 --indent;
