@@ -179,6 +179,7 @@ int main() {
         cases.emplace_back("gnu", expressions.str());
         cases.emplace_back("pointers", expressions.str());
         cases.emplace_back("memory", expressions.str());
+        cases.emplace_back("allocation_release", "256 19\n");
         cases.emplace_back("array_views", expressions.str());
         cases.emplace_back("array_literals", expressions.str());
         cases.emplace_back("vla_bounds", expressions.str());
@@ -419,9 +420,13 @@ int main() {
                             continue;
                         for (const auto& [file, contents] : expectedFiles)
                             fs::remove(p / file);
-                        must({java, "-cp", classes.string(),
-                              name == "library" ? "LibraryDriver" : "Main"},
-                             p / "input");
+                        std::vector<std::string> execute = {java};
+                        if (name == "allocation_release")
+                            execute.push_back("-Xmx64m");
+                        execute.insert(execute.end(),
+                                       {"-cp", classes.string(),
+                                        name == "library" ? "LibraryDriver" : "Main"});
+                        must(execute, p / "input");
                         if (read(p / "stdout") != expected)
                             throw std::runtime_error("output differs from native C++: " + name +
                                                      ", release " + std::to_string(release) + ", " +

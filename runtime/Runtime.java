@@ -1638,7 +1638,8 @@ static class JppMemory {
         littleEndian = pointer.littleEndian;
     }
     JppMemory(byte[] bytes, boolean littleEndian) {
-        identity = bytes;
+        // Saved pointer values must not retain an allocation after free.
+        identity = new Object();
         allocation = bytes;
         values = null;
         array = null;
