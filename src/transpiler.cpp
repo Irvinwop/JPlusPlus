@@ -707,9 +707,46 @@ class Emitter {
         auto n = family(t);
         return n == "set" || n == "multiset" || n == "unordered_set" || n == "unordered_multiset";
     }
+    bool orderTree(QualType t) const {
+        auto r = record(t);
+        return r && !user(r) && r->getQualifiedNameAsString() == "__gnu_pbds::tree";
+    }
+    bool orderTreeIterator(QualType t) const {
+        auto r = record(t);
+        return r && !user(r) &&
+               (r->getQualifiedNameAsString() == "__gnu_pbds::detail::bin_search_tree_const_it_" ||
+                r->getQualifiedNameAsString() == "__gnu_pbds::detail::bin_search_tree_it_");
+    }
+    std::string orderTreeDirection(QualType t) const {
+        return templateArgs(t)[6].getAsIntegral().isZero() ? "-1" : "1";
+    }
+    void requireOrderTree(QualType t) {
+        auto args = templateArgs(t);
+        auto named = [&](unsigned i, const std::string& expected) {
+            auto r = record(args[i].getAsType());
+            return r && !user(r) && r->getQualifiedNameAsString() == expected;
+        };
+        if (args.size() != 6 || !named(1, "__gnu_pbds::null_type") ||
+            !named(3, "__gnu_pbds::rb_tree_tag") ||
+            args[4].getKind() != TemplateArgument::Template ||
+            args[4].getAsTemplate().getAsTemplateDecl()->getQualifiedNameAsString() !=
+                "__gnu_pbds::tree_order_statistics_node_update" ||
+            !named(5, "std::allocator"))
+            fail(SourceLocation(), "this GNU policy-based tree needs additional policy lowering");
+        auto comparison = record(args[2].getAsType());
+        if (!comparison || user(comparison) ||
+            (comparison->getQualifiedNameAsString() != "std::less" &&
+             comparison->getQualifiedNameAsString() != "std::greater"))
+            fail(SourceLocation(),
+                 "custom policy-tree comparators need additional ownership lowering");
+        if (ownsDestructor(element(t)))
+            fail(SourceLocation(),
+                 "policy-tree key destruction needs additional lifetime lowering");
+    }
     bool isIter(QualType t) const {
         auto n = family(t);
-        return n.find("iterator") != std::string::npos || n == "__normal_iterator";
+        return n.find("iterator") != std::string::npos || n == "__normal_iterator" ||
+               orderTreeIterator(t);
     }
     bool dataPointer(QualType t) const {
         t = clean(t);
@@ -969,7 +1006,7 @@ class Emitter {
         if (n == "array" && templateArgs(t)[1].getAsIntegral().isZero())
             return false;
         if (isVec(t) || n == "deque" || n == "queue" || n == "stack" || n == "priority_queue" ||
-            isSet(t))
+            isSet(t) || orderTree(t))
             return ownsDestructor(element(t), visited);
         if (isMap(t))
             return ownsDestructor(element(t), visited) || ownsDestructor(element(t, 1), visited);
@@ -1504,6 +1541,8 @@ class Emitter {
             return a->getElementType();
         if (t->isPointerType())
             return t->getPointeeType();
+        if (orderTreeIterator(t))
+            return element(t, 1);
         auto n = family(t);
         if (n == "back_insert_iterator" || n == "front_insert_iterator" || n == "insert_iterator")
             return element(element(t));
@@ -1639,6 +1678,10 @@ class Emitter {
             return "JppMap<" + boxed(element(t)) + ", " + boxed(element(t, 1)) + ">";
         if (isSet(t))
             return "JppSet<" + boxed(element(t)) + ">";
+        if (orderTree(t)) {
+            requireOrderTree(t);
+            return "JppOrderSet<" + boxed(element(t)) + ">";
+        }
         if (n == "deque")
             return "JppDeque<" + boxed(element(t)) + ">";
         if (n == "queue" || n == "stack")
@@ -1729,6 +1772,9 @@ class Emitter {
             return mtEngine(t);
         if (family(t) == "seed_seq")
             return "new JppSeedSeq()";
+        if (orderTreeIterator(t))
+            return "new JppOrderIter<" + boxed(iteratorElement(t)) + ">(null, null, " +
+                   orderTreeDirection(t) + ")";
         if (family(t) == "vector" && vectorStorage)
             return "new JppVector<" + boxed(element(t)) + ">()";
         if (chrono(t))
@@ -1744,6 +1790,10 @@ class Emitter {
                    (family(t) == "map" ? comparatorPredicate(templateArgs(t)[2].getAsType(),
                                                              element(t), element(t))
                                        : comparisonPredicate(element(t), element(t))) +
+                   "))";
+        if (orderTree(t))
+            return "new " + jt + "(Jpp.comparator(" +
+                   comparatorPredicate(templateArgs(t)[2].getAsType(), element(t), element(t)) +
                    "))";
         if (isSet(t))
             return "new " + jt + "(" +
@@ -1854,6 +1904,8 @@ class Emitter {
     std::string converted(std::string s, QualType from, QualType target) {
         from = clean(from);
         target = clean(target);
+        if (orderTreeIterator(from) && orderTreeIterator(target) && !ctx.hasSameType(from, target))
+            return "Jpp.orderIterator(" + s + ", " + orderTreeDirection(target) + ")";
         bool borrowed =
             family(from) == "reference_wrapper" && family(target) != "reference_wrapper";
         if (borrowed) {
@@ -3614,13 +3666,32 @@ class Emitter {
         }
         if (n == "reference_wrapper")
             return reference(args[0]);
+        if (orderTree(t)) {
+            bool range =
+                args.size() >= 2 && (isIter(args[0]->getType()) || dataPointer(args[0]->getType()));
+            auto created = defaultValue(t);
+            auto comparatorIndex = range ? 2U : 0U;
+            if (args.size() > comparatorIndex) {
+                if (args.size() != comparatorIndex + 1)
+                    fail(c, "unsupported policy-tree constructor");
+                // Only the stateless standard comparison policies are accepted.
+                created = "Jpp.last(" + expr(args[comparatorIndex]) + ", " + created + ")";
+            }
+            if (range) {
+                auto item = temporary("jppKey");
+                return "Jpp.orderSetFrom(" + created + ", " + asIterator(args[0]) + ", " +
+                       asIterator(args[1]) + ", " + item + " -> " +
+                       converted(item, iteratorElement(args[0]->getType()), element(t)) + ")";
+            }
+            return created;
+        }
         if (n == "function")
             return converted(scalarCopyClosure(record(args[0]->getType()))
                                  ? constructElement(clean(args[0]->getType()), args[0])
                                  : expr(args[0]),
                              args[0]->getType(), t);
         if (isIter(t))
-            return expr(args[0]);
+            return converted(expr(args[0]), args[0]->getType(), t);
         if (isMap(t)) {
             bool range =
                 args.size() > 1 && (isIter(args[0]->getType()) || dataPointer(args[0]->getType()));
@@ -3884,6 +3955,11 @@ class Emitter {
                 fail(c, "unsupported member call");
             auto obj = me->getBase();
             auto ot = obj->getType();
+            auto sourceType = bare(obj)->getType();
+            if (sourceType->isPointerType())
+                sourceType = sourceType->getPointeeType();
+            if (orderTree(sourceType))
+                ot = sourceType;
             if (ot->isPointerType())
                 ot = ot->getPointeeType();
             if (f && user(f)) {
@@ -3898,6 +3974,31 @@ class Emitter {
                 return object + "." + allocatedName + "(" + arguments(c, f) + ")";
             }
             auto n = me->getMemberDecl()->getNameAsString();
+            if (orderTree(ot)) {
+                requireOrderTree(ot);
+                auto object = expr(obj) + (me->isArrow() ? ".get()" : "");
+                if (n == "order_of_key")
+                    return integerResult(c, object + ".order_of_key(" +
+                                                value(c->getArg(0), element(ot)) + ")");
+                if (n == "find_by_order")
+                    return object + ".find_by_order(" +
+                           value(c->getArg(0), ctx.UnsignedLongLongTy) + ")";
+                if (n == "size")
+                    return integerResult(c, object + ".size()");
+                if (n == "empty" || n == "clear" || n == "begin" || n == "end" || n == "rbegin" ||
+                    n == "rend")
+                    return object + "." + n + "()";
+                if (n == "insert" || n == "find" || n == "lower_bound" || n == "upper_bound") {
+                    if (c->getNumArgs() != 1)
+                        fail(c, "this policy-tree insertion needs additional range lowering");
+                    return object + "." + n + "(" + value(c->getArg(0), element(ot)) + ")";
+                }
+                if (n == "erase" && c->getNumArgs() == 1)
+                    return object + ".erase(" + expr(c->getArg(0)) + ")";
+                if (n == "swap" && c->getNumArgs() == 1)
+                    return object + ".swap(" + expr(c->getArg(0)) + ")";
+                fail(c, "unsupported policy-tree member '" + n + "'");
+            }
             if (iotaView(ot)) {
                 auto object = expr(obj) + (me->isArrow() ? ".get()" : "");
                 if (isa<CXXConversionDecl>(me->getMemberDecl()) && c->getType()->isBooleanType())
@@ -4519,6 +4620,8 @@ class Emitter {
             return swapArrays(c->getArg(0), c->getArg(1));
         if (n == "swap" && isMap(c->getArg(0)->getType()))
             return expr(c->getArg(0)) + ".swap(" + expr(c->getArg(1)) + ")";
+        if (n == "swap" && orderTree(c->getArg(0)->getType()))
+            return "Jpp.swapOrderSets(" + expr(c->getArg(0)) + ", " + expr(c->getArg(1)) + ")";
         if (n == "swap" && family(c->getArg(0)->getType()) == "deque")
             return expr(c->getArg(0)) + ".swap(" + expr(c->getArg(1)) + ")";
         if (n == "swap" && family(c->getArg(0)->getType()) == "bitset")

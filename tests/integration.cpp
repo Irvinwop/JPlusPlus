@@ -154,6 +154,11 @@ int main() {
         cases.emplace_back("jumps", keys.str());
         cases.emplace_back("lambdas", "17\n");
         cases.emplace_back("arguments", "");
+        std::ostringstream policyOperations;
+        policyOperations << 2000 << '\n';
+        for (int i = 0; i < 2000; ++i)
+            policyOperations << r(8) << ' ' << r(401) - 200 << '\n';
+        cases.emplace_back("pbds", policyOperations.str());
         cases.emplace_back("cpp23", "-9\n");
         std::ostringstream bits;
         bits << 70 << '\n';

@@ -2722,6 +2722,332 @@ static class JppSet<T> implements Iterable<T>, JppAssignable<JppSet<T>> {
     }
 }
 
+// Java has no standard indexed ordered set. AVL nodes carry subtree sizes for
+// logarithmic PBDS rank/selection, and retain their identity during rotations.
+static class JppOrderNode<T> {
+    final T key;
+    JppOrderNode<T> left, right, parent;
+    int height = 1, size = 1;
+    JppOrderNode(T key, JppOrderNode<T> parent) {
+        this.key = key;
+        this.parent = parent;
+    }
+}
+
+static class JppOrderState<T> {
+    final Comparator<? super T> comparison;
+    JppOrderNode<T> root;
+    JppOrderState(Comparator<? super T> comparison) {
+        this.comparison = comparison;
+    }
+    static int size(JppOrderNode<?> node) {
+        return node == null ? 0 : node.size;
+    }
+    static int height(JppOrderNode<?> node) {
+        return node == null ? 0 : node.height;
+    }
+    static void update(JppOrderNode<?> node) {
+        node.size = 1 + size(node.left) + size(node.right);
+        node.height = 1 + Math.max(height(node.left), height(node.right));
+    }
+    static <T> JppOrderNode<T> extreme(JppOrderNode<T> node, int direction) {
+        if (node != null)
+            while ((direction > 0 ? node.left : node.right) != null)
+                node = direction > 0 ? node.left : node.right;
+        return node;
+    }
+    static <T> JppOrderNode<T> next(JppOrderNode<T> node, int direction) {
+        JppOrderNode<T> child = direction > 0 ? node.right : node.left;
+        if (child != null)
+            return extreme(child, direction);
+        while (node.parent != null &&
+               node == (direction > 0 ? node.parent.right : node.parent.left))
+            node = node.parent;
+        return node.parent;
+    }
+    void replace(JppOrderNode<T> old, JppOrderNode<T> replacement) {
+        if (old.parent == null)
+            root = replacement;
+        else if (old == old.parent.left)
+            old.parent.left = replacement;
+        else
+            old.parent.right = replacement;
+        if (replacement != null)
+            replacement.parent = old.parent;
+    }
+    JppOrderNode<T> rotateLeft(JppOrderNode<T> node) {
+        JppOrderNode<T> top = node.right;
+        replace(node, top);
+        node.right = top.left;
+        if (node.right != null)
+            node.right.parent = node;
+        top.left = node;
+        node.parent = top;
+        update(node);
+        update(top);
+        return top;
+    }
+    JppOrderNode<T> rotateRight(JppOrderNode<T> node) {
+        JppOrderNode<T> top = node.left;
+        replace(node, top);
+        node.left = top.right;
+        if (node.left != null)
+            node.left.parent = node;
+        top.right = node;
+        node.parent = top;
+        update(node);
+        update(top);
+        return top;
+    }
+    void rebalance(JppOrderNode<T> node) {
+        while (node != null) {
+            update(node);
+            int balance = height(node.left) - height(node.right);
+            if (balance > 1) {
+                if (height(node.left.left) < height(node.left.right))
+                    rotateLeft(node.left);
+                node = rotateRight(node);
+            } else if (balance < -1) {
+                if (height(node.right.right) < height(node.right.left))
+                    rotateRight(node.right);
+                node = rotateLeft(node);
+            }
+            node = node.parent;
+        }
+    }
+    JppOrderNode<T> find(T key, int bound) {
+        JppOrderNode<T> node = root, candidate = null;
+        while (node != null) {
+            int order = comparison.compare(key, node.key);
+            if (order == 0 && bound == 0)
+                return node;
+            if (order < 0 || (order == 0 && bound < 0)) {
+                candidate = node;
+                node = node.left;
+            } else
+                node = node.right;
+        }
+        return bound == 0 ? null : candidate;
+    }
+    void erase(JppOrderNode<T> node) {
+        JppOrderNode<T> start;
+        if (node.left == null || node.right == null) {
+            start = node.parent;
+            replace(node, node.left == null ? node.right : node.left);
+        } else {
+            JppOrderNode<T> successor = extreme(node.right, 1);
+            if (successor.parent == node)
+                start = successor;
+            else {
+                start = successor.parent;
+                replace(successor, successor.right);
+                successor.right = node.right;
+                successor.right.parent = successor;
+            }
+            replace(node, successor);
+            successor.left = node.left;
+            successor.left.parent = successor;
+        }
+        rebalance(start);
+    }
+    JppOrderNode<T> copyNodes(JppOrderNode<T> node, JppOrderNode<T> parent) {
+        if (node == null)
+            return null;
+        JppOrderNode<T> result = new JppOrderNode<T>(jppCopy(node.key), parent);
+        result.left = copyNodes(node.left, result);
+        result.right = copyNodes(node.right, result);
+        update(result);
+        return result;
+    }
+}
+
+static class JppOrderIter<T> extends JppIter<T> {
+    final JppOrderState<T> owner;
+    JppOrderNode<T> node;
+    JppOrderIter(JppOrderState<T> owner, JppOrderNode<T> node, int direction) {
+        super(null, 0, direction);
+        this.owner = owner;
+        this.node = node;
+    }
+    T get() {
+        if (node == null)
+            throw new NoSuchElementException();
+        return node.key;
+    }
+    List<T> pointerStorage() {
+        return Collections.singletonList(get());
+    }
+    Object pointerIdentity() {
+        return node;
+    }
+    JppOrderIter<T> plus(int offset) {
+        return new JppOrderIter<T>(owner, node, step).advance(offset);
+    }
+    JppOrderIter<T> advance(int offset) {
+        int direction = offset < 0 ? -step : step;
+        for (long count = Math.abs((long)offset); count > 0; --count) {
+            if (node == null) {
+                if (offset > 0)
+                    throw new NoSuchElementException();
+                node = JppOrderState.extreme(owner.root, direction);
+                if (node == null)
+                    throw new NoSuchElementException();
+            } else
+                node = JppOrderState.next(node, direction);
+        }
+        return this;
+    }
+    boolean same(JppIter<?> other) {
+        return other instanceof JppOrderIter && owner == ((JppOrderIter<?>)other).owner &&
+            node == ((JppOrderIter<?>)other).node;
+    }
+    int rank() {
+        if (node == null)
+            return JppOrderState.size(owner.root);
+        int rank = JppOrderState.size(node.left);
+        for (JppOrderNode<T> at = node; at.parent != null; at = at.parent)
+            if (at == at.parent.right)
+                rank += 1 + JppOrderState.size(at.parent.left);
+        return rank;
+    }
+    int minus(JppIter<?> other) {
+        if (!(other instanceof JppOrderIter) || owner != ((JppOrderIter<?>)other).owner)
+            throw new IllegalArgumentException("iterators from different policy trees");
+        return (rank() - ((JppOrderIter<?>)other).rank()) * step;
+    }
+}
+
+static class JppOrderSet<T> implements Iterable<T>, JppAssignable<JppOrderSet<T>> {
+    JppOrderState<T> state;
+    JppOrderSet(Comparator<? super T> comparison) {
+        state = new JppOrderState<T>(comparison);
+    }
+    int size() {
+        return JppOrderState.size(state.root);
+    }
+    boolean empty() {
+        return state.root == null;
+    }
+    void clear() {
+        state.root = null;
+    }
+    JppOrderIter<T> cursor(JppOrderNode<T> node, int direction) {
+        return new JppOrderIter<T>(state, node, direction);
+    }
+    JppPair<JppIter<T>, Boolean> insert(T value) {
+        JppOrderNode<T> parent = null, node = state.root;
+        int comparison = 0;
+        while (node != null) {
+            parent = node;
+            comparison = state.comparison.compare(value, node.key);
+            if (comparison == 0)
+                return new JppPair<JppIter<T>, Boolean>(cursor(node, 1), false);
+            node = comparison < 0 ? node.left : node.right;
+        }
+        node = new JppOrderNode<T>(jppCopy(value), parent);
+        if (parent == null)
+            state.root = node;
+        else if (comparison < 0)
+            parent.left = node;
+        else
+            parent.right = node;
+        state.rebalance(parent);
+        return new JppPair<JppIter<T>, Boolean>(cursor(node, 1), true);
+    }
+    boolean erase(T value) {
+        JppOrderNode<T> node = state.find(value, 0);
+        if (node == null)
+            return false;
+        state.erase(node);
+        return true;
+    }
+    JppIter<T> erase(JppIter<T> position) {
+        JppOrderIter<T> iterator = (JppOrderIter<T>)position;
+        if (iterator.owner != state || iterator.node == null)
+            throw new IllegalArgumentException("invalid policy-tree erase iterator");
+        JppOrderIter<T> next = iterator.plus(1);
+        state.erase(iterator.node);
+        return next;
+    }
+    int order_of_key(T key) {
+        int rank = 0;
+        for (JppOrderNode<T> node = state.root; node != null;) {
+            if (state.comparison.compare(node.key, key) < 0) {
+                rank += 1 + JppOrderState.size(node.left);
+                node = node.right;
+            } else
+                node = node.left;
+        }
+        return rank;
+    }
+    JppIter<T> find_by_order(long order) {
+        if (Long.compareUnsigned(order, (long)size()) >= 0)
+            return end();
+        int rank = (int)order;
+        for (JppOrderNode<T> node = state.root; node != null;) {
+            int left = JppOrderState.size(node.left);
+            if (rank == left)
+                return cursor(node, 1);
+            if (rank < left)
+                node = node.left;
+            else {
+                rank -= left + 1;
+                node = node.right;
+            }
+        }
+        throw new IllegalStateException("inconsistent policy-tree rank");
+    }
+    JppIter<T> find(T key) {
+        return cursor(state.find(key, 0), 1);
+    }
+    JppIter<T> lower_bound(T key) {
+        return cursor(state.find(key, -1), 1);
+    }
+    JppIter<T> upper_bound(T key) {
+        return cursor(state.find(key, 1), 1);
+    }
+    JppIter<T> begin() {
+        return cursor(JppOrderState.extreme(state.root, 1), 1);
+    }
+    JppIter<T> end() {
+        return cursor(null, 1);
+    }
+    JppIter<T> rbegin() {
+        return cursor(JppOrderState.extreme(state.root, -1), -1);
+    }
+    JppIter<T> rend() {
+        return cursor(null, -1);
+    }
+    public Iterator<T> iterator() {
+        return new Iterator<T>() {
+            final JppIter<T> position = begin();
+            public boolean hasNext() {
+                return ((JppOrderIter<T>)position).node != null;
+            }
+            public T next() {
+                T result = position.get();
+                position.advance(1);
+                return result;
+            }
+        };
+    }
+    void swap(JppOrderSet<T> other) {
+        JppOrderState<T> previous = state;
+        state = other.state;
+        other.state = previous;
+    }
+    public JppOrderSet<T> copy() {
+        JppOrderSet<T> result = new JppOrderSet<T>(state.comparison);
+        result.state.root = state.copyNodes(state.root, null);
+        return result;
+    }
+    public JppOrderSet<T> jppAssignFrom(JppOrderSet<T> source) {
+        if (source != this)
+            state = source.copy().state;
+        return this;
+    }
+}
+
 static class JppHeap<T> implements JppCopyable<JppHeap<T>> {
     final PriorityQueue<T> data;
     JppHeap(boolean minimum) {
@@ -4755,6 +5081,24 @@ static class Jpp {
     static <T> T clamp(T value, T low, T high,
                       java.util.function.BiPredicate<? super T, ? super T> less) {
         return less.test(value, low) ? low : less.test(high, value) ? high : value;
+    }
+    static <T> JppIter<T> orderIterator(JppIter<T> source, int direction) {
+        JppOrderIter<T> iterator = (JppOrderIter<T>)source;
+        return new JppOrderIter<T>(iterator.owner, iterator.node, direction);
+    }
+    static <S, T> JppOrderSet<T> orderSetFrom(JppOrderSet<T> destination, JppIter<S> first,
+                                            JppIter<S> last,
+                                            java.util.function.Function<S, T> convert) {
+        for (JppIter<S> position = first.copy(); !position.same(last); position.advance(1))
+            destination.insert(convert.apply(position.get()));
+        return destination;
+    }
+    static <T> void swapOrderSets(JppOrderSet<T> first, JppOrderSet<T> second) {
+        // PBDS declares a copy constructor and assignment, so generic std::swap
+        // performs copies. Its member swap transfers nodes and has a separate path.
+        JppOrderSet<T> temporary = first.copy();
+        first.jppAssignFrom(second);
+        second.jppAssignFrom(temporary);
     }
     static <T> JppSet<T> setFrom(JppSet<T> destination, JppIter<T> first, JppIter<T> last) {
         for (JppIter<T> position = first.plus(0); !position.same(last); position.advance(1))
