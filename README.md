@@ -20,7 +20,7 @@ j++ solution.cpp -r -v j8           # target Java 8
 j++ solution.cpp --check -o Solve.java
 ```
 
-Inputs using `import std;` receive a module built with the selected C++ frontend automatically. The result remains one Java source file; supported library APIs are listed in [compatibility](docs/compatibility.md).
+Inputs using `import std;` or `import std.compat;` receive modules built with the selected C++ frontend automatically. The result remains one Java source file; supported library APIs are listed in [compatibility](docs/compatibility.md).
 
 ## What the output looks like
 

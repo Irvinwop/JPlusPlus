@@ -4506,6 +4506,12 @@ static final JppOutput jppOut = new JppOutput(System.out),
                       jppLog = new JppOutput(jppErr);
 
 static class Jpp {
+    static int toupper(int value) {
+        return value >= 'a' && value <= 'z' ? value - ('a' - 'A') : value;
+    }
+    static int tolower(int value) {
+        return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value;
+    }
     static JppPtr<JppPtr<Character>> arguments(String program, String[] arguments) {
         ArrayList<JppPtr<Character>> values = new ArrayList<JppPtr<Character>>();
         values.add(argumentString(program));

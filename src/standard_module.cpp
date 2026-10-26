@@ -4,8 +4,10 @@
 #include <clang/AST/DeclTemplate.h>
 #include <clang/Basic/Diagnostic.h>
 #include <clang/Basic/DiagnosticOptions.h>
+#include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
+#include <clang/Lex/HeaderSearch.h>
 #include <clang/Tooling/ArgumentsAdjusters.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
@@ -22,6 +24,23 @@ using namespace clang;
 
 namespace jpp {
 namespace {
+const std::map<std::string, std::string> cHeaders = {
+    {"cassert", "assert.h"}, {"cctype", "ctype.h"},   {"cerrno", "errno.h"},
+    {"cfenv", "fenv.h"},     {"cfloat", "float.h"},   {"cinttypes", "inttypes.h"},
+    {"climits", "limits.h"}, {"clocale", "locale.h"}, {"cmath", "math.h"},
+    {"csetjmp", "setjmp.h"}, {"csignal", "signal.h"}, {"cstdarg", "stdarg.h"},
+    {"cstddef", "stddef.h"}, {"cstdint", "stdint.h"}, {"cstdio", "stdio.h"},
+    {"cstdlib", "stdlib.h"}, {"cstring", "string.h"}, {"ctime", "time.h"},
+    {"cuchar", "uchar.h"},   {"cwchar", "wchar.h"},   {"cwctype", "wctype.h"}};
+
+std::string compatibilityHeaders() {
+    std::string result;
+    for (const auto& [cpp, c] : cHeaders)
+        for (const auto& header : {cpp, c})
+            result += "#if __has_include(<" + header + ">)\n#include <" + header + ">\n#endif\n";
+    return result;
+}
+
 std::string standardHeaders() {
     // The vendor's GNU umbrella includes implementation extensions as well.
     // Enumerate newer standard headers too: older umbrellas omit some of them.
@@ -209,6 +228,60 @@ void collectLibraryNamespaces(const DeclContext* context,
     }
 }
 
+bool cHeaderDeclaration(const NamedDecl* declaration, const SourceManager& sources) {
+    auto file = llvm::sys::path::filename(
+        sources.getFilename(sources.getExpansionLoc(declaration->getLocation())));
+    // These <cstddef> aliases can originate in c++config.h rather than in
+    // <cstddef> itself. Include the named types without collecting unrelated
+    // implementation declarations from that shared configuration header.
+    if (isa<TypedefNameDecl>(declaration)) {
+        auto name = declaration->getName();
+        if (name == "size_t" || name == "ptrdiff_t" || name == "nullptr_t")
+            return true;
+    }
+    // libstdc++ puts the C abs overloads in a shared implementation header.
+    return cHeaders.count(file.str()) || file == "std_abs.h";
+}
+
+void collectCNames(const DeclContext* context, const SourceManager& sources,
+                   std::set<std::string>& names, bool inStandardNamespace = false) {
+    for (auto declaration : context->decls()) {
+        if (auto linkage = dyn_cast<LinkageSpecDecl>(declaration)) {
+            collectCNames(linkage, sources, names, inStandardNamespace);
+            continue;
+        }
+        if (auto space = dyn_cast<NamespaceDecl>(declaration)) {
+            if ((!inStandardNamespace && space->getName() == "std") ||
+                (inStandardNamespace && space->isInline()))
+                collectCNames(space, sources, names, true);
+            continue;
+        }
+        auto named = dyn_cast<NamedDecl>(declaration);
+        if (!inStandardNamespace || !named || !named->getIdentifier() ||
+            named->getDeclContext()->getRedeclContext()->getPrimaryContext() !=
+                context->getRedeclContext()->getPrimaryContext() ||
+            !cHeaderDeclaration(named, sources))
+            continue;
+        auto name = named->getNameAsString();
+        if (!name.empty() && (name[0] != '_' || name == "_Exit"))
+            names.insert(name);
+    }
+}
+
+bool excludedCName(const std::string& name) {
+    if (name == "byte" || name == "to_integer" || name == "lerp")
+        return true;
+    static const std::set<std::string> specialMath = {
+        "assoc_laguerre", "assoc_legendre", "beta",         "comp_ellint_1", "comp_ellint_2",
+        "comp_ellint_3",  "cyl_bessel_i",   "cyl_bessel_j", "cyl_bessel_k",  "cyl_neumann",
+        "ellint_1",       "ellint_2",       "ellint_3",     "expint",        "hermite",
+        "laguerre",       "legendre",       "riemann_zeta", "sph_bessel",    "sph_legendre",
+        "sph_neumann"};
+    return specialMath.count(name) ||
+           (name.size() > 1 && (name.back() == 'f' || name.back() == 'l') &&
+            specialMath.count(name.substr(0, name.size() - 1)));
+}
+
 void writeExports(const NamespaceExports& exports, const std::string& path,
                   llvm::raw_ostream& output) {
     for (const auto& name : exports.names)
@@ -224,14 +297,37 @@ void writeExports(const NamespaceExports& exports, const std::string& path,
 }
 
 class ExportConsumer final : public ASTConsumer {
+    CompilerInstance& compiler;
     std::string& interface;
     bool& success;
+    bool compatibility;
+    std::string& standardFile;
 
   public:
-    ExportConsumer(std::string& result, bool& ready) : interface(result), success(ready) {}
+    ExportConsumer(CompilerInstance& instance, std::string& result, bool& ready, bool compat,
+                   std::string& provided)
+        : compiler(instance), interface(result), success(ready), compatibility(compat),
+          standardFile(provided) {}
     void HandleTranslationUnit(ASTContext& context) override {
         if (context.getDiagnostics().hasErrorOccurred())
             return;
+        standardFile =
+            compiler.getPreprocessor().getHeaderSearchInfo().getPrebuiltModuleFileName("std");
+        if (compatibility) {
+            std::set<std::string> names;
+            collectCNames(context.getTranslationUnitDecl(), context.getSourceManager(), names);
+            NamespaceExports global;
+            collectExports(context.getTranslationUnitDecl(), global);
+            llvm::raw_string_ostream output(interface);
+            output << "module;\n"
+                   << compatibilityHeaders() << "export module std.compat;\nexport import std;\n";
+            for (const auto& name : names)
+                if (!excludedCName(name) && !global.internalNames.count(name))
+                    output << "export using " << (global.names.count(name) ? "::" : "std::") << name
+                           << ";\n";
+            success = true;
+            return;
+        }
         std::map<std::string, NamespaceExports> exports;
         // Some vendor headers put namespace std inside extern "C++" at the
         // translation-unit level, notably the allocation and exception headers.
@@ -254,37 +350,48 @@ class ExportConsumer final : public ASTConsumer {
 class ExportAction final : public ASTFrontendAction {
     std::string& interface;
     bool& success;
+    bool compatibility;
+    std::string& standardFile;
 
   public:
-    ExportAction(std::string& result, bool& ready) : interface(result), success(ready) {}
-    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, llvm::StringRef) override {
-        return std::make_unique<ExportConsumer>(interface, success);
+    ExportAction(std::string& result, bool& ready, bool compat, std::string& provided)
+        : interface(result), success(ready), compatibility(compat), standardFile(provided) {}
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance& compiler,
+                                                   llvm::StringRef) override {
+        return std::make_unique<ExportConsumer>(compiler, interface, success, compatibility,
+                                                standardFile);
     }
 };
 
 class ExportFactory final : public tooling::FrontendActionFactory {
     std::string& interface;
     bool& success;
+    bool compatibility;
+    std::string& standardFile;
 
   public:
-    ExportFactory(std::string& result, bool& ready) : interface(result), success(ready) {}
+    ExportFactory(std::string& result, bool& ready, bool compat, std::string& provided)
+        : interface(result), success(ready), compatibility(compat), standardFile(provided) {}
     std::unique_ptr<FrontendAction> create() override {
-        return std::make_unique<ExportAction>(interface, success);
+        return std::make_unique<ExportAction>(interface, success, compatibility, standardFile);
     }
 };
 
 class MissingStandardModule final : public TextDiagnosticPrinter {
   public:
-    bool missing = false;
+    std::string missing;
     MissingStandardModule(llvm::raw_ostream& output, DiagnosticOptions* options)
         : TextDiagnosticPrinter(output, options) {}
     void HandleDiagnostic(DiagnosticsEngine::Level level, const Diagnostic& diagnostic) override {
         if (diagnostic.getID() == diag::err_module_not_found && diagnostic.getNumArgs()) {
             auto kind = diagnostic.getArgKind(0);
-            missing |=
-                (kind == DiagnosticsEngine::ak_std_string && diagnostic.getArgStdStr(0) == "std") ||
-                (kind == DiagnosticsEngine::ak_c_string &&
-                 llvm::StringRef(diagnostic.getArgCStr(0)) == "std");
+            llvm::StringRef name;
+            if (kind == DiagnosticsEngine::ak_std_string)
+                name = diagnostic.getArgStdStr(0);
+            else if (kind == DiagnosticsEngine::ak_c_string)
+                name = diagnostic.getArgCStr(0);
+            if (name == "std" || name == "std.compat")
+                missing = name.str();
         }
         TextDiagnosticPrinter::HandleDiagnostic(level, diagnostic);
     }
@@ -318,9 +425,11 @@ void writeFile(const std::string& path, const std::string& contents) {
         throw std::runtime_error("cannot finish writing standard module");
 }
 
-bool buildStandardModule(const ModuleDirectory& directory, const std::vector<std::string>& args) {
-    auto headers = directory.file("headers.cpp");
-    writeFile(headers, standardHeaders());
+bool buildLibraryModule(const ModuleDirectory& directory, const std::vector<std::string>& args,
+                        const std::string& name, std::map<std::string, std::string>& files) {
+    bool compatibility = name == "std.compat";
+    auto headers = directory.file("headers-" + name + ".cpp");
+    writeFile(headers, compatibility ? compatibilityHeaders() : standardHeaders());
     auto libraryArgs = args;
     // These diagnostics describe the generated library interface, not an input
     // declaration. Deprecated library declarations must remain available.
@@ -330,14 +439,24 @@ bool buildStandardModule(const ModuleDirectory& directory, const std::vector<std
                                                    libraryArgs);
     tooling::ClangTool scan(scanDatabase, {headers});
     std::string interface;
+    std::string standardFile;
     bool ready = false;
-    ExportFactory exports(interface, ready);
+    ExportFactory exports(interface, ready, compatibility, standardFile);
     if (scan.run(&exports) != 0 || !ready)
         return false;
-    auto source = directory.file("std.cppm");
+    auto source = directory.file(name + ".cppm");
     writeFile(source, interface);
     auto moduleArgs = libraryArgs;
-    moduleArgs.insert(moduleArgs.end(), {"-o", directory.file("std.pcm")});
+    if (compatibility) {
+        if (standardFile.empty()) {
+            if (!buildLibraryModule(directory, args, "std", files))
+                return false;
+            standardFile = files.at("std");
+        }
+        moduleArgs.push_back("-fmodule-file=std=" + standardFile);
+        files["std"] = standardFile;
+    }
+    moduleArgs.insert(moduleArgs.end(), {"-o", directory.file(name + ".pcm")});
     tooling::FixedCompilationDatabase moduleDatabase(std::filesystem::current_path().string(),
                                                      moduleArgs);
     tooling::ClangTool build(moduleDatabase, {source});
@@ -345,28 +464,37 @@ bool buildStandardModule(const ModuleDirectory& directory, const std::vector<std
     build.clearArgumentsAdjusters();
     build.appendArgumentsAdjuster(tooling::getClangStripDependencyFileAdjuster());
     auto action = tooling::newFrontendActionFactory<GenerateModuleInterfaceAction>();
-    return build.run(action.get()) == 0;
+    if (build.run(action.get()) != 0)
+        return false;
+    files[name] = directory.file(name + ".pcm");
+    return true;
 }
 } // namespace
 
 bool withStandardModule(const Options&, const std::vector<std::string>& args,
                         const TranslationAttempt& attempt) {
-    llvm::IntrusiveRefCntPtr<DiagnosticOptions> options(new DiagnosticOptions);
-    std::string diagnostics;
-    llvm::raw_string_ostream messages(diagnostics);
-    MissingStandardModule first(messages, options.get());
-    bool success = attempt(args, &first);
-    if (success || !first.missing) {
-        llvm::errs() << diagnostics;
-        return success;
-    }
-    ModuleDirectory directory;
-    if (!buildStandardModule(directory, args)) {
-        llvm::errs() << diagnostics;
-        return false;
-    }
     auto moduleArgs = args;
-    moduleArgs.push_back("-fmodule-file=std=" + directory.file("std.pcm"));
-    return attempt(moduleArgs, nullptr);
+    std::unique_ptr<ModuleDirectory> directory;
+    std::set<std::string> prepared;
+    while (true) {
+        llvm::IntrusiveRefCntPtr<DiagnosticOptions> options(new DiagnosticOptions);
+        std::string diagnostics;
+        llvm::raw_string_ostream messages(diagnostics);
+        MissingStandardModule first(messages, options.get());
+        bool success = attempt(moduleArgs, &first);
+        if (success || first.missing.empty() || !prepared.insert(first.missing).second) {
+            llvm::errs() << diagnostics;
+            return success;
+        }
+        if (!directory)
+            directory = std::make_unique<ModuleDirectory>();
+        std::map<std::string, std::string> files;
+        if (!buildLibraryModule(*directory, moduleArgs, first.missing, files)) {
+            llvm::errs() << diagnostics;
+            return false;
+        }
+        for (const auto& [name, path] : files)
+            moduleArgs.push_back("-fmodule-file=" + name + "=" + path);
+    }
 }
 } // namespace jpp

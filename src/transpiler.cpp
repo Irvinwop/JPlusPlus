@@ -4692,6 +4692,13 @@ class Emitter {
         if (memoryOperation == "strlen")
             return converted("Jpp.strlen(" + expr(c->getArg(0)) + ")", ctx.UnsignedLongLongTy,
                              c->getType());
+        if ((memoryOperation == "toupper" || memoryOperation == "tolower") &&
+            c->getNumArgs() == 1 && f->getNumParams() == 1 &&
+            (f->getDeclContext()->getRedeclContext()->isTranslationUnit() ||
+             f->isInStdNamespace()) &&
+            ctx.hasSameType(clean(f->getReturnType()), ctx.IntTy) &&
+            ctx.hasSameType(clean(f->getParamDecl(0)->getType()), ctx.IntTy))
+            return "Jpp." + memoryOperation + "(" + value(c->getArg(0), ctx.IntTy) + ")";
         if (isa<UserDefinedLiteral>(c) && isString(c->getType()) && c->getNumArgs() == 2) {
             auto source = clean(c->getArg(0)->getType());
             if (source->isPointerType() && source->getPointeeType()->isCharType())

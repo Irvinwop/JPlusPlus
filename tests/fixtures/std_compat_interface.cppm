@@ -1,0 +1,39 @@
+module;
+#include <bits/stdc++.h>
+#include <cfenv>
+#include <cuchar>
+#include <stddef.h>
+export module std.compat;
+export import std;
+export using ::size_t;
+export using ::ptrdiff_t;
+export using std::nullptr_t;
+export using ::max_align_t;
+export using ::FILE;
+export using ::fpos_t;
+export using ::tm;
+export using ::clock_t;
+export using ::time_t;
+export using ::int64_t;
+export using ::uint64_t;
+export using ::div_t;
+export using ::ldiv_t;
+export using ::lldiv_t;
+export using ::mbstate_t;
+export using ::wint_t;
+export using ::wctype_t;
+export using ::wctrans_t;
+export using ::fenv_t;
+export using ::fexcept_t;
+export using ::va_list;
+export using ::jmp_buf;
+export using ::sig_atomic_t;
+export using ::malloc;
+export using ::free;
+export using ::memmove;
+export using ::printf;
+export using ::strlen;
+export using ::toupper;
+export using ::tolower;
+export using ::sqrt;
+export using ::fabs;
