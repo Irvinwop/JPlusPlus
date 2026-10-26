@@ -1507,6 +1507,45 @@ static class JppPtr<T> extends JppIter<T> {
     }
 }
 
+static abstract class JppRecord {
+    JppRecordPosition jppPosition;
+    abstract JppMemoryType jppLayout();
+}
+
+static class JppRecordPosition {
+    final JppMemory memory;
+    final long offset;
+    JppRecordPosition(JppMemory memory, long offset) {
+        this.memory = memory;
+        this.offset = offset;
+    }
+}
+
+static class JppMemoryField<O extends JppRecord, T> {
+    final String name;
+    final long offset;
+    final JppMemoryType type;
+    final java.util.function.Function<O, T> getter;
+    final java.util.function.BiConsumer<O, T> setter;
+    JppMemoryField(String name, long offset, JppMemoryType type,
+                   java.util.function.Function<O, T> getter,
+                   java.util.function.BiConsumer<O, T> setter) {
+        this.name = name;
+        this.offset = offset;
+        this.type = type;
+        this.getter = getter;
+        this.setter = setter;
+    }
+    @SuppressWarnings("unchecked")
+    Object get(JppRecord object) {
+        return getter.apply((O)object);
+    }
+    @SuppressWarnings("unchecked")
+    void set(JppRecord object, Object value) {
+        setter.accept((O)object, (T)value);
+    }
+}
+
 // Clang supplies the C++ width and signedness: Java boxes alone cannot distinguish
 // a C++ short from an int, or a narrow character from char16_t.
 static class JppMemoryType {
@@ -1516,6 +1555,9 @@ static class JppMemoryType {
     final boolean signed;
     final JppMemoryType element;
     final int count;
+    final JppMemoryField<?, ?>[] fields;
+    final java.util.function.Supplier<? extends JppRecord> factory;
+    final boolean recordLittleEndian;
     private JppMemoryType(int bytes, char kind, boolean signed) {
         this.bytes = bytes;
         size = bytes;
@@ -1523,6 +1565,9 @@ static class JppMemoryType {
         this.signed = signed;
         element = null;
         count = 0;
+        fields = null;
+        factory = null;
+        recordLittleEndian = false;
     }
     private JppMemoryType(JppMemoryType element, int count) {
         bytes = 0;
@@ -1531,6 +1576,27 @@ static class JppMemoryType {
         signed = false;
         this.element = element;
         this.count = count;
+        fields = null;
+        factory = null;
+        recordLittleEndian = false;
+    }
+    private JppMemoryType(long size, boolean littleEndian,
+                           java.util.function.Supplier<? extends JppRecord> factory,
+                           JppMemoryField<?, ?>[] fields) {
+        bytes = 0;
+        this.size = size;
+        kind = 'r';
+        signed = false;
+        element = null;
+        count = 0;
+        this.fields = fields;
+        this.factory = factory;
+        recordLittleEndian = littleEndian;
+    }
+    static JppMemoryType record(long size, boolean littleEndian,
+                                java.util.function.Supplier<? extends JppRecord> factory,
+                                JppMemoryField<?, ?>... fields) {
+        return new JppMemoryType(size, littleEndian, factory, fields);
     }
     static JppMemoryType array(JppMemoryType element, int count) {
         return new JppMemoryType(element, count);
@@ -1611,6 +1677,66 @@ static class JppMemoryType {
     }
 }
 
+// Fields stay ordinary Java fields. A view overlays their current values on the
+// allocation's bytes and updates them when a byte operation writes into a field.
+static class JppRecordView {
+    final JppRecord object;
+    final JppMemoryType type;
+    final long offset;
+    final boolean littleEndian;
+    final byte[] padding;
+    JppRecordView(JppRecord object, JppMemoryType type, long offset, boolean littleEndian,
+                   boolean allocated) {
+        this.object = object;
+        this.type = type;
+        this.offset = offset;
+        this.littleEndian = littleEndian;
+        padding = allocated ? null : new byte[Math.toIntExact(type.size)];
+    }
+    int getByte(long relative, byte[] allocation) {
+        for (JppMemoryField<?, ?> field : type.fields)
+            if (relative >= field.offset && relative - field.offset < field.type.size)
+                return field.type.byteAt(field.get(object), (int)(relative - field.offset),
+                                          littleEndian);
+        return (padding == null ? allocation[Math.toIntExact(offset + relative)]
+                                 : padding[Math.toIntExact(relative)]) & 255;
+    }
+    void overlay(long start, byte[] result, int index, int count) {
+        for (JppMemoryField<?, ?> field : type.fields) {
+            long first = Math.max(start, offset + field.offset);
+            long last = Math.min(start + count, offset + field.offset + field.type.size);
+            if (first >= last)
+                continue;
+            Object value = field.get(object);
+            for (long at = first; at < last; ++at)
+                result[index + (int)(at - start)] = (byte)field.type.byteAt(
+                    value, (int)(at - offset - field.offset), littleEndian);
+        }
+    }
+    void write(long start, byte[] source, int index, int count) {
+        if (padding != null)
+            System.arraycopy(source, index, padding, Math.toIntExact(start - offset), count);
+        for (JppMemoryField<?, ?> field : type.fields) {
+            long first = Math.max(start, offset + field.offset);
+            long last = Math.min(start + count, offset + field.offset + field.type.size);
+            if (first >= last)
+                continue;
+            byte[] bytes = new byte[field.type.bytes];
+            Object previous = field.get(object);
+            for (int i = 0; i < bytes.length; ++i)
+                bytes[i] = (byte)field.type.byteAt(previous, i, littleEndian);
+            System.arraycopy(source, index + (int)(first - start), bytes,
+                               (int)(first - offset - field.offset), (int)(last - first));
+            field.set(object, field.type.decode(bytes, 0, littleEndian));
+            Object stored = field.get(object);
+            for (int i = 0; i < bytes.length; ++i)
+                if (field.type.byteAt(stored, i, littleEndian) != (bytes[i] & 255))
+                    throw new UnsupportedOperationException(
+                        "JVM changed a floating object representation");
+        }
+    }
+}
+
 // A byte view retains the real Java array/list/reference cell. Changes through
 // this view and ordinary generated Java accesses therefore see the same storage.
 static class JppMemory {
@@ -1622,6 +1748,7 @@ static class JppMemory {
     final boolean littleEndian;
     byte[] allocation;
     boolean freed;
+    TreeMap<Long, JppRecordView> records;
     @SuppressWarnings("unchecked")
     JppMemory(JppPtr<?> pointer) {
         identity = pointer.storage;
@@ -1636,6 +1763,24 @@ static class JppMemory {
         }
         elementType = pointer.elementType.scalar();
         littleEndian = pointer.littleEndian;
+        if (elementType.kind == 'r' && values != null)
+            for (int i = 0; i < values.size(); ++i) {
+                JppRecord object = (JppRecord)values.get(i);
+                JppRecordPosition previous = object.jppPosition;
+                long offset = (long)i * elementType.size;
+                object.jppPosition = new JppRecordPosition(this, offset);
+                if (previous != null && previous.memory.records != null) {
+                    JppRecordView old = previous.memory.records.get(previous.offset);
+                    if (old != null && old.padding != null) {
+                        if (records == null)
+                            records = new TreeMap<Long, JppRecordView>();
+                        JppRecordView view = new JppRecordView(object, elementType, offset,
+                                                                littleEndian, false);
+                        System.arraycopy(old.padding, 0, view.padding, 0, view.padding.length);
+                        records.put(offset, view);
+                    }
+                }
+            }
     }
     JppMemory(byte[] bytes, boolean littleEndian) {
         // Saved pointer values must not retain an allocation after free.
@@ -1670,7 +1815,51 @@ static class JppMemory {
         if (allocated())
             return allocation.length;
         // A string's terminating NUL is addressable, but is not part of size().
-        return ((long)values.size() + (identity instanceof JppString ? 1 : 0)) * elementType.bytes;
+        return ((long)values.size() + (identity instanceof JppString ? 1 : 0)) * elementType.size;
+    }
+    JppRecordView recordView(long offset, JppMemoryType type) {
+        check(offset, type.size);
+        if (records == null)
+            records = new TreeMap<Long, JppRecordView>();
+        JppRecordView existing = records.get(offset);
+        if (existing != null) {
+            if (existing.type != type)
+                throw new UnsupportedOperationException("overlapping C++ record types");
+            return existing;
+        }
+        Map.Entry<Long, JppRecordView> previous = records.floorEntry(offset);
+        Map.Entry<Long, JppRecordView> next = records.ceilingEntry(offset);
+        if ((previous != null && previous.getKey() + previous.getValue().type.size > offset) ||
+            (next != null && next.getKey() < offset + type.size))
+            throw new UnsupportedOperationException("overlapping C++ record layouts");
+        JppRecord object;
+        if (allocated()) {
+            object = type.factory.get();
+            for (JppMemoryField<?, ?> field : type.fields)
+                field.set(object, field.type.decode(allocation,
+                    Math.toIntExact(offset + field.offset), littleEndian));
+        } else {
+            if (elementType != type || offset % type.size != 0)
+                throw new UnsupportedOperationException("this C++ storage has a different record layout");
+            object = (JppRecord)scalarValue(offset / type.size);
+        }
+        JppRecordView view = new JppRecordView(object, type, offset, littleEndian, allocated());
+        records.put(offset, view);
+        if (object.jppPosition == null || allocated() || values == null || values.size() != 1)
+            object.jppPosition = new JppRecordPosition(this, offset);
+        return view;
+    }
+    Map.Entry<Long, JppRecordView> firstRecord(long offset) {
+        if (records == null)
+            return null;
+        Map.Entry<Long, JppRecordView> entry = records.floorEntry(offset);
+        if (entry == null || entry.getKey() + entry.getValue().type.size <= offset)
+            entry = records.ceilingEntry(offset);
+        return entry;
+    }
+    void bindRecord(long offset) {
+        if (!allocated() && elementType.kind == 'r' && offset >= 0 && offset < size())
+            recordView(offset - offset % elementType.size, elementType);
     }
     Object scalarValue(long index) {
         if (array == null)
@@ -1722,6 +1911,10 @@ static class JppMemory {
     }
     int getByte(long offset) {
         check(offset, 1);
+        bindRecord(offset);
+        Map.Entry<Long, JppRecordView> entry = firstRecord(offset);
+        if (entry != null && entry.getKey() <= offset)
+            return entry.getValue().getByte(offset - entry.getKey(), allocation);
         if (allocated())
             return allocation[(int)offset] & 255;
         return elementType.byteAt(scalarValue(offset / elementType.bytes),
@@ -1731,6 +1924,10 @@ static class JppMemory {
         check(offset, count);
         if (allocated()) {
             System.arraycopy(allocation, (int)offset, result, start, count);
+            for (Map.Entry<Long, JppRecordView> entry = firstRecord(offset);
+                 entry != null && entry.getKey() < offset + count;
+                 entry = records.higherEntry(entry.getKey()))
+                entry.getValue().overlay(offset, result, start, count);
             return;
         }
         for (int i = 0; i < count; ++i)
@@ -1740,6 +1937,26 @@ static class JppMemory {
         check(offset, count);
         if (allocated()) {
             System.arraycopy(source, start, allocation, (int)offset, count);
+            for (Map.Entry<Long, JppRecordView> entry = firstRecord(offset);
+                 entry != null && entry.getKey() < offset + count;
+                 entry = records.higherEntry(entry.getKey())) {
+                JppRecordView view = entry.getValue();
+                long first = Math.max(offset, view.offset);
+                long last = Math.min(offset + count, view.offset + view.type.size);
+                view.write(first, source, start + (int)(first - offset), (int)(last - first));
+            }
+            return;
+        }
+        if (elementType.kind == 'r') {
+            while (count > 0) {
+                long origin = offset - offset % elementType.size;
+                JppRecordView view = recordView(origin, elementType);
+                int part = (int)Math.min(count, origin + elementType.size - offset);
+                view.write(offset, source, start, part);
+                offset += part;
+                start += part;
+                count -= part;
+            }
             return;
         }
         int width = elementType.bytes;
@@ -1766,6 +1983,8 @@ static class JppMemory {
         }
     }
     Object load(long offset, JppMemoryType type) {
+        if (type.kind == 'r')
+            return recordView(offset, type).object;
         if (type.element != null)
             return arrayValue(offset, type);
         check(offset, type.bytes);
@@ -1776,6 +1995,12 @@ static class JppMemory {
         return type.decode(representation, 0, littleEndian);
     }
     void store(long offset, JppMemoryType type, Object value) {
+        if (type.kind == 'r') {
+            JppRecord target = recordView(offset, type).object;
+            for (JppMemoryField<?, ?> field : type.fields)
+                field.set(target, field.get((JppRecord)value));
+            return;
+        }
         if (type.element != null)
             throw new IllegalArgumentException("C++ arrays cannot be assigned as scalar values");
         byte[] representation = new byte[type.bytes];
@@ -3481,6 +3706,19 @@ static class Jpp {
             pointer.littleEndian = littleEndian;
         } else if (!pointer.elementType.sameType(type))
             pointer = new JppMemoryPtr<Object>(memory(pointer), byteOffset(pointer), type);
+        if (type.kind == 'r' && !(pointer instanceof JppMemoryPtr)) {
+            JppMemory storage = pointer.memory;
+            if (storage == null && !pointer.list.isEmpty()) {
+                JppRecord object = (JppRecord)pointer.list.get(0);
+                JppRecordPosition binding = object.jppPosition;
+                if (binding != null && binding.memory.elementType == type &&
+                    sameStorage(binding.memory.identity, pointer.storage))
+                    storage = binding.memory;
+            }
+            if (storage == null)
+                storage = memory(pointer);
+            pointer = new JppMemoryPtr<Object>(storage, byteOffset(pointer), type);
+        }
         return (JppPtr<T>)pointer;
     }
     static JppMemory memory(JppPtr<?> pointer) {
@@ -3520,10 +3758,35 @@ static class Jpp {
         return left == right || (left instanceof JppAddress && left.equals(right));
     }
     static boolean sameMemoryAddress(JppPtr<?> left, JppIter<?> right) {
-        if (right instanceof JppPtr && ((JppPtr<?>)right).elementType != null)
-            return sameStorage(left.storage, right.storage) &&
-                byteOffset(left) == byteOffset((JppPtr<?>)right);
+        if (right instanceof JppPtr && ((JppPtr<?>)right).elementType != null) {
+            JppPtr<?> pointer = (JppPtr<?>)right;
+            if (sameStorage(left.storage, pointer.storage))
+                return byteOffset(left) == byteOffset(pointer);
+            prepareRecordAddress(left);
+            prepareRecordAddress(pointer);
+            JppRecordPosition a = memoryPosition(left), b = memoryPosition(pointer);
+            return sameStorage(a.memory.identity, b.memory.identity) && a.offset == b.offset;
+        }
         return sameStorage(left.storage, right.storage) && left.pos == right.pos;
+    }
+    static void prepareRecordAddress(JppPtr<?> pointer) {
+        memory(pointer).bindRecord(byteOffset(pointer));
+    }
+    static JppRecordPosition memoryPosition(JppPtr<?> pointer) {
+        JppMemory memory = memory(pointer);
+        long offset = byteOffset(pointer);
+        // A field address can precede discovery of the containing array. Follow
+        // the object's current binding when its earlier view was a singleton.
+        while (!memory.allocated() && memory.elementType.kind == 'r' &&
+               memory.values != null && memory.values.size() == 1) {
+            JppRecord object = (JppRecord)memory.values.get(0);
+            JppRecordPosition binding = object.jppPosition;
+            if (binding == null || binding.memory == memory)
+                break;
+            memory = binding.memory;
+            offset += binding.offset;
+        }
+        return new JppRecordPosition(memory, offset);
     }
     static long pointerDifference(JppIter<?> left, JppIter<?> right) {
         if (left == null && right == null)
@@ -3531,10 +3794,15 @@ static class Jpp {
         if (left instanceof JppPtr && right instanceof JppPtr) {
             JppPtr<?> a = (JppPtr<?>)left, b = (JppPtr<?>)right;
             if (a.elementType != null && b.elementType != null) {
-                if (!sameStorage(a.storage, b.storage))
+                if (sameStorage(a.storage, b.storage))
+                    return (byteOffset(a) - byteOffset(b)) / a.elementType.size;
+                prepareRecordAddress(a);
+                prepareRecordAddress(b);
+                JppRecordPosition from = memoryPosition(a), to = memoryPosition(b);
+                if (!sameStorage(from.memory.identity, to.memory.identity))
                     throw new IllegalArgumentException(
                         "subtracting pointers to different allocations");
-                return (byteOffset(a) - byteOffset(b)) / a.elementType.size;
+                return (from.offset - to.offset) / a.elementType.size;
             }
         }
         return (long)left.pos - right.pos;
@@ -3562,6 +3830,8 @@ static class Jpp {
             throw new IllegalArgumentException("free requires a live allocation base");
         memory.freed = true;
         memory.allocation = null;
+        if (memory.records != null)
+            memory.records.clear();
     }
     static JppPtr<?> realloc(JppPtr<?> pointer, long size, boolean littleEndian) {
         if (pointer == null)
@@ -3591,8 +3861,20 @@ static class Jpp {
         long target = byteOffset(destination), origin = byteOffset(source);
         to.check(target, count);
         from.check(origin, count);
-        boolean backwards = move && sameStorage(to.identity, from.identity) && target > origin &&
-                            target - origin < count;
+        boolean backwards = false;
+        if (move) {
+            if (sameStorage(to.identity, from.identity))
+                backwards = target > origin && target - origin < count;
+            else {
+                prepareRecordAddress(destination);
+                prepareRecordAddress(source);
+                JppRecordPosition targetAddress = memoryPosition(destination);
+                JppRecordPosition sourceAddress = memoryPosition(source);
+                backwards = sameStorage(targetAddress.memory.identity, sourceAddress.memory.identity) &&
+                    targetAddress.offset > sourceAddress.offset &&
+                    targetAddress.offset - sourceAddress.offset < count;
+            }
+        }
         byte[] buffer = new byte[(int)Math.min(count, 16384)];
         long done = 0;
         while (done < count) {
@@ -3639,6 +3921,15 @@ static class Jpp {
         return null;
     }
     static <T> JppPtr<T> address(JppRef<T> value, Object object, Object field) {
+        if (object instanceof JppRecord) {
+            JppRecord record = (JppRecord)object;
+            Jpp.pointerValue(record);
+            JppRecordPosition position = record.jppPosition;
+            for (JppMemoryField<?, ?> member : record.jppLayout().fields)
+                if (member.name.equals(field))
+                    return new JppMemoryPtr<T>(position.memory, position.offset + member.offset,
+                                               member.type);
+        }
         List<T> view = new AbstractList<T>() {
             public int size() {
                 return 1;
@@ -3656,7 +3947,21 @@ static class Jpp {
         };
         return new JppPtr<T>(view, 0, new JppAddress(object, field));
     }
+    @SuppressWarnings("unchecked")
     static <T> JppPtr<T> pointerValue(T value) {
+        if (value instanceof JppRecord) {
+            JppRecord object = (JppRecord)value;
+            JppMemoryType type = object.jppLayout();
+            if (object.jppPosition == null) {
+                JppPtr<T> pointer = new JppPtr<T>(Collections.singletonList(value), 0, value);
+                pointer.elementType = type;
+                pointer.littleEndian = type.recordLittleEndian;
+                JppMemory storage = memory(pointer);
+                storage.recordView(0, type);
+            }
+            JppRecordPosition position = object.jppPosition;
+            return new JppMemoryPtr<T>(position.memory, position.offset, type);
+        }
         return address(JppRef.cell(value), value, "");
     }
     static <T> JppPtr<T> allocate(int count, java.util.function.IntFunction<T> initializer) {

@@ -179,6 +179,9 @@ int main() {
         cases.emplace_back("gnu", expressions.str());
         cases.emplace_back("pointers", expressions.str());
         cases.emplace_back("memory", expressions.str());
+        cases.emplace_back("record_storage", expressions.str());
+        cases.emplace_back("record_construction", "");
+        cases.emplace_back("record_release", "64 19\n");
         cases.emplace_back("allocation_release", "256 19\n");
         cases.emplace_back("array_views", expressions.str());
         cases.emplace_back("array_literals", expressions.str());
@@ -423,7 +426,8 @@ int main() {
                         for (const auto& [file, contents] : expectedFiles)
                             fs::remove(p / file);
                         std::vector<std::string> execute = {java};
-                        if (name == "allocation_release" || name == "scoped_allocations")
+                        if (name == "allocation_release" || name == "scoped_allocations" ||
+                            name == "record_release")
                             execute.push_back("-Xmx64m");
                         execute.insert(execute.end(),
                                        {"-cp", classes.string(),

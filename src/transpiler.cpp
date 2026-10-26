@@ -8,6 +8,7 @@
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/ParentMapContext.h>
+#include <clang/AST/RecordLayout.h>
 #include <clang/AST/StmtCXX.h>
 #include <clang/Basic/TargetInfo.h>
 #include <clang/Format/Format.h>
@@ -436,6 +437,8 @@ class Emitter {
     std::unordered_map<const OpaqueValueExpr*, std::string> opaqueReferences;
     std::unordered_map<const Expr*, std::string> arrayBounds;
     std::unordered_set<const CXXBindTemporaryExpr*> localInitializers;
+    std::unordered_set<const CXXRecordDecl*> byteRecords;
+    std::unordered_map<const CXXRecordDecl*, std::string> recordLayoutNames;
     struct ArrayBoundScope {
         std::unordered_map<const Expr*, std::string>& bounds;
         std::unordered_map<const Expr*, std::string> previous;
@@ -520,6 +523,9 @@ class Emitter {
                 method && base == "close" &&
                 scopedDestructor(ctx.getRecordType(method->getParent())))
                 base = "cpp_close";
+            if (auto method = dyn_cast<CXXMethodDecl>(f);
+                method && base == "jppLayout" && byteRecords.count(method->getParent()))
+                base = "cpp_jppLayout";
             if (f->isMain())
                 base = "cppMain";
             else if (f->isOverloadedOperator()) {
@@ -748,8 +754,51 @@ class Emitter {
     void captureExpressionBounds(const Stmt* s) {
         expressionBounds(s, true);
     }
+    const CXXRecordDecl* byteRecord(QualType t) const {
+        auto r = record(t);
+        if (r)
+            r = r->getDefinition();
+        if (!r || !user(r) || !r->isCompleteDefinition() || !r->isStandardLayout() ||
+            !r->isTriviallyCopyable() || r->isUnion() || r->getNumBases())
+            return nullptr;
+        for (auto field : r->fields()) {
+            auto item = field->getType();
+            if (field->isBitField() || item->isReferenceType() ||
+                (!item->isIntegerType() && !item->isEnumeralType() &&
+                 !(item->isRealFloatingType() &&
+                   (ctx.getTypeSize(item) == 32 || ctx.getTypeSize(item) == 64))))
+                return nullptr;
+        }
+        return r;
+    }
     std::string memoryType(QualType t) {
         t = clean(t);
+        if (auto r = byteRecord(t); r && byteRecords.count(r)) {
+            if (auto saved = recordLayoutNames.find(r); saved != recordLayoutNames.end())
+                return saved->second;
+            auto layout = temporary("jppRecordLayout");
+            recordLayoutNames[r] = layout;
+            std::vector<std::string> fields;
+            const auto& native = ctx.getASTRecordLayout(r);
+            unsigned index = 0;
+            for (auto field : r->fields()) {
+                auto fieldType = memoryType(field->getType());
+                auto member = name(field);
+                fields.push_back("new JppMemoryField<" + name(r) + ", " +
+                                 boxed(field->getType()) + ">(" + quote(member) + ", " +
+                                 std::to_string(native.getFieldOffset(index++) /
+                                                ctx.getCharWidth()) +
+                                 "L, " + fieldType + ", object -> object." + member +
+                                 ", (object, value) -> object." + member + " = value)");
+            }
+            auto initializer = "JppMemoryType.record(" +
+                               std::to_string(native.getSize().getQuantity()) + "L, " +
+                               targetLittleEndian() + ", () -> new " + name(r) +
+                               "((JppUninitialized)null)" +
+                               (fields.empty() ? "" : ", " + join(fields)) + ")";
+            arrayLayoutFields.emplace_back(layout, initializer);
+            return layout;
+        }
         if (auto a = ctx.getAsArrayType(t)) {
             if (auto saved = constantArrayLayouts.find(t.getTypePtr());
                 saved != constantArrayLayouts.end())
@@ -1945,6 +1994,12 @@ class Emitter {
                                 : branch->getCond()->EvaluateKnownConstInt(ctx).getBoolValue();
             scan(selected ? branch->getThen() : branch->getElse());
             return;
+        }
+        if (auto expression = dyn_cast<Expr>(s)) {
+            auto t = clean(expression->getType());
+            if (dataPointer(t))
+                if (auto r = byteRecord(clean(t->getPointeeType())))
+                    byteRecords.insert(r);
         }
         if (auto temporary = dyn_cast<CXXBindTemporaryExpr>(s);
             temporary && ownsDestructor(temporary->getType()) &&
@@ -3743,7 +3798,9 @@ class Emitter {
                 if (defaultedMove(method) && c->getNumArgs() == 1)
                     requireDefaultedMove(method);
                 auto allocatedName = method->getParent()->isLambda() ? "call" : name(f);
-                auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                auto object = isa<CXXThisExpr>(bare(obj))
+                                  ? (constructionThis.empty() ? "this" : constructionThis)
+                                  : me->isArrow() ? expr(obj) + ".get()" : expr(obj);
                 return object + "." + allocatedName + "(" + arguments(c, f) + ")";
             }
             auto n = me->getMemberDecl()->getNameAsString();
@@ -4734,7 +4791,7 @@ class Emitter {
             auto element = clean(input->getType())->getPointeeType();
             if (element->isVoidType())
                 return "Jpp.voidPointer(" + result + ")";
-            if (!element->isVoidType() && !element->isRecordType() && !element->isPointerType())
+            if (!element->isVoidType() && !element->isPointerType())
                 if (auto layout = memoryType(element); !layout.empty())
                     result = "Jpp.<" + boxed(element) + ">typedPointer(" + result + ", " + layout +
                              ", " + targetLittleEndian() + ")";
@@ -4745,6 +4802,12 @@ class Emitter {
         if (!input)
             return "";
         auto e = strip(input);
+        if (isa<OffsetOfExpr>(e)) {
+            Expr::EvalResult result;
+            if (e->EvaluateAsInt(result, ctx))
+                return integerLiteral(result.Val.getInt(), e->getType());
+            fail(e, "runtime offsetof indices need additional layout lowering");
+        }
         if (auto x = dyn_cast<IntegerLiteral>(e)) {
             return integerLiteral(x->getValue(), x->getType());
         }
@@ -4881,9 +4944,9 @@ class Emitter {
                 auto from = clean(x->getSubExpr()->getType()->getPointeeType());
                 auto to = clean(x->getType()->getPointeeType());
                 if (to->isVoidType() ||
-                    (!to->isRecordType() && !to->isPointerType() && !memoryType(to).empty() &&
-                     (from->isVoidType() || (!from->isRecordType() && !from->isPointerType() &&
-                                             !memoryType(from).empty()))))
+                    (!to->isPointerType() && !memoryType(to).empty() &&
+                     (from->isVoidType() ||
+                      (!from->isPointerType() && !memoryType(from).empty()))))
                     return expr(x->getSubExpr());
                 if (x->getCastKind() == CK_BitCast && !from->isVoidType() &&
                     !ctx.hasSameType(from, to))
@@ -6510,10 +6573,16 @@ class Emitter {
         auto destructor = scopedDestructor(ctx.getRecordType(r));
         if (destructor && !destructor->hasBody())
             fail(destructor->getLocation(), "the destructor definition is needed for translation");
-        line("static class " + n + " implements JppAssignable<" + n + ">" +
+        line("static class " + n + (byteRecords.count(r) ? " extends JppRecord" : "") +
+             " implements JppAssignable<" + n + ">" +
              (destructor ? ", AutoCloseable" : "") + (less ? ", Comparable<" + n + ">" : ""));
         line("{");
         ++indent;
+        if (byteRecords.count(r)) {
+            line("JppMemoryType jppLayout() { return " + memoryType(ctx.getRecordType(r)) + "; }");
+            if (!r->isAggregate())
+                line(n + "(JppUninitialized " + temporary("jppUninitialized") + ") {}");
+        }
         std::vector<std::string> params, assignments, defaults;
         for (auto decl : r->decls())
             if (auto field = dyn_cast<VarDecl>(decl); field && field->isStaticDataMember()) {
