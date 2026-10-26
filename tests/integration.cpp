@@ -235,6 +235,38 @@ int main() {
         cases.emplace_back("character_conversion", "");
         cases.emplace_back("character_classification", "");
         cases.emplace_back("character_classification_module", "");
+        std::mt19937_64 overflowRandom(0x6f766572666c6f77ULL);
+        std::ostringstream overflowInputs;
+        std::vector<long long> overflowSigned = {
+            LLONG_MIN, LLONG_MIN + 1, -2147483648LL, -32768,   -129, -128, -1, 0, 1, 127, 128, 255,
+            32767,     2147483647LL,  LLONG_MAX - 1, LLONG_MAX};
+        std::vector<unsigned long long> overflowUnsigned = {0,
+                                                            1,
+                                                            2,
+                                                            127,
+                                                            128,
+                                                            255,
+                                                            256,
+                                                            32767,
+                                                            32768,
+                                                            65535,
+                                                            65536,
+                                                            2147483647ULL,
+                                                            4294967295ULL,
+                                                            4294967296ULL,
+                                                            9223372036854775807ULL,
+                                                            9223372036854775808ULL,
+                                                            ULLONG_MAX - 1,
+                                                            ULLONG_MAX};
+        overflowInputs << overflowSigned.size() * overflowUnsigned.size() + 100 << '\n';
+        for (auto first : overflowSigned)
+            for (auto second : overflowUnsigned)
+                overflowInputs << first << ' ' << second << '\n';
+        for (int i = 0; i < 100; ++i)
+            overflowInputs << static_cast<long long>(overflowRandom()) << ' ' << overflowRandom()
+                           << '\n';
+        cases.emplace_back("checked_arithmetic", overflowInputs.str());
+        cases.emplace_back("checked_storage", overflowInputs.str());
         cases.emplace_back("string_literals", "8\n0\n1\n65\n127\n128\n255\n256\n-1\n");
 #ifdef __GLIBC__
         std::mt19937_64 cRandom(0x72616e646f6d);

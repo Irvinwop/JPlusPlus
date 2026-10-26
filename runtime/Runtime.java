@@ -145,6 +145,21 @@ static class JppGmpInteger {
     }
 }
 
+static class JppIntegerOverflow {
+    static BigInteger unsigned(BigInteger value, int width) {
+        return value.and(BigInteger.ONE.shiftLeft(width).subtract(BigInteger.ONE));
+    }
+    static <T> boolean store(BigInteger value, int width, boolean signed, JppPtr<T> destination,
+                              java.util.function.Function<BigInteger, T> convert) {
+        BigInteger modulus = BigInteger.ONE.shiftLeft(width);
+        BigInteger narrowed = value.and(modulus.subtract(BigInteger.ONE));
+        if (signed && narrowed.testBit(width - 1))
+            narrowed = narrowed.subtract(modulus);
+        destination.put(convert.apply(narrowed));
+        return !value.equals(narrowed);
+    }
+}
+
 // Narrow character classification in the initial C locale.
 static class JppCtype {
     static boolean isalnum(int value) {

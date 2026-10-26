@@ -4796,6 +4796,44 @@ class Emitter {
             return "Jpp.trap()";
         if (n.starts_with("__builtin_")) {
             auto op = n.substr(10);
+            static const auto checkedIntegers = [] {
+                std::map<std::string, std::string> names;
+                for (const auto& [stem, method] : std::map<std::string, std::string>{
+                         {"add", "add"}, {"sub", "subtract"}, {"mul", "multiply"}}) {
+                    names[stem + "_overflow"] = method;
+                    for (auto prefix : {"s", "u"})
+                        for (auto length : {"", "l", "ll"})
+                            names[prefix + stem + length + "_overflow"] = method;
+                }
+                return names;
+            }();
+            if (auto operation = checkedIntegers.find(op); operation != checkedIntegers.end()) {
+                if (c->getNumArgs() != 3)
+                    fail(c,
+                         "checked integer arithmetic requires two operands and a result pointer");
+                auto destination = c->getArg(2)->getType()->getPointeeType();
+                if (destination.isNull() || !clean(destination)->isIntegerType())
+                    fail(c, "checked integer arithmetic requires an integer result pointer");
+                destination = clean(destination);
+                auto width = ctx.getTypeSize(destination);
+                if (width == 0 || width > 128)
+                    fail(c, "this checked integer result width needs additional lowering");
+                auto operand = [&](const Expr* expression) {
+                    auto result = ordinal(expression);
+                    auto source = clean(expression->getType());
+                    if (big(source) && source->isUnsignedIntegerType())
+                        result = "JppIntegerOverflow.unsigned(" + result + ", " +
+                                 std::to_string(ctx.getTypeSize(source)) + ")";
+                    return result;
+                };
+                auto result = temporary("jppCheckedValue");
+                return "JppIntegerOverflow.store((" + operand(c->getArg(0)) + ")." +
+                       operation->second + "(" + operand(c->getArg(1)) + "), " +
+                       std::to_string(width) + ", " +
+                       (destination->isSignedIntegerType() ? "true" : "false") + ", " +
+                       value(c->getArg(2), c->getArg(2)->getType()) + ", " + result + " -> " +
+                       converted(result, ctx.Int128Ty, destination) + ")";
+            }
             std::string cls = op.ends_with("ll") || op.ends_with("l") ? "Long" : "Integer";
             if (op.starts_with("popcount"))
                 return cls + ".bitCount(" + expr(c->getArg(0)) + ")";
