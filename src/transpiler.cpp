@@ -1785,7 +1785,7 @@ class Emitter {
     bool referenceABI(QualType t) const {
         return t->isReferenceType() &&
                (clean(t)->isArithmeticType() || clean(t)->isEnumeralType() || dataPointer(t) ||
-                primitiveArray(t));
+                primitiveArray(t) || family(t) == "reference_wrapper");
     }
     std::string parameterType(QualType t) {
         return referenceABI(t) ? "JppRef<" + boxed(t) + ">" : type(t);
@@ -4662,6 +4662,8 @@ class Emitter {
             if (aliases.count(x->getDecl()))
                 return aliases[x->getDecl()];
             auto d = x->getDecl();
+            if (auto function = dyn_cast<FunctionDecl>(d))
+                return functionPointer(function, ctx.getPointerType(e->getType()));
             auto n = d->getNameAsString();
             if (!user(d)) {
                 if (n == "ignore")
@@ -5172,6 +5174,9 @@ class Emitter {
                         if (!(isa<ImplicitValueInitExpr>(element) &&
                               ctx.getAsArrayType(element->getType())))
                             a.push_back(value(element, this->element(t), true));
+                if (a.size() == templateArgs(t)[1].getAsIntegral().getZExtValue())
+                    return "new " + type(t) + "(Arrays.<" + boxed(element(t)) + ">asList(" +
+                           join(a) + "))";
                 return "Jpp.vectorInitialized(" + number(templateArgs(t)[1].getAsIntegral()) +
                        ", () -> " + defaultValue(element(t)) + ", Arrays.<" + boxed(element(t)) +
                        ">asList(" + join(a) + "))";
@@ -6360,6 +6365,8 @@ class Emitter {
             fail(r->getLocation(), "class inheritance is not supported yet");
         source(r);
         currentRecord = r;
+        auto defaultConstructor = sema.LookupDefaultConstructor(const_cast<CXXRecordDecl*>(r));
+        bool defaultConstructible = defaultConstructor && !defaultConstructor->isDeleted();
         bool less = false;
         const CXXMethodDecl* lt = nullptr;
         for (auto m : r->methods())
@@ -6405,12 +6412,14 @@ class Emitter {
         }
         if (r->isAggregate()) {
             line(n + "(JppUninitialized " + temporary("jppUninitialized") + ") {}");
-            line(n + "() {");
-            ++indent;
-            for (auto d : defaults)
-                line(d);
-            --indent;
-            line("}");
+            if (defaultConstructible) {
+                line(n + "() {");
+                ++indent;
+                for (auto d : defaults)
+                    line(d);
+                --indent;
+                line("}");
+            }
             if (!params.empty()) {
                 line(n + "(" + join(params) + ") {");
                 ++indent;
@@ -6422,7 +6431,7 @@ class Emitter {
         }
         const CXXConstructorDecl* customCopy = nullptr;
         const CXXMethodDecl* customAssignment = nullptr;
-        bool emittedDefault = r->isAggregate();
+        bool emittedDefault = r->isAggregate() && defaultConstructible;
         for (auto method : r->methods()) {
             if (method->isCopyAssignmentOperator() && !method->isImplicit() &&
                 !method->isDefaulted() && method->hasBody())
@@ -6439,7 +6448,7 @@ class Emitter {
                     emittedDefault = true;
             }
         }
-        if (!emittedDefault && !r->hasUserDeclaredConstructor()) {
+        if (!emittedDefault && !r->hasUserDeclaredConstructor() && defaultConstructible) {
             line(n + "() {");
             ++indent;
             for (auto d : defaults)

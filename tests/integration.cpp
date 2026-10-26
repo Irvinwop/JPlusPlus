@@ -186,6 +186,7 @@ int main() {
         cases.emplace_back("tuples", expressions.str());
         cases.emplace_back("tuple_references", expressions.str());
         cases.emplace_back("tuple_wrappers", expressions.str());
+        cases.emplace_back("wrapper_aliases", expressions.str());
         cases.emplace_back("tuple_ordering", expressions.str());
         cases.emplace_back("tuple_calls", expressions.str());
         cases.emplace_back("tuple_objects", expressions.str());
