@@ -3555,6 +3555,19 @@ static final JppOutput jppOut = new JppOutput(System.out),
                       jppLog = new JppOutput(jppErr);
 
 static class Jpp {
+    static JppPtr<JppPtr<Character>> arguments(String program, String[] arguments) {
+        ArrayList<JppPtr<Character>> values = new ArrayList<JppPtr<Character>>();
+        values.add(argumentString(program));
+        for (String argument : arguments)
+            values.add(argumentString(argument));
+        values.add(null);
+        return pointer(begin(values));
+    }
+    static JppPtr<Character> argumentString(String value) {
+        String bytes = new String(value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                                  java.nio.charset.StandardCharsets.ISO_8859_1);
+        return new JppString(bytes).c_str();
+    }
     static long byteIoCount(long size, long count) {
         if (size == 0 || count == 0)
             return 0;
@@ -4321,6 +4334,18 @@ static class Jpp {
     }
     static char[] charArray(String value, int size) {
         return Arrays.copyOf(value.toCharArray(), size);
+    }
+    static long strlen(Object value) {
+        if (value instanceof JppIter) {
+            JppIter<?> at = ((JppIter<?>)value).plus(0);
+            long length = 0;
+            while ((Character)at.get() != '\0') {
+                ++length;
+                at.advance(1);
+            }
+            return length;
+        }
+        return cString(value).length();
     }
     static String cString(Object value) {
         if (value instanceof String) {

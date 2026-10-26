@@ -153,6 +153,7 @@ int main() {
         cases.emplace_back("maps", keys.str());
         cases.emplace_back("jumps", keys.str());
         cases.emplace_back("lambdas", "17\n");
+        cases.emplace_back("arguments", "");
         cases.emplace_back("cpp23", "-9\n");
         std::ostringstream bits;
         bits << 70 << '\n';
@@ -371,7 +372,13 @@ int main() {
                     : source;
             must({cxx, "-std=gnu++23", "-O2", nativeSource, "-o", (p / "native").string()},
                  p / "empty");
-            must({(p / "native").string()}, p / "input");
+            std::vector<std::string> programArguments;
+            if (name == "arguments")
+                programArguments = {"alpha beta", "\xce\xbb\xf0\x9f\x99\x82", "", "-17"};
+            std::vector<std::string> nativeCommand{(p / "native").string()};
+            nativeCommand.insert(nativeCommand.end(), programArguments.begin(),
+                                 programArguments.end());
+            must(nativeCommand, p / "input");
             auto expected = read(p / "stdout");
             auto expectedErrors = read(p / "stderr");
             std::map<std::string, std::string> expectedFiles;
@@ -435,6 +442,8 @@ int main() {
                         execute.insert(execute.end(),
                                        {"-cp", classes.string(),
                                         name == "library" ? "LibraryDriver" : "Main"});
+                        execute.insert(execute.end(), programArguments.begin(),
+                                       programArguments.end());
                         must(execute, p / "input");
                         if (read(p / "stdout") != expected)
                             throw std::runtime_error("output differs from native C++: " + name +
@@ -460,6 +469,24 @@ int main() {
         if (!selected.empty() && !selected.count("cli")) {
             std::cout << checks << " compiler/runtime differential checks passed\n";
             return 0;
+        }
+        auto argumentSource = (fs::path(JPP_SOURCE) / "tests/fixtures/arguments.cpp").string();
+        must({cxx, "-std=gnu++23", "-O2", argumentSource, "-o", (p / "native-args").string()},
+             p / "empty");
+        for (const auto& words : std::vector<std::vector<std::string>>{
+                 {}, {"alpha beta", "\xce\xbb\xf0\x9f\x99\x82", "", "-17"}}) {
+            std::vector<std::string> nativeArguments{(p / "native-args").string()};
+            nativeArguments.insert(nativeArguments.end(), words.begin(), words.end());
+            must(nativeArguments, p / "empty");
+            auto expectedArguments = read(p / "stdout");
+            std::vector<std::string> cliArguments{
+                JPP_BINARY, argumentSource, "-r", "-v", "j8", "-o", (p / "Main.java").string(),
+                "--"};
+            cliArguments.insert(cliArguments.end(), words.begin(), words.end());
+            must(cliArguments, p / "empty");
+            if (read(p / "stdout") != expectedArguments)
+                throw std::runtime_error("CLI arguments differ from native C++");
+            ++checks;
         }
         // Rejection must preserve an existing submission, including across a failed --check.
         write(p / "bad.cpp", "int main(){ asm volatile(\"nop\"); }\n");

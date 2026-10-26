@@ -2,6 +2,8 @@
 
 `tests/integration.cpp` is a C++ end-to-end harness. The oracle is the independently compiled native C++ program. Each Java target is generated separately, compiled into real class files, and run with the same input. Output is compared byte for byte. The harness also checks class-file versions and failure behavior of the CLI.
 
+Entrypoint cases pass spaced, empty, negative-looking, and non-ASCII arguments to native C++ and each generated Java target. They compare UTF-8 bytes, null termination, writable argument strings, pointer rebinding, and updates to `argc` and `argv`. CLI checks also exercise `-r -- ...` and an invocation with no extra arguments.
+
 Randomized inputs have a fixed seed so failures can be reproduced. Fixtures exercise negative values, duplicates, 64-bit magnitudes, graph paths, nested-container mutations, value copies, shared references, recursion, bit operations, unsigned values above the signed limit, and intermediate products requiring 128 bits. Expression regressions cover assignment precedence, boolean promotions and arithmetic, and C++17 assignment sequencing, including destinations with side effects and compound assignments that modify their own operands.
 
 Algorithm and conversion fixtures exercise reference callbacks, returned stateful function objects, generic comparators, overlapping backward copies, cross-type output iterators, pair conversions, conditional lvalues, emplacement, and map/set merging. Library translation units without `main` are checked using separate native and Java drivers that call the translated methods.
