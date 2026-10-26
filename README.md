@@ -20,6 +20,8 @@ j++ solution.cpp -r -v j8           # target Java 8
 j++ solution.cpp --check -o Solve.java
 ```
 
+Inputs using `import std;` receive a module built with the selected C++ frontend automatically. The result remains one Java source file; supported library APIs are listed in [compatibility](docs/compatibility.md).
+
 ## What the output looks like
 
 Your algorithm stays in ordinary Java methods. `vector<T>` becomes `ArrayList<T>`, fixed and variable length C arrays become Java arrays, and user structs become nested classes. Support helpers handle C++ behavior such as value copies, mutable references, pairs, and iterators. Only the helpers your program uses are included.

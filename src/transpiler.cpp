@@ -1,5 +1,6 @@
 #include "transpiler.hpp"
 #include "runtime.hpp"
+#include "standard_module.hpp"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
@@ -4691,6 +4692,12 @@ class Emitter {
         if (memoryOperation == "strlen")
             return converted("Jpp.strlen(" + expr(c->getArg(0)) + ")", ctx.UnsignedLongLongTy,
                              c->getType());
+        if (isa<UserDefinedLiteral>(c) && isString(c->getType()) && c->getNumArgs() == 2) {
+            auto source = clean(c->getArg(0)->getType());
+            if (source->isPointerType() && source->getPointeeType()->isCharType())
+                return "new JppString(" + value(c->getArg(0), c->getArg(0)->getType(), true) +
+                       ", " + value(c->getArg(1), ctx.UnsignedLongLongTy) + ")";
+        }
         if (isa<UserDefinedLiteral>(c) && family(c->getType()) == "duration" &&
             c->getNumArgs() == 1)
             return chronoValue(c->getType(), value(c->getArg(0), ctx.LongLongTy));
@@ -8056,9 +8063,18 @@ class Action final : public ASTFrontendAction {
     const Options& opt;
     std::string& output;
     bool& success;
+    bool captured;
 
   public:
-    Action(const Options& o, std::string& s, bool& b) : opt(o), output(s), success(b) {}
+    Action(const Options& o, std::string& s, bool& b, bool buffered)
+        : opt(o), output(s), success(b), captured(buffered) {}
+    bool BeginSourceFileAction(CompilerInstance& compiler) override {
+        // The supplied printer captures complete diagnostics. Avoid a separate
+        // summary on stderr for an import that the standard-module retry handles.
+        if (captured)
+            compiler.getDiagnosticOpts().ShowCarets = false;
+        return true;
+    }
     std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance& compiler,
                                                    llvm::StringRef) override {
         return std::make_unique<Consumer>(compiler, opt, output, success);
@@ -8068,11 +8084,13 @@ class Factory final : public tooling::FrontendActionFactory {
     const Options& opt;
     std::string& output;
     bool& success;
+    bool captured;
 
   public:
-    Factory(const Options& o, std::string& s, bool& b) : opt(o), output(s), success(b) {}
+    Factory(const Options& o, std::string& s, bool& b, bool buffered)
+        : opt(o), output(s), success(b), captured(buffered) {}
     std::unique_ptr<FrontendAction> create() override {
-        return std::make_unique<Action>(opt, output, success);
+        return std::make_unique<Action>(opt, output, success, captured);
     }
 };
 } // namespace
@@ -8102,10 +8120,17 @@ bool transpile(const Options& opt, std::string& java) {
     std::vector<std::string> args = {"-std=gnu++23",   "-fsyntax-only", "-Wno-unused-value",
                                      "-DONLINE_JUDGE", "-resource-dir", JPP_CLANG_RESOURCE_DIR};
     args.insert(args.end(), opt.compilerArgs.begin(), opt.compilerArgs.end());
-    tooling::FixedCompilationDatabase db(std::filesystem::current_path().string(), args);
-    tooling::ClangTool tool(db, {opt.input});
-    bool success = false;
-    Factory factory(opt, java, success);
-    return tool.run(&factory) == 0 && success;
+    return withStandardModule(opt, args,
+                              [&](const auto& arguments, DiagnosticConsumer* diagnostic) {
+                                  tooling::FixedCompilationDatabase db(
+                                      std::filesystem::current_path().string(), arguments);
+                                  tooling::ClangTool tool(db, {opt.input});
+                                  if (diagnostic)
+                                      tool.setDiagnosticConsumer(diagnostic);
+                                  tool.setPrintErrorMessage(!diagnostic);
+                                  bool success = false;
+                                  Factory factory(opt, java, success, diagnostic != nullptr);
+                                  return tool.run(&factory) == 0 && success;
+                              });
 }
 } // namespace jpp

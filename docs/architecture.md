@@ -15,11 +15,15 @@ One standalone .java file
 
 The implementation is C++23 and uses Clang's C++ AST API directly. It does not parse C++ with regular expressions, translate through a VM, or embed an executable. Preprocessor macros and included local headers go through the same frontend as normal C++ compilation. Instantiated user function templates are emitted as concrete methods.
 
+`src/standard_module.cpp` handles an actual missing `std` module diagnostic. It scans the selected toolchain's available standard headers, exports eligible namespace declarations and the global allocation functions, and builds a real module interface with the same Clang library and compiler arguments. The original input is then parsed with that module file. Inline namespaces, namespace aliases, operators and literal operators retain their identities; internal-linkage implementation declarations are not exported. Temporary module files are removed after translation. Inputs without a missing standard import use their ordinary frontend pass, and explicit compatible module files keep working.
+
 ## Java mappings
 
 `src/transpiler.cpp` walks user declarations and translates expressions and statements. Primitive C++ arrays become primitive Java arrays. `std::vector` uses `ArrayList`. Helpers use `TreeMap`, `HashMap`, `ArrayDeque`, and `PriorityQueue` for the corresponding library operations. A mutable string wrapper uses `StringBuilder` to support C++ character assignment.
 
 Narrow strings retain one Java character per C++ byte. Literal emission escapes non-ASCII bytes, and stream encoding uses ISO-8859-1 to preserve those bytes in both directions. This keeps UTF-8 sequences, invalid UTF-8, and embedded NULs intact without treating C++ string lengths as Unicode character counts. C-string operations stop at NUL; explicit lengths and iterator ranges retain it. File paths are truncated at NUL and decoded as UTF-8 for Java's filesystem APIs. Arbitrary non-UTF-8 Unix filenames remain unsupported.
+
+Supported narrow library literal operators construct strings from their pointer and explicit byte count, so a NUL does not truncate the value. User-defined literal functions continue through ordinary user-function emission.
 
 C++ copies are semantically different from Java reference assignment. Copying a vector or struct must keep later mutations independent. Generated copy methods and `jppCopy` preserve that behavior in supported paths. Assignment uses separate methods that update the existing object, so retained references continue to observe its fields. Member initializers run during construction and are omitted when the C++ copy constructor supplies those members.
 
