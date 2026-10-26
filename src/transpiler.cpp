@@ -458,6 +458,7 @@ class Emitter {
     std::unordered_map<const LabelDecl*, std::string> jumpLabels;
     std::unordered_map<const FunctionProtoType*, std::string> functionTypes;
     std::vector<std::pair<const FunctionProtoType*, std::string>> interfaces;
+    std::set<std::string> closureInterfaces;
     struct FunctionPointerField {
         const FunctionDecl* declaration;
         std::string field, javaType;
@@ -608,6 +609,71 @@ class Emitter {
     std::string family(QualType t) const {
         auto r = record(t);
         return r && !user(r) ? r->getNameAsString() : "";
+    }
+    bool iotaView(QualType t) const {
+        if (family(t) == "iota_view")
+            return true;
+        auto arguments =
+            family(t) == "view_interface" ? templateArgs(t) : std::vector<TemplateArgument>();
+        return arguments.size() == 1 && family(arguments[0].getAsType()) == "iota_view";
+    }
+    const CXXRecordDecl* iotaPositionOwner(QualType t) const {
+        auto r = record(t);
+        auto parent = r ? dyn_cast<CXXRecordDecl>(r->getDeclContext()) : nullptr;
+        return parent && !user(r) && !user(parent) && parent->getName() == "iota_view" ? parent
+                                                                                       : nullptr;
+    }
+    std::string rangeFactory(QualType t) const {
+        auto r = record(t);
+        if (!r || user(r))
+            return {};
+        auto n = r->getQualifiedNameAsString();
+        return n == "std::ranges::views::_Iota"    ? "JppIotaFactory"
+               : n == "std::ranges::__for_each_fn" ? "JppRangesForEach"
+                                                   : "";
+    }
+    QualType iotaElement(QualType t) {
+        if (family(t) == "view_interface")
+            t = templateArgs(t)[0].getAsType();
+        if (auto owner = iotaPositionOwner(t))
+            t = ctx.getRecordType(owner);
+        auto arguments = templateArgs(t);
+        auto item = arguments[0].getAsType();
+        auto bound = arguments[1].getAsType();
+        if (!item->isIntegerType() || !bound->isIntegerType())
+            fail(SourceLocation(), "this iota value type needs additional range lowering");
+        if (ctx.getTypeSize(item) > 64 || ctx.getTypeSize(bound) > 64)
+            fail(SourceLocation(), "129-bit iota differences need additional range lowering");
+        if (item->isSignedIntegerType() != bound->isSignedIntegerType())
+            fail(SourceLocation(), "mixed-signedness iota needs additional range lowering");
+        return item;
+    }
+    std::string iotaDecoder(QualType t) {
+        auto argument = temporary("jppOrdinal");
+        auto item = iotaElement(t);
+        return argument + " -> " + (big(item) ? argument : converted(argument, ctx.Int128Ty, item));
+    }
+    std::string iotaValueInfo(QualType t) {
+        auto item = iotaElement(t);
+        return ", " + std::to_string(ctx.getTypeSize(item)) + ", " +
+               (item->isSignedIntegerType() ? "true" : "false");
+    }
+    std::string ordinal(const Expr* e) {
+        return big(e->getType()) ? expr(e) : value(e, ctx.Int128Ty);
+    }
+    std::string makeIota(QualType t, const Expr* first, const Expr* last) {
+        if (!last ||
+            (!clean(last->getType())->isIntegerType() && !iotaPositionOwner(last->getType())))
+            fail(first, "this iota bound needs additional range lowering");
+        auto arguments = templateArgs(t);
+        if (clean(arguments[0].getAsType())->isSignedIntegerType() !=
+            clean(arguments[1].getAsType())->isSignedIntegerType())
+            fail(first, "mixed-signedness iota needs additional range lowering");
+        auto endpoint = [&](const Expr* value) {
+            return iotaPositionOwner(value->getType()) ? expr(value) + ".position" : ordinal(value);
+        };
+        return "new " + type(t) + "(" + endpoint(first) + ", " + endpoint(last) + ", " +
+               iotaDecoder(t) + iotaValueInfo(t) + ")";
     }
     bool isString(QualType t) const {
         return family(t) == "basic_string" || family(t) == "basic_string_view";
@@ -784,18 +850,17 @@ class Emitter {
             for (auto field : r->fields()) {
                 auto fieldType = memoryType(field->getType());
                 auto member = name(field);
-                fields.push_back("new JppMemoryField<" + name(r) + ", " +
-                                 boxed(field->getType()) + ">(" + quote(member) + ", " +
-                                 std::to_string(native.getFieldOffset(index++) /
-                                                ctx.getCharWidth()) +
-                                 "L, " + fieldType + ", object -> object." + member +
-                                 ", (object, value) -> object." + member + " = value)");
+                fields.push_back(
+                    "new JppMemoryField<" + name(r) + ", " + boxed(field->getType()) + ">(" +
+                    quote(member) + ", " +
+                    std::to_string(native.getFieldOffset(index++) / ctx.getCharWidth()) + "L, " +
+                    fieldType + ", object -> object." + member + ", (object, value) -> object." +
+                    member + " = value)");
             }
-            auto initializer = "JppMemoryType.record(" +
-                               std::to_string(native.getSize().getQuantity()) + "L, " +
-                               targetLittleEndian() + ", () -> new " + name(r) +
-                               "((JppUninitialized)null)" +
-                               (fields.empty() ? "" : ", " + join(fields)) + ")";
+            auto initializer =
+                "JppMemoryType.record(" + std::to_string(native.getSize().getQuantity()) + "L, " +
+                targetLittleEndian() + ", () -> new " + name(r) + "((JppUninitialized)null)" +
+                (fields.empty() ? "" : ", " + join(fields)) + ")";
             arrayLayoutFields.emplace_back(layout, initializer);
             return layout;
         }
@@ -972,7 +1037,8 @@ class Emitter {
     }
     bool defaultedMove(const FunctionDecl* function) const {
         auto method = dyn_cast_or_null<CXXMethodDecl>(function);
-        if (!method || !user(method) || (!method->isImplicit() && !method->isDefaulted()))
+        if (!method || !user(method) || method->getParent()->isLambda() ||
+            (!method->isImplicit() && !method->isDefaulted()))
             return false;
         auto constructor = dyn_cast<CXXConstructorDecl>(method);
         return constructor ? constructor->isMoveConstructor() : method->isMoveAssignmentOperator();
@@ -1515,6 +1581,14 @@ class Emitter {
             return "JppPtr<" + (p->isVoidType() ? std::string("?") : boxed(p)) + ">";
         }
         auto n = family(t);
+        if (iotaView(t))
+            return "JppIota<" + boxed(iotaElement(t)) + ">";
+        if (iotaPositionOwner(t))
+            return "JppIotaIter<" + boxed(iotaElement(t)) + ">";
+        if (n == "in_fun_result")
+            return "JppRangeResult<" + boxed(element(t)) + ", " + boxed(element(t, 1)) + ">";
+        if (auto factory = rangeFactory(t); !factory.empty())
+            return factory;
         if (chrono(t)) {
             chronoPeriod(t);
             return n == "duration" ? "JppDuration" : "JppTimePoint";
@@ -1703,6 +1777,15 @@ class Emitter {
         }
         if (family(t) == "_Swallow_assign")
             return "new JppIgnore()";
+        if (iotaView(t))
+            return "new " + type(t) + "(BigInteger.ZERO, BigInteger.ZERO, " + iotaDecoder(t) +
+                   iotaValueInfo(t) + ")";
+        if (iotaPositionOwner(t))
+            return "new " + type(t) + "(BigInteger.ZERO, " + iotaDecoder(t) + iotaValueInfo(t) +
+                   ")";
+        if (family(t) == "in_fun_result")
+            return "new " + type(t) + "(" + defaultValue(element(t)) + ", " +
+                   defaultValue(element(t, 1)) + ")";
         if (auto r = record(t); r && user(r))
             for (auto constructor : r->ctors())
                 if (constructor->isDefaultConstructor() && constructor->getNumParams()) {
@@ -1771,11 +1854,14 @@ class Emitter {
     std::string converted(std::string s, QualType from, QualType target) {
         from = clean(from);
         target = clean(target);
-        if (family(from) == "reference_wrapper" && family(target) != "reference_wrapper") {
+        bool borrowed =
+            family(from) == "reference_wrapper" && family(target) != "reference_wrapper";
+        if (borrowed) {
             s += ".get()";
             from = clean(element(from));
         }
-        if (family(target) == "function" && !from->isNullPtrType() && type(from) != type(target)) {
+        if (family(target) == "function" && !from->isNullPtrType() &&
+            (borrowed || type(from) != type(target))) {
             auto source = callableType(from), destination = callableType(target);
             if (source->getNumParams() != destination->getNumParams())
                 fail(SourceLocation(), "callable conversion needs argument-pack lowering");
@@ -3381,6 +3467,8 @@ class Emitter {
         }
         if (args.empty())
             return defaultValue(t);
+        if (iotaView(t))
+            return makeIota(t, args[0], args.size() > 1 ? args[1] : nullptr);
         auto n = family(t);
         if (chrono(t)) {
             if (args.size() != 1)
@@ -3527,7 +3615,10 @@ class Emitter {
         if (n == "reference_wrapper")
             return reference(args[0]);
         if (n == "function")
-            return converted(expr(args[0]), args[0]->getType(), t);
+            return converted(scalarCopyClosure(record(args[0]->getType()))
+                                 ? constructElement(clean(args[0]->getType()), args[0])
+                                 : expr(args[0]),
+                             args[0]->getType(), t);
         if (isIter(t))
             return expr(args[0]);
         if (isMap(t)) {
@@ -3802,10 +3893,21 @@ class Emitter {
                 auto allocatedName = method->getParent()->isLambda() ? "call" : name(f);
                 auto object = isa<CXXThisExpr>(bare(obj))
                                   ? (constructionThis.empty() ? "this" : constructionThis)
-                                  : me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                              : me->isArrow() ? expr(obj) + ".get()"
+                                              : expr(obj);
                 return object + "." + allocatedName + "(" + arguments(c, f) + ")";
             }
             auto n = me->getMemberDecl()->getNameAsString();
+            if (iotaView(ot)) {
+                auto object = expr(obj) + (me->isArrow() ? ".get()" : "");
+                if (isa<CXXConversionDecl>(me->getMemberDecl()) && c->getType()->isBooleanType())
+                    return "!" + object + ".empty()";
+                if (n == "begin" || n == "end" || n == "empty" || n == "front" || n == "back")
+                    return object + "." + n + "()";
+                if (n == "size")
+                    return converted(object + ".size()", ctx.Int128Ty, c->getType());
+                fail(c, "this iota member needs additional range lowering");
+            }
             if (ordering(ot) && ordering(c->getType()) &&
                 isa<CXXConversionDecl>(me->getMemberDecl()))
                 return "jppCopy(" + expr(obj) + (me->isArrow() ? ".get()" : "") + ")";
@@ -4137,7 +4239,8 @@ class Emitter {
                         } else
                             line("return " + invocation + ";");
                     });
-            }
+            } else if (!isa<CXXMethodDecl>(f))
+                prefix = options.className + ".";
             return prefix + name(f) + "(" + arguments(c, f) + ")";
         }
         auto memoryOperation = n.starts_with("__builtin_") ? n.substr(10) : n;
@@ -4859,6 +4962,9 @@ class Emitter {
                 return functionPointer(function, ctx.getPointerType(e->getType()));
             auto n = d->getNameAsString();
             if (!user(d)) {
+                auto factory = rangeFactory(d->getType());
+                if (!factory.empty() && isa<VarDecl>(d))
+                    return factory + ".INSTANCE";
                 if (n == "ignore")
                     return "JppIgnore.INSTANCE";
                 if (ordering(d->getType())) {
@@ -4938,8 +5044,16 @@ class Emitter {
                 return x->getSubExpr()->HasSideEffects(ctx)
                            ? "Jpp.last(" + expr(x->getSubExpr()) + ", null)"
                            : "null";
-            if (x->getCastKind() == CK_IntegralToPointer)
-                fail(e, "integer-derived pointer addresses need additional storage lowering");
+            if (x->getCastKind() == CK_IntegralToPointer) {
+                if (!dataPointer(x->getType()))
+                    fail(e, "integer-derived function pointers need additional address lowering");
+                return "Jpp.<" +
+                       (x->getType()->getPointeeType()->isVoidType()
+                            ? std::string("Object")
+                            : boxed(x->getType()->getPointeeType())) +
+                       ">integerPointer(" + ordinal(x->getSubExpr()) + ", " +
+                       std::to_string(ctx.getTypeSize(x->getType())) + ")";
+            }
             if (x->getCastKind() == CK_PointerToIntegral)
                 fail(e, "converting pointer addresses to integers needs byte-addressed storage");
             if (dataPointer(x->getType()) && dataPointer(x->getSubExpr()->getType())) {
@@ -4947,8 +5061,7 @@ class Emitter {
                 auto to = clean(x->getType()->getPointeeType());
                 if (to->isVoidType() ||
                     (!to->isPointerType() && !memoryType(to).empty() &&
-                     (from->isVoidType() ||
-                      (!from->isPointerType() && !memoryType(from).empty()))))
+                     (from->isVoidType() || (!from->isPointerType() && !memoryType(from).empty()))))
                     return expr(x->getSubExpr());
                 if (x->getCastKind() == CK_BitCast && !from->isVoidType() &&
                     !ctx.hasSameType(from, to))
@@ -5135,6 +5248,10 @@ class Emitter {
             auto base = expr(x->getBase());
             if (x->isArrow())
                 base += ".get()";
+            if (family(x->getBase()->getType()) == "in_fun_result" ||
+                (x->isArrow() &&
+                 family(x->getBase()->getType()->getPointeeType()) == "in_fun_result"))
+                return base + "." + x->getMemberDecl()->getNameAsString();
             if (!user(x->getMemberDecl())) {
                 auto n = x->getMemberDecl()->getNameAsString();
                 if (n == "first" || n == "second") {
@@ -5152,6 +5269,113 @@ class Emitter {
         }
         if (auto x = dyn_cast<CXXOperatorCallExpr>(e)) {
             auto op = x->getOperator();
+            if (op == OO_Call && x->getNumArgs()) {
+                auto factory = rangeFactory(x->getArg(0)->getType());
+                std::string result;
+                if (factory == "JppIotaFactory") {
+                    if (x->getNumArgs() != 3)
+                        fail(x, "unbounded iota needs additional range lowering");
+                    result = makeIota(x->getType(), x->getArg(1), x->getArg(2));
+                } else if (factory == "JppRangesForEach") {
+                    if (x->getNumArgs() != 4 || !iotaView(x->getArg(1)->getType()))
+                        fail(x, "this ranges::for_each overload needs additional range lowering");
+                    if (family(x->getArg(3)->getType()) != "identity")
+                        fail(x, "this ranges::for_each projection needs additional lowering");
+                    if (x->getArg(3)->HasSideEffects(ctx))
+                        fail(x, "evaluating this projection needs additional range lowering");
+                    auto callback = x->getArg(2);
+                    auto callbackType = x->getDirectCallee()->getParamDecl(1)->getType();
+                    if (ownsDestructor(callbackType) ||
+                        callbackType.isDestructedType() != QualType::DK_none)
+                        fail(callback, "callable destruction needs additional lifetime lowering");
+                    if (auto closure = record(callbackType); closure && closure->isLambda()) {
+                        bool copied = false, capturedThis = false;
+                        for (auto capture : closure->captures()) {
+                            if (capture.getCaptureKind() == LCK_StarThis)
+                                fail(callback,
+                                     "this closure copy needs additional callable lowering");
+                            capturedThis |= capture.capturesThis();
+                            if (capture.capturesVariable()) {
+                                copied |= capture.getCaptureKind() == LCK_ByCopy;
+                                if (auto variable = dyn_cast<VarDecl>(capture.getCapturedVar());
+                                    variable && variable->isInitCapture())
+                                    fail(callback,
+                                         "init captures need additional callable lowering");
+                            }
+                        }
+                        if (copied && !scalarCopyClosure(closure)) {
+                            if (capturedThis || !isa<LambdaExpr>(bare(callback)))
+                                fail(callback,
+                                     "this closure copy needs additional callable lowering");
+                            for (auto field : closure->fields())
+                                if (!field->getType()->isReferenceType() &&
+                                    !field->getType().isTriviallyCopyableType(ctx))
+                                    fail(callback,
+                                         "captured value moves need additional callable lowering");
+                        }
+                    }
+                    auto fn = temporary("jppFunction"), item = temporary("jppItem");
+                    auto movedFn = temporary("jppMovedFunction");
+                    auto moved =
+                        constructElement(callbackType, mappedValue(callbackType, VK_XValue, movedFn,
+                                                                   "", x->getExprLoc()));
+                    auto callable = mappedValue(callbackType, VK_LValue, fn, "", x->getExprLoc());
+                    std::vector<Expr*> arguments{mappedValue(iotaElement(x->getArg(1)->getType()),
+                                                             VK_PRValue, item, "",
+                                                             x->getExprLoc())};
+                    Sema::ContextRAII context(sema, semanticContext());
+                    auto invocation = sema.BuildCallExpr(nullptr, callable, x->getExprLoc(),
+                                                         arguments, x->getExprLoc());
+                    if (invocation.isInvalid())
+                        fail(callback, "cannot resolve this range callback invocation");
+                    result = "JppIota.forEach(" + expr(x->getArg(1)) + ", " +
+                             value(callback, callbackType, true) + ", " + movedFn + " -> " + moved +
+                             ", (" + fn + ", " + item + ") -> " + expression(invocation.get()) +
+                             ")";
+                }
+                if (!result.empty())
+                    return x->getArg(0)->HasSideEffects(ctx)
+                               ? "Jpp.last(" + expr(x->getArg(0)) + ", " + result + ")"
+                               : result;
+            }
+            if (x->getNumArgs() && iotaPositionOwner(x->getArg(0)->getType()) &&
+                (!x->getDirectCallee() || !user(x->getDirectCallee()))) {
+                auto object = expr(x->getArg(0));
+                if (op == OO_Star)
+                    return object + ".get()";
+                if (op == OO_Subscript)
+                    return object + ".get(" + ordinal(x->getArg(1)) + ")";
+                if (op == OO_PlusPlus || op == OO_MinusMinus)
+                    return object + (x->getNumArgs() > 1 ? ".post(" : ".advance(") +
+                           (op == OO_MinusMinus ? "BigInteger.ONE.negate()" : "BigInteger.ONE") +
+                           ")";
+                if (op == OO_Plus || op == OO_Minus || op == OO_PlusEqual || op == OO_MinusEqual) {
+                    if (iotaPositionOwner(x->getArg(1)->getType()))
+                        return converted(object + ".position.subtract(" + expr(x->getArg(1)) +
+                                             ".position)",
+                                         ctx.Int128Ty, x->getType());
+                    auto distance = ordinal(x->getArg(1));
+                    if (op == OO_Minus || op == OO_MinusEqual)
+                        distance = "(" + distance + ").negate()";
+                    return object +
+                           (op == OO_PlusEqual || op == OO_MinusEqual ? ".advance(" : ".plus(") +
+                           distance + ")";
+                }
+                if (op == OO_EqualEqual || op == OO_ExclaimEqual || op == OO_Less ||
+                    op == OO_LessEqual || op == OO_Greater || op == OO_GreaterEqual)
+                    return "(" + object + ".position.compareTo(" + expr(x->getArg(1)) +
+                           ".position) " + getOperatorSpelling(op) + " 0)";
+                if (op == OO_Spaceship)
+                    return "new JppOrdering(Integer.signum(" + object + ".position.compareTo(" +
+                           expr(x->getArg(1)) + ".position)))";
+            }
+            if (op == OO_Plus && x->getNumArgs() == 2 &&
+                iotaPositionOwner(x->getArg(1)->getType()) &&
+                (!x->getDirectCallee() || !user(x->getDirectCallee())))
+                return expr(x->getArg(1)) + ".plus(" + ordinal(x->getArg(0)) + ")";
+            if (op == OO_Subscript && x->getNumArgs() == 2 && iotaView(x->getArg(0)->getType()) &&
+                (!x->getDirectCallee() || !user(x->getDirectCallee())))
+                return expr(x->getArg(0)) + ".get(" + ordinal(x->getArg(1)) + ")";
             if (op == OO_Equal && x->getNumArgs() == 2 &&
                 family(x->getArg(0)->getType()) == "vector" && x->getDirectCallee() &&
                 x->getDirectCallee()->getNumParams() &&
@@ -5464,8 +5688,29 @@ class Emitter {
             return expr(x->getReplacement());
         fail(e, std::string("unsupported expression ") + e->getStmtClassName());
     }
+    bool scalarCopyClosure(const CXXRecordDecl* closure) const {
+        if (!closure || !closure->isLambda())
+            return false;
+        bool copied = false;
+        for (auto capture : closure->captures()) {
+            if (capture.capturesThis())
+                return false;
+            if (!capture.capturesVariable())
+                continue;
+            auto variable = dyn_cast<VarDecl>(capture.getCapturedVar());
+            if (!variable || variable->isInitCapture())
+                return false;
+            if (capture.getCaptureKind() == LCK_ByCopy) {
+                copied = true;
+                if (!clean(variable->getType())->isScalarType())
+                    return false;
+            }
+        }
+        return copied;
+    }
     std::string lambda(const LambdaExpr* e) {
         auto f = lambdaOperator(e->getLambdaClass());
+        bool copyable = scalarCopyClosure(e->getLambdaClass());
         std::vector<std::string> params;
         for (auto p : f->parameters()) {
             auto base = identifier(p->getNameAsString());
@@ -5476,15 +5721,20 @@ class Emitter {
                              (cells.count(p) && !references.count(p) ? "jppParam_" : "") + name(p));
         }
         auto oldAliases = aliases;
-        std::vector<std::string> captures;
+        std::vector<std::string> captures, captureCopies;
         for (auto capture : e->captures())
             if (capture.capturesVariable() && capture.getCaptureKind() == LCK_ByCopy) {
                 auto v = capture.getCapturedVar();
-                auto snapshot = "jppCapture" + std::to_string(++serial);
+                auto snapshot = temporary("jppCapture");
                 auto outer = aliases.count(v)
                                  ? aliases[v]
                                  : (cell(dyn_cast<VarDecl>(v)) ? name(v) + ".get()" : name(v));
-                if (primitiveArray(v->getType())) {
+                if (copyable) {
+                    auto storage = "JppRef<" + boxed(v->getType()) + "> " + snapshot;
+                    captures.push_back(storage + " = JppRef.cell(jppCopy(" + outer + "));");
+                    captureCopies.push_back(snapshot + " = JppRef.cell(jppCopy(" + snapshot +
+                                            ".get()));");
+                } else if (primitiveArray(v->getType())) {
                     auto layout = memoryType(v->getType());
                     auto location = v->getType()->isReferenceType()
                                         ? "(" + outer.substr(0, outer.size() - 6) + ").pointer()"
@@ -5537,6 +5787,14 @@ class Emitter {
         arrayBounds = std::move(oldBounds);
         enclosingFunctions.resize(oldEnclosing);
         aliases = std::move(oldAliases);
+        if (copyable) {
+            auto interface = functionType(f->getType()->getAs<FunctionProtoType>());
+            closureInterfaces.insert(interface);
+            return "new " + interface + "Closure() { " + join(captures, " ") +
+                   " protected void jppCopyCaptures() { " + join(captureCopies, " ") +
+                   " } public " + parameterType(f->getReturnType()) + " call(" + join(params) +
+                   ") " + body + " }";
+        }
         if (!captures.empty())
             return "new " + functionType(f->getType()->getAs<FunctionProtoType>()) + "() { " +
                    join(captures, " ") + " public " + parameterType(f->getReturnType()) + " call(" +
@@ -6576,8 +6834,8 @@ class Emitter {
         if (destructor && !destructor->hasBody())
             fail(destructor->getLocation(), "the destructor definition is needed for translation");
         line("static class " + n + (byteRecords.count(r) ? " extends JppRecord" : "") +
-             " implements JppAssignable<" + n + ">" +
-             (destructor ? ", AutoCloseable" : "") + (less ? ", Comparable<" + n + ">" : ""));
+             " implements JppAssignable<" + n + ">" + (destructor ? ", AutoCloseable" : "") +
+             (less ? ", Comparable<" + n + ">" : ""));
         line("{");
         ++indent;
         if (byteRecords.count(r)) {
@@ -6821,6 +7079,9 @@ class Emitter {
                              booleanValue(result, f->getReturnType()) + "; }"
                        : "") +
                  " }");
+            if (closureInterfaces.count(n))
+                line("static abstract class " + n + "Closure extends JppClosure<" + n +
+                     "> implements " + n + " {}");
         }
         out << tupleDefinitions();
         if (main) {

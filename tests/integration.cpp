@@ -166,6 +166,9 @@ int main() {
         for (int i = 0; i < 48; ++i)
             expressions << (i % 8 == 0 ? 0 : r(101) - 50) << ' ' << r(17) - 8 << '\n';
         cases.emplace_back("expressions", expressions.str());
+        cases.emplace_back("closure_copies", expressions.str());
+        cases.emplace_back("ranges", expressions.str());
+        cases.emplace_back("integer_pointers", expressions.str());
         cases.emplace_back("discarded", expressions.str());
         cases.emplace_back("heaps", expressions.str());
         cases.emplace_back("reference_returns", expressions.str());

@@ -9,6 +9,21 @@ interface JppAssignable<T> extends JppCopyable<T> {
 interface JppUninitialized {}
 interface JppMove {}
 
+// Clone the callable's Java class, then give its owned captures independent cells.
+static abstract class JppClosure<F> implements JppCopyable<F>, java.lang.Cloneable {
+    protected abstract void jppCopyCaptures();
+    @SuppressWarnings("unchecked")
+    public F copy() {
+        try {
+            JppClosure<F> result = (JppClosure<F>)super.clone();
+            result.jppCopyCaptures();
+            return (F)result;
+        } catch (java.lang.CloneNotSupportedException error) {
+            throw new AssertionError(error);
+        }
+    }
+}
+
 interface JppListOwner<T> {
     List<T> jppStorage();
 }
@@ -1401,6 +1416,134 @@ static class JppTimePoint implements JppAssignable<JppTimePoint>, Comparable<Jpp
     }
 }
 
+static class JppIotaFactory implements JppCopyable<JppIotaFactory> {
+    static final JppIotaFactory INSTANCE = new JppIotaFactory();
+    public JppIotaFactory copy() { return new JppIotaFactory(); }
+}
+
+static class JppRangesForEach implements JppCopyable<JppRangesForEach> {
+    static final JppRangesForEach INSTANCE = new JppRangesForEach();
+    public JppRangesForEach copy() { return new JppRangesForEach(); }
+}
+
+static class JppRangeResult<I, F> implements JppAssignable<JppRangeResult<I, F>> {
+    I in;
+    F fun;
+    JppRangeResult(I in, F fun) { this.in = in; this.fun = fun; }
+    public JppRangeResult<I, F> copy() {
+        return new JppRangeResult<I, F>(jppCopy(in), jppCopy(fun));
+    }
+    public JppRangeResult<I, F> jppAssignFrom(JppRangeResult<I, F> other) {
+        in = Jpp.assignValue(in, other.in);
+        fun = Jpp.assignValue(fun, other.fun);
+        return this;
+    }
+}
+
+static class JppIotaIter<T> implements JppAssignable<JppIotaIter<T>>, Comparable<JppIotaIter<T>> {
+    BigInteger position;
+    java.util.function.Function<BigInteger, T> decode;
+    int width;
+    boolean signed;
+    JppIotaIter(BigInteger position, java.util.function.Function<BigInteger, T> decode,
+                int width, boolean signed) {
+        this.position = canonical(position, width, signed);
+        this.decode = decode;
+        this.width = width;
+        this.signed = signed;
+    }
+    static BigInteger canonical(BigInteger value, int width, boolean signed) {
+        if (signed ? value.bitLength() < width : value.signum() >= 0 && value.bitLength() <= width)
+            return value;
+        BigInteger modulus = BigInteger.ONE.shiftLeft(width);
+        BigInteger low = value.and(modulus.subtract(BigInteger.ONE));
+        return signed && low.testBit(width - 1) ? low.subtract(modulus) : low;
+    }
+    T get() { return decode.apply(position); }
+    T get(BigInteger offset) { return decode.apply(canonical(position.add(offset), width, signed)); }
+    JppIotaIter<T> plus(BigInteger offset) {
+        return new JppIotaIter<T>(position.add(offset), decode, width, signed);
+    }
+    JppIotaIter<T> advance(BigInteger offset) {
+        position = canonical(position.add(offset), width, signed);
+        return this;
+    }
+    JppIotaIter<T> post(BigInteger offset) {
+        JppIotaIter<T> old = copy();
+        advance(offset);
+        return old;
+    }
+    public JppIotaIter<T> copy() { return plus(BigInteger.ZERO); }
+    public int compareTo(JppIotaIter<T> other) { return position.compareTo(other.position); }
+    public JppIotaIter<T> jppAssignFrom(JppIotaIter<T> other) {
+        position = other.position;
+        decode = other.decode;
+        width = other.width;
+        signed = other.signed;
+        return this;
+    }
+}
+
+// Iota stores its endpoints, independent of the number of generated values.
+static class JppIota<T> implements JppAssignable<JppIota<T>>, Iterable<T> {
+    BigInteger first, last;
+    java.util.function.Function<BigInteger, T> decode;
+    int width;
+    boolean signed;
+    JppIota(BigInteger first, BigInteger last,
+             java.util.function.Function<BigInteger, T> decode, int width, boolean signed) {
+        if (first.compareTo(last) > 0)
+            throw new IllegalArgumentException("invalid iota endpoint order");
+        this.first = first;
+        this.last = last;
+        this.decode = decode;
+        this.width = width;
+        this.signed = signed;
+    }
+    JppIotaIter<T> begin() { return new JppIotaIter<T>(first, decode, width, signed); }
+    JppIotaIter<T> end() { return new JppIotaIter<T>(last, decode, width, signed); }
+    BigInteger size() { return last.subtract(first); }
+    boolean empty() { return first.equals(last); }
+    T front() { return decode.apply(first); }
+    T back() { return decode.apply(last.subtract(BigInteger.ONE)); }
+    T get(BigInteger offset) { return decode.apply(JppIotaIter.canonical(first.add(offset), width, signed)); }
+    public JppIota<T> copy() { return new JppIota<T>(first, last, decode, width, signed); }
+    public JppIota<T> jppAssignFrom(JppIota<T> other) {
+        first = other.first;
+        last = other.last;
+        decode = other.decode;
+        width = other.width;
+        signed = other.signed;
+        return this;
+    }
+    public Iterator<T> iterator() {
+        BigInteger endpoint = last;
+        JppIotaIter<T> current = begin();
+        return new Iterator<T>() {
+            public boolean hasNext() { return !current.position.equals(endpoint); }
+            public T next() {
+                if (!hasNext())
+                    throw new NoSuchElementException();
+                T result = current.get();
+                current.advance(BigInteger.ONE);
+                return result;
+            }
+        };
+    }
+    static <T, F> JppRangeResult<JppIotaIter<T>, F> forEach(
+        JppIota<T> range, F argument, java.util.function.UnaryOperator<F> move,
+        java.util.function.BiConsumer<F, T> action) {
+        F function = move.apply(argument);
+        JppIotaIter<T> iterator = range.begin();
+        BigInteger end = range.last;
+        while (!iterator.position.equals(end)) {
+            action.accept(function, iterator.get());
+            iterator.advance(BigInteger.ONE);
+        }
+        return new JppRangeResult<JppIotaIter<T>, F>(iterator, move.apply(function));
+    }
+}
+
 static class JppIter<T> implements JppCopyable<JppIter<T>> {
     final List<T> list;
     final Object storage;
@@ -1504,6 +1647,29 @@ static class JppPtr<T> extends JppIter<T> {
             other.pos >= 0 && other.pos < other.list.size() &&
             (get() instanceof JppCopyable || get() instanceof Collection) &&
             get() == other.get();
+    }
+}
+
+// Integer pointer values can be retained as sentinels without inventing an allocation.
+static class JppIntegerPtr<T> extends JppPtr<T> {
+    final BigInteger address;
+    JppIntegerPtr(BigInteger address) {
+        super(null, 0, address);
+        this.address = address;
+    }
+    JppIntegerPtr<T> plus(int offset) {
+        if (offset != 0)
+            throw new UnsupportedOperationException("arithmetic on an integer-derived C++ address");
+        return new JppIntegerPtr<T>(address);
+    }
+    boolean same(JppIter<?> other) {
+        return other instanceof JppIntegerPtr && address.equals(((JppIntegerPtr<?>)other).address);
+    }
+    T get() {
+        throw new UnsupportedOperationException("dereferencing an integer-derived C++ address");
+    }
+    T put(T value) {
+        throw new UnsupportedOperationException("dereferencing an integer-derived C++ address");
     }
 }
 
@@ -3670,6 +3836,10 @@ static class Jpp {
             return ((JppPtr<T>)at).plus(0);
         return at == null ? null : new JppPtr<T>(at.pointerStorage(), at.pos, at.pointerIdentity());
     }
+    static <T> JppPtr<T> integerPointer(BigInteger value, int width) {
+        BigInteger address = value.and(BigInteger.ONE.shiftLeft(width).subtract(BigInteger.ONE));
+        return address.signum() == 0 ? null : new JppIntegerPtr<T>(address);
+    }
     static int arrayBound(long value) {
         if (value < 0 || value > Integer.MAX_VALUE - 8)
             throw new IllegalArgumentException("C++ array bound exceeds Java's indexing limit");
@@ -3700,6 +3870,8 @@ static class Jpp {
         if (at == null)
             return null;
         JppPtr<?> pointer = at instanceof JppPtr ? (JppPtr<?>)at : pointer(at);
+        if (pointer instanceof JppIntegerPtr)
+            return (JppPtr<T>)pointer;
         if (pointer.elementType == null) {
             pointer = pointer.plus(0);
             pointer.elementType = type;
