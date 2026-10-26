@@ -267,6 +267,10 @@ int main() {
                            << '\n';
         cases.emplace_back("checked_arithmetic", overflowInputs.str());
         cases.emplace_back("checked_storage", overflowInputs.str());
+#ifdef JPP_TEST_GNU_FRONTEND
+        cases.emplace_back("checked_predicates", overflowInputs.str());
+        cases.emplace_back("predicate_effects", overflowInputs.str());
+#endif
         cases.emplace_back("string_literals", "8\n0\n1\n65\n127\n128\n255\n256\n-1\n");
 #ifdef __GLIBC__
         std::mt19937_64 cRandom(0x72616e646f6d);
@@ -809,6 +813,24 @@ int main() {
             read(p / "stderr").find("arithmetic on pointers to void") == std::string::npos)
             throw std::runtime_error("void-pointer differences escaped GNU C++ diagnostics");
         ++checks;
+        for (const auto& result : {"true", "1.0", "Kind{}", "static_cast<int*>(nullptr)"}) {
+            write(p / "overflow-invalid.cpp",
+                  "enum Kind { value }; int main(){ return __builtin_add_overflow_p(1,2," +
+                      std::string(result) + "); }\n");
+            code = process(
+                {cxx, "-std=gnu++23", "-fsyntax-only", (p / "overflow-invalid.cpp").string()},
+                p / "empty", p / "stdout", p / "stderr");
+            if (code != 1)
+                throw std::runtime_error("native oracle unexpectedly accepts predicate result " +
+                                         std::string(result));
+            code = process({JPP_BINARY, (p / "overflow-invalid.cpp").string(), "-t", "-o",
+                            (p / "Main.java").string()},
+                           p / "empty", p / "stdout", p / "stderr");
+            if (code != 1 || read(p / "Main.java") != gnuSubmission)
+                throw std::runtime_error("invalid overflow predicate replaced valid output: " +
+                                         std::string(result));
+            ++checks;
+        }
 #endif
         std::cout << checks << " compiler/runtime differential and CLI checks passed\n";
     } catch (const std::exception& e) {

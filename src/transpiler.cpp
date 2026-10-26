@@ -2585,6 +2585,14 @@ class Emitter {
             markCapturedVariables(c);
         if (isa<BinaryConditionalOperator>(s) || isa<StmtExpr>(s) || isa<CXXNewExpr>(s))
             markCapturedVariables(s);
+        if (auto call = dyn_cast<CallExpr>(s);
+            call && call->getDirectCallee() && call->getNumArgs() == 3) {
+            auto function = call->getDirectCallee()->getNameAsString();
+            if ((function == "__builtin_add_overflow_p" || function == "__builtin_sub_overflow_p" ||
+                 function == "__builtin_mul_overflow_p") &&
+                call->getArg(2)->HasSideEffects(ctx))
+                markCapturedVariables(call);
+        }
         if (auto list = dyn_cast<InitListExpr>(s);
             list && record(list->getType()) && user(record(list->getType())))
             for (auto init : list->inits())
@@ -4796,6 +4804,57 @@ class Emitter {
             return "Jpp.trap()";
         if (n.starts_with("__builtin_")) {
             auto op = n.substr(10);
+            if (op == "add_overflow_p" || op == "sub_overflow_p" || op == "mul_overflow_p") {
+                if (c->getNumArgs() != 3)
+                    fail(c, "checked arithmetic predicates require three arguments");
+                auto result = c->getArg(2);
+                auto target = clean(result->getType());
+                if (!target->isIntegerType() || target->isBooleanType() ||
+                    result->getType()->isEnumeralType())
+                    fail(c, "checked arithmetic predicates require a non-boolean integer result "
+                            "expression");
+                auto width = ctx.getIntWidth(target);
+                if (auto field = result->getSourceBitField())
+                    width = std::min(width, field->getBitWidthValue(ctx));
+                auto operand = [&](const Expr* expression) {
+                    auto value = ordinal(expression);
+                    auto source = clean(expression->getType());
+                    if (big(source) && source->isUnsignedIntegerType())
+                        value = "JppOverflowPredicate.unsigned(" + value + ", " +
+                                std::to_string(ctx.getIntWidth(source)) + ")";
+                    return value;
+                };
+                auto method = op.starts_with("add")   ? "add"
+                              : op.starts_with("sub") ? "subtract"
+                                                      : "multiply";
+                auto invoke = [&](const std::string& left, const std::string& right) {
+                    return "JppOverflowPredicate." + std::string(method) + "(" + left + ", " +
+                           right + ", " + std::to_string(width) + ", " +
+                           (target->isSignedIntegerType() ? "true" : "false") + ")";
+                };
+                if (!result->HasSideEffects(ctx))
+                    return invoke(operand(c->getArg(0)), operand(c->getArg(1)));
+                std::function<void(const Stmt*)> validateCleanup = [&](const Stmt* statement) {
+                    if (!statement || isa<LambdaExpr>(statement))
+                        return;
+                    if (auto temporary = dyn_cast<CXXBindTemporaryExpr>(statement);
+                        temporary && !temporary->getTemporary()->getDestructor()->isTrivial())
+                        fail(result, "overflow predicates with nontrivial temporary cleanup need "
+                                     "additional lifetime lowering");
+                    for (auto child : statement->children())
+                        validateCleanup(child);
+                };
+                validateCleanup(result);
+                return "((boolean) " + supplier([&] {
+                           auto left = temporary("jppLeft"), right = temporary("jppRight");
+                           line("BigInteger " + left + " = " + operand(c->getArg(0)) + ";");
+                           line("BigInteger " + right + " = " + operand(c->getArg(1)) + ";");
+                           predicateEffects(result);
+                           if (!terminates(result))
+                               line("return " + invoke(left, right) + ";");
+                       }) +
+                       ")";
+            }
             static const auto checkedIntegers = [] {
                 std::map<std::string, std::string> names;
                 for (const auto& [stem, method] : std::map<std::string, std::string>{
@@ -5700,35 +5759,8 @@ class Emitter {
                 opaqueValues = std::move(previous);
             });
         }
-        if (auto x = dyn_cast<StmtExpr>(e)) {
-            std::function<void(const Stmt*, unsigned, unsigned)> validate = [&](const Stmt* s,
-                                                                                unsigned loops,
-                                                                                unsigned switches) {
-                if (!s || isa<LambdaExpr>(s))
-                    return;
-                if (isa<ReturnStmt>(s) || isa<GotoStmt>(s) || isa<IndirectGotoStmt>(s))
-                    fail(s, "control transfer out of a GNU statement expression requires "
-                            "additional lowering");
-                if ((isa<BreakStmt>(s) && !loops && !switches) || (isa<ContinueStmt>(s) && !loops))
-                    fail(s, "a GNU statement expression cannot yet break or continue an "
-                            "enclosing loop");
-                const Stmt* loopBody = nullptr;
-                if (auto loop = dyn_cast<ForStmt>(s))
-                    loopBody = loop->getBody();
-                else if (auto loop = dyn_cast<WhileStmt>(s))
-                    loopBody = loop->getBody();
-                else if (auto loop = dyn_cast<DoStmt>(s))
-                    loopBody = loop->getBody();
-                else if (auto loop = dyn_cast<CXXForRangeStmt>(s))
-                    loopBody = loop->getBody();
-                auto selection = dyn_cast<SwitchStmt>(s);
-                for (auto child : s->children())
-                    validate(child, loops + (child && child == loopBody),
-                             switches + (selection && child == selection->getBody()));
-            };
-            validate(x->getSubStmt(), 0, 0);
-            return supplier([&] { bodyStatements(x->getSubStmt(), true); });
-        }
+        if (auto x = dyn_cast<StmtExpr>(e))
+            return statementExpression(x);
         if (auto x = dyn_cast<BinaryOperator>(e))
             return binary(x->getLHS(), x->getRHS(), x->getOpcodeStr().str(), x->getType());
         if (auto x = dyn_cast<CXXRewrittenBinaryOperator>(e))
@@ -6510,6 +6542,117 @@ class Emitter {
         }
         return s;
     }
+    std::string statementExpression(const StmtExpr* expression, bool discardLast = false) {
+        std::function<void(const Stmt*, unsigned, unsigned)> validate =
+            [&](const Stmt* statement, unsigned loops, unsigned switches) {
+                if (!statement || isa<LambdaExpr>(statement))
+                    return;
+                if (isa<ReturnStmt>(statement) || isa<GotoStmt>(statement) ||
+                    isa<IndirectGotoStmt>(statement))
+                    fail(statement, "control transfer out of a GNU statement expression requires "
+                                    "additional lowering");
+                if ((isa<BreakStmt>(statement) && !loops && !switches) ||
+                    (isa<ContinueStmt>(statement) && !loops))
+                    fail(statement, "a GNU statement expression cannot yet break or continue an "
+                                    "enclosing loop");
+                const Stmt* loopBody = nullptr;
+                if (auto loop = dyn_cast<ForStmt>(statement))
+                    loopBody = loop->getBody();
+                else if (auto loop = dyn_cast<WhileStmt>(statement))
+                    loopBody = loop->getBody();
+                else if (auto loop = dyn_cast<DoStmt>(statement))
+                    loopBody = loop->getBody();
+                else if (auto loop = dyn_cast<CXXForRangeStmt>(statement))
+                    loopBody = loop->getBody();
+                auto selection = dyn_cast<SwitchStmt>(statement);
+                for (auto child : statement->children())
+                    validate(child, loops + (child && child == loopBody),
+                             switches + (selection && child == selection->getBody()));
+            };
+        validate(expression->getSubStmt(), 0, 0);
+        return supplier([&] { bodyStatements(expression->getSubStmt(), true, 0, discardLast); });
+    }
+    void predicateEffects(const Expr* e) {
+        if (!e || !e->HasSideEffects(ctx))
+            return;
+        if (auto temporary = dyn_cast<CXXBindTemporaryExpr>(e);
+            temporary && !temporary->getTemporary()->getDestructor()->isTrivial())
+            fail(e, "overflow predicates with nontrivial temporary cleanup need additional "
+                    "lifetime lowering");
+        if (auto wrapper = dyn_cast<ExprWithCleanups>(e)) {
+            predicateEffects(wrapper->getSubExpr());
+            return;
+        }
+        if (auto wrapper = dyn_cast<ParenExpr>(e)) {
+            predicateEffects(wrapper->getSubExpr());
+            return;
+        }
+        if (auto cast = dyn_cast<CastExpr>(e); cast && !isa<CXXDynamicCastExpr>(cast)) {
+            if (cast->getCastKind() != CK_LValueToRValue ||
+                !cast->getSubExpr()->getType().isVolatileQualified()) {
+                predicateEffects(cast->getSubExpr());
+                return;
+            }
+        }
+        if (auto unary = dyn_cast<UnaryOperator>(e); unary && !unary->isIncrementDecrementOp()) {
+            predicateEffects(unary->getSubExpr());
+            return;
+        }
+        if (auto member = dyn_cast<MemberExpr>(e); member && !e->getType().isVolatileQualified()) {
+            predicateEffects(member->getBase());
+            return;
+        }
+        if (auto index = dyn_cast<ArraySubscriptExpr>(e);
+            index && !e->getType().isVolatileQualified()) {
+            predicateEffects(index->getLHS());
+            predicateEffects(index->getRHS());
+            return;
+        }
+        if (auto binary = dyn_cast<BinaryOperator>(e); binary && !binary->isAssignmentOp()) {
+            if (binary->isLogicalOp()) {
+                line("if (" + std::string(binary->getOpcode() == BO_LOr ? "!(" : "(") +
+                     truth(binary->getLHS()) + ")) {");
+                ++indent;
+                predicateEffects(binary->getRHS());
+                --indent;
+                line("}");
+            } else {
+                predicateEffects(binary->getLHS());
+                if (!terminates(binary->getLHS()))
+                    predicateEffects(binary->getRHS());
+            }
+            return;
+        }
+        if (auto choice = dyn_cast<ConditionalOperator>(e)) {
+            line("if (" + truth(choice->getCond()) + ") {");
+            ++indent;
+            predicateEffects(choice->getTrueExpr());
+            --indent;
+            line("} else {");
+            ++indent;
+            predicateEffects(choice->getFalseExpr());
+            --indent;
+            line("}");
+            return;
+        }
+        if (auto choice = dyn_cast<BinaryConditionalOperator>(e)) {
+            line("if (!(" + truth(choice->getCommon()) + ")) {");
+            ++indent;
+            predicateEffects(choice->getFalseExpr());
+            --indent;
+            line("}");
+            return;
+        }
+        if (auto statement = dyn_cast<StmtExpr>(e)) {
+            line("Jpp.ignore(" + statementExpression(statement, true) + ");");
+            return;
+        }
+        if (auto invocation = dyn_cast<CallExpr>(e); invocation && returnsReference(invocation)) {
+            line("Jpp.ignore(" + call(invocation) + ");");
+            return;
+        }
+        expressionStatement(e);
+    }
     std::string statementValue(const Expr* e) {
         if (primitiveArray(e->getType()) && e->isGLValue() && !isa<StringLiteral>(bare(e)))
             return "Jpp.ignore(" + arrayLocation(e) + ")";
@@ -6937,7 +7080,8 @@ class Emitter {
         for (auto child : statement->children())
             requireCheckpointFlow(child, loops, breaks);
     }
-    bool bodyStatements(const CompoundStmt* body, bool returnValue = false, size_t first = 0) {
+    bool bodyStatements(const CompoundStmt* body, bool returnValue = false, size_t first = 0,
+                        bool discardLast = false) {
         struct Exit {
             const LabelDecl* label;
             size_t begin, end;
@@ -7049,7 +7193,12 @@ class Emitter {
             }
             if (returnValue && i + 1 == statements.size())
                 if (auto e = dyn_cast<Expr>(child); e && !e->getType()->isVoidType()) {
-                    line("return " + value(e, e->getType(), true) + ";");
+                    if (discardLast) {
+                        predicateEffects(e);
+                        if (!terminates(e))
+                            line("return 0;");
+                    } else
+                        line("return " + value(e, e->getType(), true) + ";");
                     dead = true;
                     continue;
                 }

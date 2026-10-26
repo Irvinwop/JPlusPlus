@@ -145,6 +145,25 @@ static class JppGmpInteger {
     }
 }
 
+static class JppOverflowPredicate {
+    static BigInteger unsigned(BigInteger value, int width) {
+        return value.and(BigInteger.ONE.shiftLeft(width).subtract(BigInteger.ONE));
+    }
+    static boolean overflow(BigInteger value, int width, boolean signed) {
+        return signed ? value.bitLength() >= width
+                      : value.signum() < 0 || value.bitLength() > width;
+    }
+    static boolean add(BigInteger left, BigInteger right, int width, boolean signed) {
+        return overflow(left.add(right), width, signed);
+    }
+    static boolean subtract(BigInteger left, BigInteger right, int width, boolean signed) {
+        return overflow(left.subtract(right), width, signed);
+    }
+    static boolean multiply(BigInteger left, BigInteger right, int width, boolean signed) {
+        return overflow(left.multiply(right), width, signed);
+    }
+}
+
 static class JppIntegerOverflow {
     static BigInteger unsigned(BigInteger value, int width) {
         return value.and(BigInteger.ONE.shiftLeft(width).subtract(BigInteger.ONE));
