@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
@@ -186,6 +187,24 @@ int main() {
         cases.emplace_back("pointer_exceptions", "");
         cases.emplace_back("exception_termination", "");
         cases.emplace_back("implicit_vector_moves", "");
+        std::mt19937_64 gmpRandom(0x676d702d70726f62ULL);
+        std::vector<long> gmpLimits = {0, 1, -1, LONG_MAX, LONG_MIN, 7, -7};
+        std::vector<unsigned long> gmpUnsignedLimits = {
+            0, 1, ULONG_MAX, 1UL << 63, (1UL << 63) - 1, 4294967295UL};
+        std::ostringstream gmpInputs;
+        gmpInputs << 300 << '\n';
+        for (int i = 0; i < 300; ++i) {
+            long left = i < gmpLimits.size() ? gmpLimits[i] : static_cast<long>(gmpRandom());
+            long right = i % 8 == 0 ? 7 : static_cast<long>(gmpRandom());
+            if (right == 0)
+                right = -1;
+            auto extra = i < gmpUnsignedLimits.size() ? gmpUnsignedLimits[i] : gmpRandom();
+            gmpInputs << left << ' ' << right << ' ' << extra << ' '
+                      << (i % 5 ? gmpRandom() % 301 : 0) << ' ' << (i % 7 ? gmpRandom() % 201 : 0)
+                      << '\n';
+        }
+        cases.emplace_back("gmp_integers", gmpInputs.str());
+        cases.emplace_back("field_format", "");
         cases.emplace_back("cpp23", "-9\n");
         std::ostringstream bits;
         bits << 70 << '\n';
@@ -409,9 +428,11 @@ int main() {
                 oracleCompiler = std::getenv("JPP_TEST_POINTER_CXX")
                                      ? std::getenv("JPP_TEST_POINTER_CXX")
                                      : "clang++-18";
-            must({oracleCompiler, "-std=gnu++23", "-O2", nativeSource, "-o",
-                  (p / "native").string()},
-                 p / "empty");
+            std::vector<std::string> nativeCompile = {
+                oracleCompiler, "-std=gnu++23", "-O2", nativeSource, "-o", (p / "native").string()};
+            if (name == "gmp_integers")
+                nativeCompile.push_back("-lgmp");
+            must(nativeCompile, p / "empty");
             std::vector<std::string> programArguments;
             if (name == "arguments")
                 programArguments = {"alpha beta", "\xce\xbb\xf0\x9f\x99\x82", "", "-17"};

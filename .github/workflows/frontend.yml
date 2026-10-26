@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-18 llvm-18-dev libclang-18-dev libclang-cpp18-dev \
-            libzstd-dev ninja-build curl patch ecj
+            libzstd-dev libgmp-dev ninja-build curl patch ecj
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: build/frontend-cache

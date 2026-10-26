@@ -37,7 +37,7 @@ jobs:
       - name: Install C++ frontend and independent Java compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 llvm-18-dev libclang-18-dev libclang-cpp18-dev ninja-build ecj
+          sudo apt-get install -y clang-18 llvm-18-dev libclang-18-dev libclang-cpp18-dev libgmp-dev ninja-build ecj
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \

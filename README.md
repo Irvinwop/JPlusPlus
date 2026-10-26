@@ -43,7 +43,7 @@ Linux is the supported development platform. Install LLVM/Clang 18 development l
 ```sh
 # Ubuntu 24.04
 sudo apt-get install clang-18 llvm-18-dev libclang-18-dev \
-  libclang-cpp18-dev cmake ninja-build openjdk-21-jdk-headless
+  libclang-cpp18-dev libgmp-dev cmake ninja-build openjdk-21-jdk-headless
 
 git clone https://github.com/Irvinwop/JPlusPlus.git
 cd JPlusPlus

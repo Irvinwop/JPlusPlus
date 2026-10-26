@@ -10,6 +10,141 @@ interface JppUninitialized {}
 interface JppMove {}
 interface JppTrivialValue {}
 
+// The C handle keeps its identity while BigInteger supplies the integer value.
+static class JppGmpInteger {
+    BigInteger value = BigInteger.ZERO;
+    int limbCount(int width) {
+        int bits = value.abs().bitLength();
+        int count = bits == 0 ? 0 : (bits - 1) / width + 1;
+        return value.signum() < 0 ? -count : count;
+    }
+    static void initialize(JppPtr<JppGmpInteger> target) {
+        target.get().value = BigInteger.ZERO;
+    }
+    static void clear(JppPtr<JppGmpInteger> target) {
+        target.get().value = BigInteger.ZERO;
+    }
+    static void set(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> source) {
+        target.get().value = source.get().value;
+    }
+    static void setInteger(JppPtr<JppGmpInteger> target, BigInteger source) {
+        target.get().value = source;
+    }
+    static void add(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> left,
+                    JppPtr<JppGmpInteger> right) {
+        target.get().value = left.get().value.add(right.get().value);
+    }
+    static void subtract(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> left,
+                         JppPtr<JppGmpInteger> right) {
+        target.get().value = left.get().value.subtract(right.get().value);
+    }
+    static void multiply(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> left,
+                         JppPtr<JppGmpInteger> right) {
+        target.get().value = left.get().value.multiply(right.get().value);
+    }
+    static void addInteger(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> left,
+                           BigInteger right) {
+        target.get().value = left.get().value.add(right);
+    }
+    static void subtractInteger(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> left,
+                                BigInteger right) {
+        target.get().value = left.get().value.subtract(right);
+    }
+    static void integerSubtract(JppPtr<JppGmpInteger> target, BigInteger left,
+                                JppPtr<JppGmpInteger> right) {
+        target.get().value = left.subtract(right.get().value);
+    }
+    static void multiplyInteger(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> left,
+                                BigInteger right) {
+        target.get().value = left.get().value.multiply(right);
+    }
+    static void negate(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> source) {
+        target.get().value = source.get().value.negate();
+    }
+    static void absolute(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> source) {
+        target.get().value = source.get().value.abs();
+    }
+    static void swap(JppPtr<JppGmpInteger> left, JppPtr<JppGmpInteger> right) {
+        JppGmpInteger a = left.get(), b = right.get();
+        BigInteger value = a.value;
+        a.value = b.value;
+        b.value = value;
+    }
+    static BigInteger[] division(BigInteger numerator, BigInteger denominator, int mode) {
+        BigInteger[] parts = numerator.divideAndRemainder(denominator);
+        if (parts[1].signum() != 0) {
+            int sign = numerator.signum() * denominator.signum();
+            if (mode < 0 && sign < 0) {
+                parts[0] = parts[0].subtract(BigInteger.ONE);
+                parts[1] = parts[1].add(denominator);
+            } else if (mode > 0 && sign > 0) {
+                parts[0] = parts[0].add(BigInteger.ONE);
+                parts[1] = parts[1].subtract(denominator);
+            }
+        }
+        return parts;
+    }
+    static void divide(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> numerator,
+                       JppPtr<JppGmpInteger> denominator, int mode) {
+        target.get().value = division(numerator.get().value, denominator.get().value, mode)[0];
+    }
+    static void remainder(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> numerator,
+                          JppPtr<JppGmpInteger> denominator, int mode) {
+        target.get().value = division(numerator.get().value, denominator.get().value, mode)[1];
+    }
+    static void divideRemainder(JppPtr<JppGmpInteger> quotient, JppPtr<JppGmpInteger> remainder,
+                                JppPtr<JppGmpInteger> numerator,
+                                JppPtr<JppGmpInteger> denominator, int mode) {
+        BigInteger[] parts = division(numerator.get().value, denominator.get().value, mode);
+        quotient.get().value = parts[0];
+        remainder.get().value = parts[1];
+    }
+    static void modulo(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> numerator,
+                       JppPtr<JppGmpInteger> denominator) {
+        target.get().value = numerator.get().value.mod(denominator.get().value.abs());
+    }
+    static int compare(JppPtr<JppGmpInteger> left, JppPtr<JppGmpInteger> right) {
+        return left.get().value.compareTo(right.get().value);
+    }
+    static int compareInteger(JppPtr<JppGmpInteger> left, BigInteger right) {
+        return left.get().value.compareTo(right);
+    }
+    static int compareAbsolute(JppPtr<JppGmpInteger> left, JppPtr<JppGmpInteger> right) {
+        return left.get().value.abs().compareTo(right.get().value.abs());
+    }
+    static int compareAbsoluteInteger(JppPtr<JppGmpInteger> left, BigInteger right) {
+        return left.get().value.abs().compareTo(right);
+    }
+    static BigInteger unsignedValue(JppPtr<JppGmpInteger> source) {
+        return source.get().value.abs();
+    }
+    static int testBit(JppPtr<JppGmpInteger> source, BigInteger index) {
+        BigInteger value = source.get().value;
+        return index.bitLength() > 31 ? (value.signum() < 0 ? 1 : 0)
+                                     : (value.testBit(index.intValue()) ? 1 : 0);
+    }
+    static void multiplyPowerOfTwo(JppPtr<JppGmpInteger> target,
+                                   JppPtr<JppGmpInteger> source, BigInteger exponent) {
+        BigInteger value = source.get().value;
+        target.get().value = value.signum() == 0 ? value : value.shiftLeft(exponent.intValueExact());
+    }
+    static void and(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> left,
+                    JppPtr<JppGmpInteger> right) {
+        target.get().value = left.get().value.and(right.get().value);
+    }
+    static void or(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> left,
+                   JppPtr<JppGmpInteger> right) {
+        target.get().value = left.get().value.or(right.get().value);
+    }
+    static void xor(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> left,
+                    JppPtr<JppGmpInteger> right) {
+        target.get().value = left.get().value.xor(right.get().value);
+    }
+    static void complement(JppPtr<JppGmpInteger> target, JppPtr<JppGmpInteger> source) {
+        target.get().value = source.get().value.not();
+    }
+}
+
 // C++ handlers catch only translated C++ exceptions. Nonlocal jumps and JVM
 // failures keep their own control paths.
 static class JppException extends RuntimeException {
@@ -4006,6 +4141,8 @@ static class JppOutput extends JppStreamState implements AutoCloseable {
     private PrintWriter output;
     int precision = 6;
     char formatMode = 'g';
+    long fieldWidth;
+    char fillCharacter = ' ', adjustment = 'r';
     boolean boolalpha, good = true, ended, unitBuffered;
     JppOutput(OutputStream stream) {
         output = new PrintWriter(new BufferedWriter(
@@ -4067,27 +4204,95 @@ static class JppOutput extends JppStreamState implements AutoCloseable {
         if (!good || output == null)
             return this;
         flushTie();
+        String text;
         if (value instanceof Boolean)
-            output.print(boolalpha ? value : ((Boolean)value ? 1 : 0));
+            text = boolalpha ? value.toString() : ((Boolean)value ? "1" : "0");
         else if (value instanceof Double || value instanceof Float) {
             String special = Jpp.nonfinite(((Number)value).doubleValue(), false, false, false);
-            if (special != null) {
-                output.print(special);
-                if (unitBuffered)
-                    output.flush();
-                return this;
+            if (special != null)
+                text = special;
+            else {
+                double number = ((Number)value).doubleValue();
+                text = (Double.doubleToRawLongBits(number) < 0 ? "-" : "") +
+                    Jpp.floating(Math.abs(number), formatMode,
+                                 formatMode == 'a' ? -1 : precision, false);
             }
-            double number = ((Number)value).doubleValue();
-            if (Double.doubleToRawLongBits(number) < 0)
-                output.print('-');
-            output.print(Jpp.floating(Math.abs(number), formatMode,
-                                      formatMode == 'a' ? -1 : precision, false));
         } else
-            output.print(value);
+            text = String.valueOf(value);
+        long padding = fieldWidth > text.length() ? fieldWidth - text.length() : 0;
+        fieldWidth = 0;
+        int prefix = 0;
+        if (adjustment == 'i' && value instanceof Number) {
+            if (text.startsWith("-") || text.startsWith("+"))
+                prefix = 1;
+            else if (text.startsWith("0x") || text.startsWith("0X"))
+                prefix = 2;
+        }
+        if (adjustment == 'l') {
+            output.print(text);
+            padding(padding);
+        } else {
+            output.print(text.substring(0, prefix));
+            padding(padding);
+            output.print(text.substring(prefix));
+        }
         if (unitBuffered)
             output.flush();
         return this;
     }
+    private void padding(long count) {
+        if (count == 0)
+            return;
+        char[] buffer = new char[256];
+        Arrays.fill(buffer, fillCharacter);
+        while (count > 0) {
+            int length = (int)Math.min(count, buffer.length);
+            output.write(buffer, 0, length);
+            count -= length;
+        }
+    }
+    JppOutput raw(Object value) {
+        if (!good || output == null)
+            return this;
+        flushTie();
+        output.print(value);
+        if (unitBuffered)
+            output.flush();
+        return this;
+    }
+    JppOutput put(char value) {
+        return raw(value);
+    }
+    JppOutput write(JppPtr<Character> source, long count) {
+        if (!good || output == null)
+            return this;
+        flushTie();
+        if (count < 0) {
+            good = false;
+            return this;
+        }
+        int length = Math.toIntExact(count);
+        for (int i = 0; i < length; ++i)
+            output.print(source.plus(i).get());
+        if (unitBuffered)
+            output.flush();
+        return this;
+    }
+    long width() { return fieldWidth; }
+    long width(long value) {
+        long previous = fieldWidth;
+        fieldWidth = value;
+        return previous;
+    }
+    char fill() { return fillCharacter; }
+    char fill(char value) {
+        char previous = fillCharacter;
+        fillCharacter = value;
+        return previous;
+    }
+    JppOutput fieldWidth(long value) { fieldWidth = value; return this; }
+    JppOutput fieldFill(char value) { fillCharacter = value; return this; }
+    JppOutput adjust(char value) { adjustment = value; return this; }
     JppOutput flush() {
         flushTie();
         if (output != null) {
@@ -4098,7 +4303,7 @@ static class JppOutput extends JppStreamState implements AutoCloseable {
         return this;
     }
     JppOutput endl() {
-        print('\n');
+        put('\n');
         return flush();
     }
     JppOutput precision(int n) {
@@ -4329,7 +4534,7 @@ static class Jpp {
         while (copied < requested) {
             int length = (int)Math.min((long)buffer.length, requested - copied);
             storage.read(offset + copied, buffer, 0, length);
-            output.print(new String(buffer, 0, length,
+            output.raw(new String(buffer, 0, length,
                                     java.nio.charset.StandardCharsets.ISO_8859_1));
             copied += length;
             if (!output.good)
@@ -5809,8 +6014,9 @@ static class Jpp {
         return true;
     }
     static int putchar(int c) {
-        jppOut.print((char)c);
-        return c;
+        int octet = c & 255;
+        jppOut.raw((char)octet);
+        return octet;
     }
     static int exit(int status) {
         jppOut.flush();
@@ -5823,7 +6029,7 @@ static class Jpp {
         return jppIn.readByte();
     }
     static int puts(Object s) {
-        jppOut.print(cString(s)).print('\n');
+        jppOut.raw(cString(s)).raw('\n');
         return 0;
     }
     static int ignore(Object... values) {

@@ -15,6 +15,7 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Lex/Lexer.h>
+#include <clang/Lex/Preprocessor.h>
 #include <clang/Sema/Lookup.h>
 #include <clang/Sema/Overload.h>
 #include <clang/Sema/Sema.h>
@@ -635,6 +636,29 @@ class Emitter {
     std::string family(QualType t) const {
         auto r = record(t);
         return r && !user(r) ? r->getNameAsString() : "";
+    }
+    bool gmpInteger(QualType t) const {
+        auto r = record(t);
+        auto alias = r && !user(r) ? r->getTypedefNameForAnonDecl() : nullptr;
+        return alias && alias->getName() == "__mpz_struct";
+    }
+    bool gmpRepresentationField(const Expr* e) const {
+        auto member = dyn_cast_or_null<MemberExpr>(bare(e));
+        if (!member)
+            return false;
+        auto owner = member->getBase()->getType();
+        return gmpInteger(owner->isPointerType() ? owner->getPointeeType() : owner);
+    }
+    unsigned gmpLimbBits(QualType t) const {
+        auto nails = sema.PP.getMacroInfo(sema.PP.getIdentifierInfo("GMP_NAIL_BITS"));
+        if (!nails || nails->getNumTokens() != 1 ||
+            Lexer::getSpelling(nails->tokens()[0], sm, ctx.getLangOpts()) != "0")
+            fail(SourceLocation(),
+                 "GMP limb configurations with nail bits need additional lowering");
+        for (auto field : record(t)->fields())
+            if (field->getName() == "_mp_d" && field->getType()->isPointerType())
+                return ctx.getTypeSize(field->getType()->getPointeeType());
+        fail(SourceLocation(), "cannot determine the GMP integer limb width");
     }
     bool iotaView(QualType t) const {
         if (family(t) == "iota_view")
@@ -1690,6 +1714,10 @@ class Emitter {
                 return functionType(p->getAs<FunctionProtoType>());
             return "JppPtr<" + (p->isVoidType() ? std::string("?") : boxed(p)) + ">";
         }
+        if (gmpInteger(t)) {
+            gmpLimbBits(t);
+            return "JppGmpInteger";
+        }
         auto n = family(t);
         if (jumpBuffer(t))
             return "JppJumpBuffer";
@@ -2614,6 +2642,8 @@ class Emitter {
         return referenceABI(callableType(call->getCallee()->getType())->getReturnType());
     }
     std::string reference(const Expr* e) {
+        if (gmpRepresentationField(e))
+            fail(e, "references to GMP representation fields need additional lowering");
         if (auto opaque = dyn_cast_or_null<OpaqueValueExpr>(bare(e));
             opaque && opaqueReferences.count(opaque))
             return opaqueReferences.at(opaque);
@@ -3102,7 +3132,8 @@ class Emitter {
         auto right = bare(op->getArg(1));
         if (longDouble(right->getType()))
             fail(right, "long double text formatting needs additional lowering");
-        if (auto dr = dyn_cast<DeclRefExpr>(right)) {
+        if (auto dr = dyn_cast<DeclRefExpr>(right);
+            dr && isa<FunctionDecl>(dr->getDecl()) && !user(dr->getDecl())) {
             auto n = dr->getDecl()->getNameAsString();
             if (n == "endl")
                 return left + ".endl()";
@@ -3118,11 +3149,23 @@ class Emitter {
                 return left + ".boolalpha(" + (n == "boolalpha" ? "true" : "false") + ")";
             if (n == "unitbuf" || n == "nounitbuf")
                 return left + ".unitbuf(" + (n == "unitbuf" ? "true" : "false") + ")";
+            if (n == "left" || n == "right" || n == "internal")
+                return left + ".adjust('" +
+                       std::string(n == "left"    ? "l"
+                                   : n == "right" ? "r"
+                                                  : "i") +
+                       "')";
         }
         if (auto call = dyn_cast<CallExpr>(right);
-            call && call->getDirectCallee() &&
-            call->getDirectCallee()->getNameAsString() == "setprecision")
-            return left + ".precision(" + intArgument(call->getArg(0)) + ")";
+            call && call->getDirectCallee() && !user(call->getDirectCallee())) {
+            auto method = call->getDirectCallee()->getNameAsString();
+            if (method == "setprecision")
+                return left + ".precision(" + intArgument(call->getArg(0)) + ")";
+            if (method == "setw")
+                return left + ".fieldWidth(" + value(call->getArg(0), ctx.LongLongTy) + ")";
+            if (method == "setfill")
+                return left + ".fieldFill(" + value(call->getArg(0), ctx.CharTy) + ")";
+        }
         auto s = expr(op->getArg(1));
         auto t = op->getArg(1)->getType();
         if (family(t) == "mersenne_twister_engine")
@@ -3146,6 +3189,8 @@ class Emitter {
         return {};
     }
     std::string assign(const Expr* lhs, const std::string& rhs) {
+        if (gmpRepresentationField(lhs))
+            fail(lhs, "writes to GMP representation fields need additional lowering");
         if (auto opaque = dyn_cast_or_null<OpaqueValueExpr>(bare(lhs));
             opaque && opaqueReferences.count(opaque))
             return reference(lhs) + ".set(" + rhs + ")";
@@ -3436,6 +3481,8 @@ class Emitter {
         return e->HasSideEffects(ctx);
     }
     std::string compoundAssignment(const CompoundAssignOperator* e, bool asReference = false) {
+        if (gmpRepresentationField(e->getLHS()))
+            fail(e, "writes to GMP representation fields need additional lowering");
         if (dataPointer(e->getLHS()->getType())) {
             bool bytes = clean(e->getLHS()->getType())->getPointeeType()->isVoidType();
             auto left = temporary("jppPointer"), right = temporary("jppOffset");
@@ -4089,6 +4136,67 @@ class Emitter {
             return {};
         return constantValue(result.Val, t);
     }
+    std::string gmpCall(const CallExpr* c, const std::string& operation) {
+        static const std::map<std::string, std::string> methods = {
+            {"init", "initialize"},
+            {"clear", "clear"},
+            {"init_set", "set"},
+            {"set", "set"},
+            {"init_set_ui", "setInteger"},
+            {"init_set_si", "setInteger"},
+            {"set_ui", "setInteger"},
+            {"set_si", "setInteger"},
+            {"add", "add"},
+            {"sub", "subtract"},
+            {"mul", "multiply"},
+            {"add_ui", "addInteger"},
+            {"sub_ui", "subtractInteger"},
+            {"ui_sub", "integerSubtract"},
+            {"mul_ui", "multiplyInteger"},
+            {"mul_si", "multiplyInteger"},
+            {"neg", "negate"},
+            {"abs", "absolute"},
+            {"swap", "swap"},
+            {"cmp", "compare"},
+            {"cmp_ui", "compareInteger"},
+            {"cmp_si", "compareInteger"},
+            {"cmpabs", "compareAbsolute"},
+            {"cmpabs_ui", "compareAbsoluteInteger"},
+            {"tstbit", "testBit"},
+            {"mul_2exp", "multiplyPowerOfTwo"},
+            {"and", "and"},
+            {"ior", "or"},
+            {"xor", "xor"},
+            {"com", "complement"}};
+        std::vector<std::string> args;
+        for (auto argument : c->arguments()) {
+            auto t = clean(argument->getType());
+            if (t->isIntegerType())
+                args.push_back(converted(expr(argument), t, ctx.Int128Ty));
+            else if (t->isPointerType() && gmpInteger(t->getPointeeType()))
+                args.push_back(value(argument, argument->getType(), true));
+            else
+                fail(c, "this GMP argument type needs additional lowering");
+        }
+        if (operation == "get_ui")
+            return converted("JppGmpInteger.unsignedValue(" + join(args) + ")", ctx.Int128Ty,
+                             c->getType());
+        if (operation == "mod")
+            return "JppGmpInteger.modulo(" + join(args) + ")";
+        if ((operation.starts_with("fdiv_") || operation.starts_with("tdiv_") ||
+             operation.starts_with("cdiv_")) &&
+            (operation.ends_with("_q") || operation.ends_with("_r") ||
+             operation.ends_with("_qr"))) {
+            auto method = operation.ends_with("_qr")  ? "divideRemainder"
+                          : operation.ends_with("_q") ? "divide"
+                                                      : "remainder";
+            args.push_back(operation[0] == 'f' ? "-1" : operation[0] == 'c' ? "1" : "0");
+            return "JppGmpInteger." + std::string(method) + "(" + join(args) + ")";
+        }
+        if (auto method = methods.find(operation); method != methods.end())
+            return "JppGmpInteger." + method->second + "(" + join(args) + ")";
+        fail(c, "unsupported GMP integer function __gmpz_" + operation);
+    }
     std::string call(const CallExpr* c) {
         if (auto saved = checkpointValues.find(c); saved != checkpointValues.end())
             return saved->second;
@@ -4309,6 +4417,20 @@ class Emitter {
             }
             if (n == "sync_with_stdio")
                 return "Jpp.last(" + expr(obj) + ", JppIoState.sync(" + truth(c->getArg(0)) + "))";
+            if (auto source = family(sourceType); source.find("ostream") != std::string::npos ||
+                                                  source.find("ofstream") != std::string::npos) {
+                auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
+                if (n == "width")
+                    return converted(
+                        object + ".width(" +
+                            (c->getNumArgs() ? value(c->getArg(0), ctx.LongLongTy) : "") + ")",
+                        ctx.LongLongTy, c->getType());
+                if (n == "fill")
+                    return converted(object + ".fill(" +
+                                         (c->getNumArgs() ? value(c->getArg(0), ctx.CharTy) : "") +
+                                         ")",
+                                     ctx.CharTy, c->getType());
+            }
             if (stream(ot)) {
                 auto object = me->isArrow() ? expr(obj) + ".get()" : expr(obj);
                 if (n == "tie")
@@ -4323,6 +4445,11 @@ class Emitter {
                     return object + ".ended";
                 if (n == "flush")
                     return object + ".flush()";
+                if (n == "put")
+                    return object + ".put(" + value(c->getArg(0), ctx.CharTy) + ")";
+                if (n == "write")
+                    return object + ".write(" + value(c->getArg(0), c->getArg(0)->getType(), true) +
+                           ", " + value(c->getArg(1), ctx.LongLongTy) + ")";
                 if (n == "close" || n == "is_open")
                     return object + "." + n + "()";
                 if (n == "open") {
@@ -4546,6 +4673,8 @@ class Emitter {
                 prefix = options.className + ".";
             return prefix + name(f) + "(" + arguments(c, f) + ")";
         }
+        if (n.starts_with("__gmpz_"))
+            return gmpCall(c, n.substr(7));
         auto memoryOperation = n.starts_with("__builtin_") ? n.substr(10) : n;
         if (memoryOperation == "strlen")
             return converted("Jpp.strlen(" + expr(c->getArg(0)) + ")", ctx.UnsignedLongLongTy,
@@ -5531,6 +5660,8 @@ class Emitter {
             if (x->getOpcode() == UO_AddrOf)
                 return address(a);
             if (x->isIncrementDecrementOp()) {
+                if (gmpRepresentationField(a))
+                    fail(x, "writes to GMP representation fields need additional lowering");
                 int delta = x->isIncrementOp() ? 1 : -1;
                 if (longDouble(a->getType()))
                     return "Jpp.updateLongDouble(" + reference(a) + ", " + std::to_string(delta) +
@@ -5626,6 +5757,11 @@ class Emitter {
                 return base + "." + x->getMemberDecl()->getNameAsString();
             if (!user(x->getMemberDecl())) {
                 auto n = x->getMemberDecl()->getNameAsString();
+                auto owner = x->getBase()->getType();
+                if (owner->isPointerType())
+                    owner = owner->getPointeeType();
+                if (gmpInteger(owner) && n == "_mp_size")
+                    return base + ".limbCount(" + std::to_string(gmpLimbBits(owner)) + ")";
                 if (n == "first" || n == "second") {
                     auto owner = x->getBase()->getType();
                     if (owner->isPointerType())
