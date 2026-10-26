@@ -4699,6 +4699,38 @@ class Emitter {
             ctx.hasSameType(clean(f->getReturnType()), ctx.IntTy) &&
             ctx.hasSameType(clean(f->getParamDecl(0)->getType()), ctx.IntTy))
             return "Jpp." + memoryOperation + "(" + value(c->getArg(0), ctx.IntTy) + ")";
+        static const std::set<std::string> characterPredicates = {
+            "isalnum", "isalpha", "isblank", "iscntrl", "isdigit", "isgraph",
+            "islower", "isprint", "ispunct", "isspace", "isupper", "isxdigit"};
+        if (characterPredicates.count(memoryOperation) && c->getNumArgs() == 1 &&
+            f->getNumParams() == 1 &&
+            (f->getDeclContext()->getRedeclContext()->isTranslationUnit() ||
+             f->isInStdNamespace()) &&
+            ctx.hasSameType(clean(f->getReturnType()), ctx.IntTy) &&
+            ctx.hasSameType(clean(f->getParamDecl(0)->getType()), ctx.IntTy)) {
+            std::string mask;
+            // Clang's optimized digit builtin returns a boolean integer.
+            // Unoptimized and non-builtin calls retain the libc result bits.
+            if (memoryOperation == "isdigit" && f->getBuiltinID() &&
+                (n.starts_with("__builtin_") || ctx.getLangOpts().Optimize))
+                mask = "1";
+            else {
+                auto triple = ctx.getTargetInfo().getTriple();
+                if (triple.isOSLinux() && triple.isGNUEnvironment()) {
+                    auto identifier = "_IS" + memoryOperation.substr(2);
+                    for (auto declaration :
+                         ctx.getTranslationUnitDecl()->lookup(&ctx.Idents.get(identifier)))
+                        if (auto constant = dyn_cast<EnumConstantDecl>(declaration);
+                            constant && !user(constant))
+                            mask = number(constant->getInitVal());
+                }
+            }
+            if (mask.empty())
+                fail(c, "C character classification for this target library needs additional "
+                        "lowering");
+            return "(JppCtype." + memoryOperation + "(" + value(c->getArg(0), ctx.IntTy) + ") ? " +
+                   mask + " : 0)";
+        }
         if (isa<UserDefinedLiteral>(c) && isString(c->getType()) && c->getNumArgs() == 2) {
             auto source = clean(c->getArg(0)->getType());
             if (source->isPointerType() && source->getPointeeType()->isCharType())
@@ -4998,8 +5030,6 @@ class Emitter {
             return "Jpp.swap(" + reference(c->getArg(0)) + ", " + reference(c->getArg(1)) + ")";
         if (n == "flush")
             return expr(c->getArg(0)) + ".flush()";
-        if (n == "isdigit")
-            return "Jpp.isdigit(" + expr(c->getArg(0)) + ")";
         if (n == "move" || n == "forward" || n == "as_const")
             return expr(c->getArg(0));
         if (n == "to_string" && c->getNumArgs() && longDouble(c->getArg(0)->getType()))

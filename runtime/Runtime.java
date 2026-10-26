@@ -145,6 +145,47 @@ static class JppGmpInteger {
     }
 }
 
+// Narrow character classification in the initial C locale.
+static class JppCtype {
+    static boolean isalnum(int value) {
+        return isalpha(value) || isdigit(value);
+    }
+    static boolean isalpha(int value) {
+        return isupper(value) || islower(value);
+    }
+    static boolean isblank(int value) {
+        return value == ' ' || value == '\t';
+    }
+    static boolean iscntrl(int value) {
+        return (value >= 0 && value < 32) || value == 127;
+    }
+    static boolean isdigit(int value) {
+        return value >= '0' && value <= '9';
+    }
+    static boolean isgraph(int value) {
+        return value >= '!' && value <= '~';
+    }
+    static boolean islower(int value) {
+        return value >= 'a' && value <= 'z';
+    }
+    static boolean isprint(int value) {
+        return value >= ' ' && value <= '~';
+    }
+    static boolean ispunct(int value) {
+        return isgraph(value) && !isalnum(value);
+    }
+    static boolean isspace(int value) {
+        return value == ' ' || (value >= '\t' && value <= '\r');
+    }
+    static boolean isupper(int value) {
+        return value >= 'A' && value <= 'Z';
+    }
+    static boolean isxdigit(int value) {
+        return isdigit(value) || (value >= 'a' && value <= 'f') ||
+               (value >= 'A' && value <= 'F');
+    }
+}
+
 // The default GNU libc rand/random stream has 31 words of shared state.
 static class JppGlibcRandom {
     static final int[] words = new int[31];
@@ -5482,9 +5523,6 @@ static class Jpp {
         a.set(b.get());
         b.set(value);
         return 0;
-    }
-    static int isdigit(int c) {
-        return c >= '0' && c <= '9' ? 1 : 0;
     }
     static <T> Comparator<T> comparator(java.util.function.BiPredicate<? super T, ? super T> less) {
         return (a, b) -> less.test(a, b) ? -1 : less.test(b, a) ? 1 : 0;

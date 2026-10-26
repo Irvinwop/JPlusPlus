@@ -233,6 +233,8 @@ int main() {
                                 << ' ' << i % 256 << '\n';
         cases.emplace_back("std_compat", compatibilityInputs.str());
         cases.emplace_back("character_conversion", "");
+        cases.emplace_back("character_classification", "");
+        cases.emplace_back("character_classification_module", "");
         cases.emplace_back("string_literals", "8\n0\n1\n65\n127\n128\n255\n256\n-1\n");
 #ifdef __GLIBC__
         std::mt19937_64 cRandom(0x72616e646f6d);
@@ -489,7 +491,9 @@ int main() {
                 oracleCompiler = std::getenv("JPP_TEST_POINTER_CXX")
                                      ? std::getenv("JPP_TEST_POINTER_CXX")
                                      : "clang++-18";
-            if (name == "std_module" || name == "std_compat") {
+            bool compatibilityModule =
+                name == "std_compat" || name == "character_classification_module";
+            if (name == "std_module" || compatibilityModule) {
                 oracleCompiler = std::getenv("JPP_TEST_MODULE_CXX")
                                      ? std::getenv("JPP_TEST_MODULE_CXX")
                                      : "clang++-18";
@@ -499,7 +503,7 @@ int main() {
                 must({oracleCompiler, "-std=gnu++23", "-c", interface.string(),
                       "-fmodule-output=" + (p / "std.pcm").string(), "-o", (p / "std.o").string()},
                      p / "empty");
-                if (name == "std_compat") {
+                if (compatibilityModule) {
                     auto compatibility =
                         fs::path(JPP_SOURCE) / "tests/fixtures/std_compat_interface.cppm";
                     must({oracleCompiler, "-std=gnu++23", "-c", compatibility.string(),
@@ -515,10 +519,10 @@ int main() {
                 nativeCompile.push_back("-lgmp");
             if (name == "gnu_random_threads")
                 nativeCompile.push_back("-pthread");
-            if (name == "std_module" || name == "std_compat") {
+            if (name == "std_module" || compatibilityModule) {
                 nativeCompile.push_back("-fmodule-file=std=" + (p / "std.pcm").string());
                 nativeCompile.push_back((p / "std.o").string());
-                if (name == "std_compat") {
+                if (compatibilityModule) {
                     nativeCompile.push_back("-fmodule-file=std.compat=" +
                                             (p / "std.compat.pcm").string());
                     nativeCompile.push_back((p / "std.compat.o").string());
@@ -696,16 +700,19 @@ int main() {
                 throw std::runtime_error("module failure replaced output or lost its diagnostic");
             ++checks;
         }
-        write(p / "locale.cpp",
-              "#include <locale>\n#include <iostream>\n"
-              "int main() { std::cout << std::toupper('a', std::locale(\"C\")); }\n");
-        code = process({JPP_BINARY, (p / "locale.cpp").string(), "--check", "-v", "j8", "-o",
-                        (p / "Main.java").string()},
-                       p / "empty", p / "stdout", p / "stderr");
-        if (code == 0 || read(p / "Main.java") != "existing submission\n" ||
-            read(p / "stderr").find("unsupported") == std::string::npos)
-            throw std::runtime_error("C++ locale overload was miscompiled or replaced output");
-        ++checks;
+        for (const std::string function : {"toupper", "isdigit"}) {
+            write(p / "locale.cpp",
+                  "#include <locale>\n#include <iostream>\n"
+                  "int main() { int effects = 0; std::cout << std::" +
+                      function + "('a', (++effects, std::locale(\"C\"))) << ':' << effects; }\n");
+            code = process({JPP_BINARY, (p / "locale.cpp").string(), "--check", "-v", "j8", "-o",
+                            (p / "Main.java").string()},
+                           p / "empty", p / "stdout", p / "stderr");
+            if (code == 0 || read(p / "Main.java") != "existing submission\n" ||
+                read(p / "stderr").find("unsupported") == std::string::npos)
+                throw std::runtime_error("C++ locale overload was miscompiled or replaced output");
+            ++checks;
+        }
         write(p / "exit.cpp",
               "#include <iostream>\nint main(){std::cout << 123 << '\\n'; return 7;}\n");
         code = process({JPP_BINARY, (p / "exit.cpp").string(), "-r", "-v", "j8", "-o",
