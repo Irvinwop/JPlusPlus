@@ -3,9 +3,11 @@
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
+#include <clang/AST/Attr.h>
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/ExprCXX.h>
+#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/StmtCXX.h>
 #include <clang/Basic/TargetInfo.h>
 #include <clang/Format/Format.h>
@@ -433,6 +435,7 @@ class Emitter {
     std::unordered_map<const OpaqueValueExpr*, std::string> opaqueValues;
     std::unordered_map<const OpaqueValueExpr*, std::string> opaqueReferences;
     std::unordered_map<const Expr*, std::string> arrayBounds;
+    std::unordered_set<const CXXBindTemporaryExpr*> localInitializers;
     struct ArrayBoundScope {
         std::unordered_map<const Expr*, std::string>& bounds;
         std::unordered_map<const Expr*, std::string> previous;
@@ -513,6 +516,10 @@ class Emitter {
                 (objectMethods.count(base) ||
                  (isa<CXXMethodDecl>(f) && (base == "copy" || base == "compareTo"))))
                 base = "cpp_" + base;
+            if (auto method = dyn_cast<CXXMethodDecl>(f);
+                method && base == "close" &&
+                scopedDestructor(ctx.getRecordType(method->getParent())))
+                base = "cpp_close";
             if (f->isMain())
                 base = "cppMain";
             else if (f->isOverloadedOperator()) {
@@ -818,6 +825,73 @@ class Emitter {
     }
     bool tupleLike(QualType t) const {
         return product(t) || family(t) == "array";
+    }
+    const CXXDestructorDecl* scopedDestructor(QualType t) const {
+        if (t->isReferenceType() || t->isPointerType())
+            return nullptr;
+        auto r = record(t);
+        auto destructor = r && user(r) ? r->getDestructor() : nullptr;
+        return destructor && !destructor->isImplicit() && !destructor->isDefaulted() ? destructor
+                                                                                     : nullptr;
+    }
+    bool ownsDestructor(QualType t, std::unordered_set<const Type*>& visited) {
+        if (t->isReferenceType() || t->isPointerType())
+            return false;
+        t = clean(t);
+        if (!visited.insert(t.getTypePtr()).second)
+            return false;
+        if (scopedDestructor(t))
+            return true;
+        if (auto array = ctx.getAsArrayType(t)) {
+            if (auto fixed = dyn_cast<ConstantArrayType>(array); fixed && fixed->getSize().isZero())
+                return false;
+            return ownsDestructor(array->getElementType(), visited);
+        }
+        auto n = family(t);
+        if (n == "reference_wrapper" || n == "function")
+            return false;
+        if (n == "array" && templateArgs(t)[1].getAsIntegral().isZero())
+            return false;
+        if (isVec(t) || n == "deque" || n == "queue" || n == "stack" || n == "priority_queue" ||
+            isSet(t))
+            return ownsDestructor(element(t), visited);
+        if (isMap(t))
+            return ownsDestructor(element(t), visited) || ownsDestructor(element(t, 1), visited);
+        if (product(t))
+            for (auto item : productTypes(t))
+                if (ownsDestructor(item, visited))
+                    return true;
+        if (auto r = record(t); r && user(r))
+            for (auto field : r->fields())
+                if (ownsDestructor(field->getType(), visited))
+                    return true;
+        return false;
+    }
+    bool ownsDestructor(QualType t) {
+        std::unordered_set<const Type*> visited;
+        return ownsDestructor(t, visited);
+    }
+    bool scopedResource(QualType t) const {
+        return fileStream(t) || scopedDestructor(t);
+    }
+    void markLocalInitializer(const Expr* e) {
+        if (!e)
+            return;
+        if (auto temporary = dyn_cast<CXXBindTemporaryExpr>(e)) {
+            localInitializers.insert(temporary);
+            markLocalInitializer(temporary->getSubExpr());
+        } else if (auto cleanup = dyn_cast<ExprWithCleanups>(e))
+            markLocalInitializer(cleanup->getSubExpr());
+        else if (auto parens = dyn_cast<ParenExpr>(e))
+            markLocalInitializer(parens->getSubExpr());
+        else if (auto cast = dyn_cast<CastExpr>(e))
+            markLocalInitializer(cast->getSubExpr());
+        else if (auto conditional = dyn_cast<ConditionalOperator>(e)) {
+            markLocalInitializer(conditional->getTrueExpr());
+            markLocalInitializer(conditional->getFalseExpr());
+        } else if (auto comma = dyn_cast<BinaryOperator>(e);
+                   comma && comma->getOpcode() == BO_Comma)
+            markLocalInitializer(comma->getRHS());
     }
     bool containsVector(QualType t, std::unordered_set<const Type*>& visited) {
         if (t->isReferenceType() || t->isPointerType())
@@ -1861,6 +1935,36 @@ class Emitter {
     void scan(const Stmt* s) {
         if (!s)
             return;
+        if (auto branch = dyn_cast<IfStmt>(s);
+            branch && (branch->isConstexpr() || branch->isConsteval())) {
+            scan(branch->getInit());
+            scan(branch->getConditionVariableDeclStmt());
+            scan(branch->getCond());
+            bool selected = branch->isConsteval()
+                                ? branch->isNegatedConsteval()
+                                : branch->getCond()->EvaluateKnownConstInt(ctx).getBoolValue();
+            scan(selected ? branch->getThen() : branch->getElse());
+            return;
+        }
+        if (auto temporary = dyn_cast<CXXBindTemporaryExpr>(s);
+            temporary && ownsDestructor(temporary->getType()) &&
+            !localInitializers.count(temporary))
+            fail(s, "this temporary's destruction needs additional lifetime lowering");
+        if (auto allocated = dyn_cast<CXXNewExpr>(s);
+            allocated && ownsDestructor(allocated->getAllocatedType()))
+            fail(s, "heap object destruction needs additional lifetime lowering");
+        if (auto deleted = dyn_cast<CXXDeleteExpr>(s);
+            deleted && ownsDestructor(deleted->getArgument()->getType()->getPointeeType()))
+            fail(s, "heap object destruction needs additional lifetime lowering");
+        if (auto call = dyn_cast<CallExpr>(s);
+            call && call->getDirectCallee() && isa<CXXDestructorDecl>(call->getDirectCallee()))
+            fail(s, "explicit destructor calls need additional lifetime lowering");
+        if (auto call = dyn_cast<CallExpr>(s); call && call->getDirectCallee() &&
+                                               !user(call->getDirectCallee()) &&
+                                               call->getDirectCallee()->getNameAsString() == "swap")
+            for (auto argument : call->arguments())
+                if (ownsDestructor(argument->getType()))
+                    fail(s, "swap temporary destruction needs additional lifetime lowering");
         if (isa<Expr>(s) && expressionBounds(s, false))
             markCapturedVariables(s);
         if (auto cast = dyn_cast<ExplicitCastExpr>(s))
@@ -1876,6 +1980,14 @@ class Emitter {
             reservedNames.insert(identifier(r->getDecl()->getNameAsString()));
         if (auto l = dyn_cast<LambdaExpr>(s)) {
             auto callable = lambdaOperator(l->getLambdaClass());
+            for (auto field : l->getLambdaClass()->fields())
+                if (ownsDestructor(field->getType()))
+                    fail(l, "captured object destruction needs additional lifetime lowering");
+            if (ownsDestructor(callable->getReturnType()))
+                fail(l, "returned object destruction needs additional lifetime lowering");
+            for (auto parameter : callable->parameters())
+                if (ownsDestructor(parameter->getType()))
+                    fail(l, "value-parameter destruction needs additional lifetime lowering");
             if (referenceABI(callable->getReturnType()))
                 markReturnedReferences(callable->getBody());
             for (auto p : callable->parameters()) {
@@ -1893,6 +2005,22 @@ class Emitter {
         if (auto d = dyn_cast<DeclStmt>(s)) {
             for (auto decl : d->decls()) {
                 if (auto v = dyn_cast<VarDecl>(decl)) {
+                    if (ownsDestructor(v->getType())) {
+                        if (v->hasAttr<CleanupAttr>())
+                            fail(v->getLocation(),
+                                 "cleanup attributes need additional lifetime lowering");
+                        if (!scopedDestructor(v->getType()))
+                            fail(v->getLocation(),
+                                 "element destruction needs additional lifetime lowering");
+                        if (!v->hasLocalStorage() || v->isStaticLocal())
+                            fail(v->getLocation(),
+                                 "static object destruction needs additional lifetime lowering");
+                        auto parents = ctx.getParents(*d);
+                        if (parents.size() != 1 || !parents[0].get<CompoundStmt>())
+                            fail(v->getLocation(),
+                                 "this declaration's destruction needs additional scope lowering");
+                        markLocalInitializer(v->getInit());
+                    }
                     scanArrayBounds(v->getType());
                     reservedNames.insert(identifier(v->getNameAsString()));
                     if (v->isStaticLocal() && !staticStorage.count(v->getCanonicalDecl())) {
@@ -5729,7 +5857,7 @@ class Emitter {
             bool ownsStream = false;
             if (declarations)
                 for (auto decl : declarations->decls())
-                    if (auto v = dyn_cast<VarDecl>(decl); v && fileStream(v->getType()) &&
+                    if (auto v = dyn_cast<VarDecl>(decl); v && scopedResource(v->getType()) &&
                                                           !v->getType()->isReferenceType() &&
                                                           !v->isStaticLocal())
                         ownsStream = true;
@@ -5742,7 +5870,7 @@ class Emitter {
                 auto v = dyn_cast<VarDecl>(decl);
                 if (!v)
                     fail(child, "unsupported declaration alongside a file stream");
-                if (fileStream(v->getType()) && !v->getType()->isReferenceType() &&
+                if (scopedResource(v->getType()) && !v->getType()->isReferenceType() &&
                     !v->isStaticLocal()) {
                     if (cell(v)) {
                         line(variable(v) + ";");
@@ -6227,9 +6355,9 @@ class Emitter {
             m && (m->isCopyAssignmentOperator() || m->isMoveAssignmentOperator()) &&
             (m->isImplicit() || m->isDefaulted()))
             return;
-        if (isa<CXXDestructorDecl>(f))
-            fail(f->getLocation(),
-                 "user-defined destructors require deterministic lifetime support");
+        if (auto destructor = dyn_cast<CXXDestructorDecl>(f);
+            destructor && !scopedDestructor(ctx.getRecordType(destructor->getParent())))
+            fail(f->getLocation(), "this destructor needs additional lifetime lowering");
         if (auto c = dyn_cast<CXXConstructorDecl>(f);
             c && c->isCopyOrMoveConstructor() && (c->isImplicit() || c->isDefaulted()))
             return;
@@ -6274,8 +6402,12 @@ class Emitter {
             line("}");
         } else {
             bool stat = !isa<CXXMethodDecl>(f) || cast<CXXMethodDecl>(f)->isStatic();
-            line(std::string(stat ? "static " : "") + parameterType(f->getReturnType()) + " " +
-                 name(f) + "(" + join(params) + ")");
+            auto destructor = isa<CXXDestructorDecl>(f);
+            line(std::string(destructor ? "public "
+                             : stat     ? "static "
+                                        : "") +
+                 parameterType(f->getReturnType()) + " " + (destructor ? "close" : name(f)) + "(" +
+                 join(params) + ")");
             line("{");
             ++indent;
             for (auto p : f->parameters())
@@ -6375,8 +6507,11 @@ class Emitter {
                 lt = m;
             }
         auto n = name(r);
+        auto destructor = scopedDestructor(ctx.getRecordType(r));
+        if (destructor && !destructor->hasBody())
+            fail(destructor->getLocation(), "the destructor definition is needed for translation");
         line("static class " + n + " implements JppAssignable<" + n + ">" +
-             (less ? ", Comparable<" + n + ">" : ""));
+             (destructor ? ", AutoCloseable" : "") + (less ? ", Comparable<" + n + ">" : ""));
         line("{");
         ++indent;
         std::vector<std::string> params, assignments, defaults;
@@ -6444,7 +6579,8 @@ class Emitter {
                              "multiple copy constructors need distinct Java signatures");
                     customCopy = constructor;
                 }
-                if (constructor->getNumParams() == 0 && constructor->hasBody())
+                if (!constructor->isImplicit() && constructor->getNumParams() == 0 &&
+                    constructor->hasBody())
                     emittedDefault = true;
             }
         }
@@ -6506,8 +6642,26 @@ class Emitter {
         : ctx(c), sema(s), options(o), sm(c.getSourceManager()) {}
     std::string generate() {
         collect(ctx.getTranslationUnitDecl());
+        for (auto r : records)
+            for (auto field : r->fields())
+                if (ownsDestructor(field->getType()) ||
+                    (scopedDestructor(ctx.getRecordType(r)) &&
+                     !field->getType()->isReferenceType() &&
+                     field->getType().isDestructedType() != QualType::DK_none))
+                    fail(field->getLocation(),
+                         "member destruction needs additional lifetime lowering");
+        for (auto variable : globals)
+            if (ownsDestructor(variable->getType()))
+                fail(variable->getLocation(),
+                     "static object destruction needs additional lifetime lowering");
         for (auto f : functions) {
+            if (ownsDestructor(f->getReturnType()))
+                fail(f->getLocation(),
+                     "returned object destruction needs additional lifetime lowering");
             for (auto p : f->parameters()) {
+                if (ownsDestructor(p->getType()))
+                    fail(p->getLocation(),
+                         "value-parameter destruction needs additional lifetime lowering");
                 scanArrayBounds(p->getOriginalType());
                 reservedNames.insert(identifier(p->getNameAsString()));
                 if (referenceABI(p->getType()))

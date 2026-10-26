@@ -199,6 +199,8 @@ int main() {
         cases.emplace_back("void_memory", expressions.str());
 #endif
         cases.emplace_back("objects", expressions.str());
+        cases.emplace_back("scoped_lifetimes", expressions.str());
+        cases.emplace_back("scoped_allocations", "128 19\n");
         cases.emplace_back("statics", expressions.str());
         cases.emplace_back("calls", expressions.str());
         cases.emplace_back("standard_values", expressions.str());
@@ -421,7 +423,7 @@ int main() {
                         for (const auto& [file, contents] : expectedFiles)
                             fs::remove(p / file);
                         std::vector<std::string> execute = {java};
-                        if (name == "allocation_release")
+                        if (name == "allocation_release" || name == "scoped_allocations")
                             execute.push_back("-Xmx64m");
                         execute.insert(execute.end(),
                                        {"-cp", classes.string(),
