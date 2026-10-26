@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -53,6 +54,8 @@ int process(const std::vector<std::string>& args, const fs::path& input, const f
         throw std::runtime_error("fork");
     if (!pid) {
         setpgid(0, 0);
+        rlimit coreLimit{0, 0};
+        setrlimit(RLIMIT_CORE, &coreLimit);
         int in = open(input.c_str(), O_RDONLY),
             out = open(output.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600),
             err = open(errors.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -175,6 +178,14 @@ int main() {
         extendedInputs << "1.0000000000000000001\n-0\n1e-4950\n1e-4951\n-1e-4951\n1e4932\n12."
                           "5x\n9\n1e99999\n3\n";
         cases.emplace_back("long_double", extendedInputs.str());
+        std::ostringstream exceptionInputs;
+        exceptionInputs << 80 << '\n';
+        for (int i = 0; i < 80; ++i)
+            exceptionInputs << r(18001) - 9000 << '\n';
+        cases.emplace_back("exceptions", exceptionInputs.str());
+        cases.emplace_back("pointer_exceptions", "");
+        cases.emplace_back("exception_termination", "");
+        cases.emplace_back("implicit_vector_moves", "");
         cases.emplace_back("cpp23", "-9\n");
         std::ostringstream bits;
         bits << 70 << '\n';
@@ -391,7 +402,15 @@ int main() {
                 name == "library"
                     ? (fs::path(JPP_SOURCE) / "tests/fixtures/library_driver.cpp").string()
                     : source;
-            must({cxx, "-std=gnu++23", "-O2", nativeSource, "-o", (p / "native").string()},
+            // GCC binds a pointer-reference catch parameter to a temporary. Use
+            // Clang's native object reference as the oracle for this standard rule.
+            auto oracleCompiler = cxx;
+            if (name == "pointer_exceptions")
+                oracleCompiler = std::getenv("JPP_TEST_POINTER_CXX")
+                                     ? std::getenv("JPP_TEST_POINTER_CXX")
+                                     : "clang++-18";
+            must({oracleCompiler, "-std=gnu++23", "-O2", nativeSource, "-o",
+                  (p / "native").string()},
                  p / "empty");
             std::vector<std::string> programArguments;
             if (name == "arguments")
@@ -399,9 +418,25 @@ int main() {
             std::vector<std::string> nativeCommand{(p / "native").string()};
             nativeCommand.insert(nativeCommand.end(), programArguments.begin(),
                                  programArguments.end());
-            must(nativeCommand, p / "input");
-            auto expected = read(p / "stdout");
-            auto expectedErrors = read(p / "stderr");
+            struct Oracle {
+                std::string input, output, errors;
+                int status;
+            };
+            std::vector<std::string> inputs{input};
+            if (name == "exception_termination") {
+                inputs.clear();
+                for (int mode = 0; mode < 8; ++mode)
+                    inputs.push_back(std::to_string(mode) + '\n');
+            }
+            std::vector<Oracle> oracles;
+            for (const auto& nativeInput : inputs) {
+                write(p / "input", nativeInput);
+                int status = process(nativeCommand, p / "input", p / "stdout", p / "stderr", p);
+                if (status != 0 && (name != "exception_termination" || status != 134))
+                    throw std::runtime_error("native execution failed: " + name + ", status " +
+                                             std::to_string(status) + '\n' + read(p / "stderr"));
+                oracles.push_back({nativeInput, read(p / "stdout"), read(p / "stderr"), status});
+            }
             std::map<std::string, std::string> expectedFiles;
             std::vector<std::string> outputNames;
             if (name == "files")
@@ -465,23 +500,34 @@ int main() {
                                         name == "library" ? "LibraryDriver" : "Main"});
                         execute.insert(execute.end(), programArguments.begin(),
                                        programArguments.end());
-                        must(execute, p / "input");
-                        if (read(p / "stdout") != expected)
-                            throw std::runtime_error("output differs from native C++: " + name +
-                                                     ", release " + std::to_string(release) + ", " +
-                                                     javac + ", " + java + "\nexpected:\n" +
-                                                     expected.substr(0, 1000) + "\nactual:\n" +
-                                                     read(p / "stdout").substr(0, 1000));
-                        if ((name == "stream_state" || name == "stream_exit" ||
-                             name == "byte_io") &&
-                            read(p / "stderr") != expectedErrors)
-                            throw std::runtime_error("error output differs from native C++: " +
-                                                     name);
-                        for (const auto& [file, contents] : expectedFiles)
-                            if (!fs::exists(p / file) || read(p / file) != contents)
+                        for (const auto& oracle : oracles) {
+                            write(p / "input", oracle.input);
+                            int status =
+                                process(execute, p / "input", p / "stdout", p / "stderr", p);
+                            if (status != oracle.status)
                                 throw std::runtime_error(
-                                    "file output differs from native C++: " + name + ", " + file);
-                        ++checks;
+                                    "exit status differs from native C++: " + name + ", release " +
+                                    std::to_string(release) + ", " + javac + ", " + java +
+                                    ", expected " + std::to_string(oracle.status) + ", actual " +
+                                    std::to_string(status) + '\n' + read(p / "stderr"));
+                            if (read(p / "stdout") != oracle.output)
+                                throw std::runtime_error(
+                                    "output differs from native C++: " + name + ", release " +
+                                    std::to_string(release) + ", " + javac + ", " + java +
+                                    "\nexpected:\n" + oracle.output.substr(0, 1000) +
+                                    "\nactual:\n" + read(p / "stdout").substr(0, 1000));
+                            if ((name == "stream_state" || name == "stream_exit" ||
+                                 name == "byte_io") &&
+                                read(p / "stderr") != oracle.errors)
+                                throw std::runtime_error("error output differs from native C++: " +
+                                                         name);
+                            for (const auto& [file, contents] : expectedFiles)
+                                if (!fs::exists(p / file) || read(p / file) != contents)
+                                    throw std::runtime_error(
+                                        "file output differs from native C++: " + name + ", " +
+                                        file);
+                            ++checks;
+                        }
                     }
                 }
             }

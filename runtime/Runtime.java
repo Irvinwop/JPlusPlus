@@ -10,6 +10,56 @@ interface JppUninitialized {}
 interface JppMove {}
 interface JppTrivialValue {}
 
+// C++ handlers catch only translated C++ exceptions. Nonlocal jumps and JVM
+// failures keep their own control paths.
+static class JppException extends RuntimeException {
+    final String type;
+    final String[] handlers;
+    final JppRef<Object> value;
+    JppException(String type, Object value, String[] handlers) {
+        super(null, null, false, false);
+        this.type = type;
+        this.handlers = handlers;
+        this.value = JppRef.cell(value);
+    }
+    boolean matches(String handler) {
+        for (String candidate : handlers)
+            if (candidate.equals(handler))
+                return true;
+        return false;
+    }
+    <T> JppRef<T> reference() {
+        return (JppRef<T>)(JppRef<?>)value;
+    }
+}
+static class JppExceptions {
+    static final ThreadLocal<JppException> CURRENT = new ThreadLocal<JppException>();
+    static JppException activate(JppException exception) {
+        JppException previous = CURRENT.get();
+        CURRENT.set(exception);
+        return previous;
+    }
+    static void restore(JppException previous) {
+        if (previous == null)
+            CURRENT.remove();
+        else
+            CURRENT.set(previous);
+    }
+    static JppException rethrow() {
+        JppException exception = CURRENT.get();
+        if (exception == null)
+            throw terminate();
+        return exception;
+    }
+    static <T> T raise(JppException exception) {
+        throw exception;
+    }
+    static JppException terminate() {
+        Runtime.getRuntime().halt(134);
+        throw new AssertionError("C++ termination returned");
+    }
+}
+
 // x87 values are immutable scalars. BigInteger supplies exact intermediates;
 // every arithmetic operation rounds once to the target's 64-bit significand.
 static class JppLongDouble implements Comparable<JppLongDouble> {

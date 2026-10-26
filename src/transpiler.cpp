@@ -16,6 +16,7 @@
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Sema/Lookup.h>
+#include <clang/Sema/Overload.h>
 #include <clang/Sema/Sema.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
@@ -66,9 +67,13 @@ const std::set<std::string> javaRuntimeNames = {
     "StrictMath",
     "System",
     "Runtime",
+    "RuntimeException",
+    "Error",
+    "Exception",
     "OutOfMemoryError",
     "InterruptedException",
     "Thread",
+    "ThreadLocal",
     "Class",
     "Arrays",
     "Collections",
@@ -469,6 +474,10 @@ class Emitter {
     std::vector<std::pair<std::string, std::string>> arrayLayoutFields;
     std::map<std::string, std::string> literalArrays;
     std::map<std::string, std::string> extendedConstants;
+    std::vector<const VarDecl*> exceptionHandlers;
+    std::unordered_map<const void*, std::string> exceptionKeys;
+    std::set<std::string> exceptionLabels;
+    bool cppExceptions = false;
     std::set<unsigned> tupleArities;
     std::map<std::vector<bool>, std::string> productReferenceKinds;
     bool vectorStorage = false;
@@ -2135,6 +2144,81 @@ class Emitter {
     std::string parameterType(QualType t) {
         return referenceABI(t) ? "JppRef<" + boxed(t) + ">" : type(t);
     }
+    std::string exceptionKey(QualType t) {
+        t = t.getCanonicalType();
+        auto [entry, inserted] = exceptionKeys.try_emplace(t.getAsOpaquePtr());
+        if (inserted) {
+            auto base = t.getAsString(), label = base;
+            unsigned suffix = 2;
+            while (!exceptionLabels.insert(label).second)
+                label = base + "#" + std::to_string(suffix++);
+            entry->second = label;
+        }
+        return entry->second;
+    }
+    std::string exceptionType(QualType t) {
+        return exceptionKey(t.getNonReferenceType().getUnqualifiedType());
+    }
+    std::string handlerType(const VarDecl* parameter) {
+        return exceptionKey(parameter->getType());
+    }
+    void requireExceptionType(QualType t, SourceLocation location) const {
+        t = clean(t);
+        auto r = record(t);
+        if (!t->isScalarType() &&
+            !(r && user(r) && r->isTriviallyCopyable() && r->hasTrivialDestructor()))
+            fail(location,
+                 "this exception object's copying and destruction need additional lowering");
+        if (t->isMemberPointerType())
+            fail(location, "member-pointer exceptions need additional lowering");
+    }
+    bool matchesException(QualType from, const VarDecl* parameter) {
+        auto to =
+            parameter->getType().getNonReferenceType().getUnqualifiedType().getCanonicalType();
+        from = from.getNonReferenceType().getUnqualifiedType().getCanonicalType();
+        if (ctx.hasSameType(from, to))
+            return true;
+        if (!to->isPointerType() || (!from->isPointerType() && !from->isNullPtrType()))
+            return false;
+        if (parameter->getType()->isReferenceType() &&
+            !parameter->getType()->getPointeeType().isConstQualified())
+            return false;
+        OpaqueValueExpr source(parameter->getLocation(), from, VK_PRValue);
+        auto conversion = sema.TryImplicitConversion(&source, to, true, Sema::AllowedExplicit::None,
+                                                     false, false, false);
+        if (!conversion.isStandard())
+            return false;
+        if (from->isFunctionPointerType() && !ctx.hasSameType(from, to))
+            fail(parameter->getLocation(),
+                 "converting a caught function pointer needs additional callable lowering");
+        return true;
+    }
+    std::string thrown(const CXXThrowExpr* expression) {
+        auto operand = expression->getSubExpr();
+        if (!operand)
+            return "JppExceptions.rethrow()";
+        auto t = operand->getType().getUnqualifiedType().getCanonicalType();
+        requireExceptionType(t, expression->getExprLoc());
+        std::set<std::string> matched;
+        for (auto parameter : exceptionHandlers)
+            if (matchesException(t, parameter))
+                matched.insert(quote(handlerType(parameter)));
+        std::vector<std::string> handlers(matched.begin(), matched.end());
+        return "new JppException(" + quote(exceptionType(t)) + ", " + value(operand, t, true) +
+               ", new String[] {" + join(handlers) + "})";
+    }
+    bool terminateBoundary(const FunctionDecl* function) const {
+        return cppExceptions && function->getType()->castAs<FunctionProtoType>()->isNothrow();
+    }
+    void endTerminateBoundary() {
+        auto exception = temporary("jppException");
+        --indent;
+        line("} catch (JppException " + exception + ") {");
+        ++indent;
+        line("throw JppExceptions.terminate();");
+        --indent;
+        line("}");
+    }
     const VarDecl* variableRef(const Expr* e) const {
         if (auto r = dyn_cast_or_null<DeclRefExpr>(bare(e)))
             return dyn_cast<VarDecl>(r->getDecl());
@@ -2206,6 +2290,18 @@ class Emitter {
     void scan(const Stmt* s) {
         if (!s)
             return;
+        if (isa<CXXThrowExpr>(s) || isa<CXXTryStmt>(s))
+            cppExceptions = true;
+        if (auto handler = dyn_cast<CXXCatchStmt>(s))
+            if (auto parameter = handler->getExceptionDecl()) {
+                requireExceptionType(parameter->getType(), parameter->getLocation());
+                if (std::find(exceptionHandlers.begin(), exceptionHandlers.end(), parameter) ==
+                    exceptionHandlers.end())
+                    exceptionHandlers.push_back(parameter);
+                reservedNames.insert(identifier(parameter->getNameAsString()));
+                if (referenceABI(parameter->getType()))
+                    references.insert(parameter);
+            }
         if (auto branch = dyn_cast<IfStmt>(s);
             branch && (branch->isConstexpr() || branch->isConsteval())) {
             scan(branch->getInit());
@@ -2339,6 +2435,9 @@ class Emitter {
             c && c->getDirectCallee() &&
             (user(c->getDirectCallee()) || c->getDirectCallee()->getNameAsString() == "swap")) {
             auto f = c->getDirectCallee();
+            if (defaultedMove(f))
+                vectorStorage |=
+                    containsVector(ctx.getRecordType(cast<CXXMethodDecl>(f)->getParent()));
             if (auto method = dyn_cast<CXXMethodDecl>(f); method && method->isStatic())
                 if (auto member = dyn_cast<MemberExpr>(bare(c->getCallee()));
                     member && member->getBase()->HasSideEffects(ctx))
@@ -5171,6 +5270,8 @@ class Emitter {
         if (!input)
             return "";
         auto e = strip(input);
+        if (auto expression = dyn_cast<CXXThrowExpr>(e))
+            return "JppExceptions.raise(" + thrown(expression) + ")";
         if (isa<OffsetOfExpr>(e)) {
             Expr::EvalResult result;
             if (e->EvaluateAsInt(result, ctx))
@@ -6035,6 +6136,10 @@ class Emitter {
         indent = 0;
         line("{");
         ++indent;
+        if (terminateBoundary(f)) {
+            line("try {");
+            ++indent;
+        }
         for (auto p : f->parameters())
             if (cells.count(p) && !references.count(p))
                 line("final JppRef<" + boxed(p->getType()) + "> " + name(p) +
@@ -6045,6 +6150,8 @@ class Emitter {
             bodyStatements(b);
         else
             stmt(f->getBody());
+        if (terminateBoundary(f))
+            endTerminateBoundary();
         --indent;
         line("}");
         auto body = out.str();
@@ -6246,6 +6353,12 @@ class Emitter {
     std::string sequence(const Expr* first, const Expr* second) {
         return supplier([&] {
             expressionStatement(first);
+            if (terminates(first))
+                return;
+            if (terminates(second)) {
+                expressionStatement(second);
+                return;
+            }
             if (second->getType()->isVoidType()) {
                 expressionStatement(second);
                 line("return null;");
@@ -6257,6 +6370,14 @@ class Emitter {
         ArrayBoundScope statementBounds(arrayBounds);
         captureExpressionBounds(e);
         auto b = bare(e);
+        if (auto expression = dyn_cast<CXXThrowExpr>(b)) {
+            line("throw " + thrown(expression) + ";");
+            return;
+        }
+        if (auto cast = dyn_cast<CastExpr>(b); cast && terminates(cast->getSubExpr())) {
+            expressionStatement(cast->getSubExpr());
+            return;
+        }
         if (auto c = dyn_cast<ConditionalOperator>(b); c && c->getType()->isVoidType()) {
             line("if (" + truth(c->getCond()) + ")");
             block(c->getTrueExpr());
@@ -6279,7 +6400,8 @@ class Emitter {
         }
         if (auto bin = dyn_cast<BinaryOperator>(b); bin && bin->getOpcode() == BO_Comma) {
             expressionStatement(bin->getLHS());
-            expressionStatement(bin->getRHS());
+            if (!terminates(bin->getLHS()))
+                expressionStatement(bin->getRHS());
             return;
         }
         if (auto u = dyn_cast<UnaryOperator>(b);
@@ -6339,6 +6461,18 @@ class Emitter {
     bool terminates(const Stmt* s) {
         if (!s)
             return false;
+        if (auto expression = dyn_cast<Expr>(s)) {
+            if (auto plain = strip(expression); plain != expression)
+                return terminates(plain);
+            if (auto cast = dyn_cast<CastExpr>(expression))
+                return terminates(cast->getSubExpr());
+            if (auto comma = dyn_cast<BinaryOperator>(expression);
+                comma && comma->getOpcode() == BO_Comma)
+                return terminates(comma->getLHS()) || terminates(comma->getRHS());
+            if (auto conditional = dyn_cast<ConditionalOperator>(expression))
+                return terminates(conditional->getTrueExpr()) &&
+                       terminates(conditional->getFalseExpr());
+        }
         if (isa<ReturnStmt>(s) || isa<CXXThrowExpr>(s) || isa<BreakStmt>(s) ||
             isa<ContinueStmt>(s) || isa<GotoStmt>(s))
             return true;
@@ -6352,6 +6486,14 @@ class Emitter {
             return call->getDirectCallee() && call->getDirectCallee()->isNoReturn();
         if (auto b = dyn_cast<CompoundStmt>(s))
             return !b->body_empty() && terminates(b->body_back());
+        if (auto attempt = dyn_cast<CXXTryStmt>(s)) {
+            if (!terminates(attempt->getTryBlock()))
+                return false;
+            for (unsigned i = 0; i < attempt->getNumHandlers(); ++i)
+                if (!terminates(attempt->getHandler(i)->getHandlerBlock()))
+                    return false;
+            return true;
+        }
         if (auto i = dyn_cast<IfStmt>(s))
             return i->getElse() && terminates(i->getThen()) && terminates(i->getElse());
         if (auto loop = dyn_cast<ForStmt>(s)) {
@@ -6578,6 +6720,57 @@ class Emitter {
         }
         if (auto b = dyn_cast<CompoundStmt>(s)) {
             block(b);
+            return;
+        }
+        if (auto attempt = dyn_cast<CXXTryStmt>(s)) {
+            line("try");
+            block(attempt->getTryBlock());
+            auto caught = temporary("jppException");
+            line("catch (JppException " + caught + ") {");
+            ++indent;
+            bool catchAll = false;
+            for (unsigned i = 0; i < attempt->getNumHandlers(); ++i) {
+                auto handler = attempt->getHandler(i);
+                auto parameter = handler->getExceptionDecl();
+                if (parameter)
+                    line(std::string(i ? "else if (" : "if (") + caught + ".matches(" +
+                         quote(handlerType(parameter)) + ")) {");
+                else {
+                    line(i ? "else {" : "{");
+                    catchAll = true;
+                }
+                ++indent;
+                if (parameter) {
+                    auto t = parameter->getType();
+                    auto source = caught + ".value.get()";
+                    if (clean(t)->isVoidPointerType())
+                        source = "Jpp.voidPointer((JppPtr<?>)" + source + ")";
+                    source = "(" + boxed(t) + ")(" + source + ")";
+                    if (t->isReferenceType() && (referenceABI(t) || cell(parameter))) {
+                        auto exact = caught + ".type.equals(" + quote(exceptionType(t)) + ")";
+                        line("final JppRef<" + boxed(t) + "> " + name(parameter) + " = " + exact +
+                             " ? " + caught + ".<" + boxed(t) + ">reference() : " + "JppRef.cell(" +
+                             source + ");");
+                    } else {
+                        if (!t->isReferenceType())
+                            source = "jppCopy(" + source + ")";
+                        line((cell(parameter) ? "final JppRef<" + boxed(t) + "> " : type(t) + " ") +
+                             name(parameter) + " = " +
+                             (cell(parameter) ? "JppRef.cell(" + source + ")" : source) + ";");
+                    }
+                }
+                auto previous = temporary("jppPreviousException");
+                line("JppException " + previous + " = JppExceptions.activate(" + caught + ");");
+                line("try");
+                block(handler->getHandlerBlock());
+                line("finally { JppExceptions.restore(" + previous + "); }");
+                --indent;
+                line("}");
+            }
+            if (!catchAll)
+                line("else { throw " + caught + "; }");
+            --indent;
+            line("}");
             return;
         }
         if (auto d = dyn_cast<DeclStmt>(s)) {
@@ -7027,6 +7220,13 @@ class Emitter {
         if (auto destructor = dyn_cast<CXXDestructorDecl>(f);
             destructor && !scopedDestructor(ctx.getRecordType(destructor->getParent())))
             fail(f->getLocation(), "this destructor needs additional lifetime lowering");
+        if (cppExceptions && isa<CXXDestructorDecl>(f) && !terminateBoundary(f))
+            fail(f->getLocation(),
+                 "potentially throwing destructors need exception-unwinding lowering");
+        if (isa<CXXTryStmt>(f->getBody()) &&
+            (isa<CXXConstructorDecl>(f) || isa<CXXDestructorDecl>(f)))
+            fail(f->getLocation(),
+                 "constructor and destructor function-try-blocks need additional lowering");
         if (auto c = dyn_cast<CXXConstructorDecl>(f);
             c && c->isCopyOrMoveConstructor() && (c->isImplicit() || c->isDefaulted()))
             return;
@@ -7045,6 +7245,10 @@ class Emitter {
             line(name(ctor->getParent()) + "(" + join(params) + ")");
             line("{");
             ++indent;
+            if (terminateBoundary(f)) {
+                line("try {");
+                ++indent;
+            }
             for (auto p : f->parameters())
                 if (cells.count(p) && !references.count(p))
                     line("final JppRef<" + boxed(p->getType()) + "> " + name(p) +
@@ -7067,6 +7271,8 @@ class Emitter {
             }
             if (auto b = dyn_cast<CompoundStmt>(f->getBody()))
                 bodyStatements(b);
+            if (terminateBoundary(f))
+                endTerminateBoundary();
             --indent;
             line("}");
         } else {
@@ -7079,6 +7285,10 @@ class Emitter {
                  join(params) + ")");
             line("{");
             ++indent;
+            if (terminateBoundary(f)) {
+                line("try {");
+                ++indent;
+            }
             for (auto p : f->parameters())
                 if (cells.count(p) && !references.count(p))
                     line("final JppRef<" + boxed(p->getType()) + "> " + name(p) +
@@ -7091,6 +7301,8 @@ class Emitter {
                 stmt(f->getBody());
             if (f->isMain() && !terminates(f->getBody()))
                 line("return 0;");
+            if (terminateBoundary(f))
+                endTerminateBoundary();
             --indent;
             line("}");
         }
@@ -7442,6 +7654,8 @@ class Emitter {
             if (main->getNumParams() > 1)
                 arguments.push_back("Jpp.arguments(" + quote(options.className) + ", args)");
             line("try { status = " + name(main) + "(" + join(arguments) + "); }");
+            if (cppExceptions)
+                line("catch (JppException exception) { throw JppExceptions.terminate(); }");
             line("finally {");
             ++indent;
             line("jppOut.flush(); jppErr.flush(); jppLog.flush();");
