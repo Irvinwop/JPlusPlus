@@ -759,7 +759,7 @@ class Emitter {
         if (r)
             r = r->getDefinition();
         if (!r || !user(r) || !r->isCompleteDefinition() || !r->isStandardLayout() ||
-            !r->isTriviallyCopyable() || r->isUnion() || r->getNumBases())
+            !r->isTriviallyCopyable() || r->isUnion() || r->isLambda() || r->getNumBases())
             return nullptr;
         for (auto field : r->fields()) {
             auto item = field->getType();
@@ -799,6 +799,8 @@ class Emitter {
             arrayLayoutFields.emplace_back(layout, initializer);
             return layout;
         }
+        if (t->isRecordType())
+            return {};
         if (auto a = ctx.getAsArrayType(t)) {
             if (auto saved = constantArrayLayouts.find(t.getTypePtr());
                 saved != constantArrayLayouts.end())

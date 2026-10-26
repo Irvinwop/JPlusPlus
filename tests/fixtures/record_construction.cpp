@@ -39,4 +39,9 @@ int main() {
     forward[2].value = -931;
     cout << forward[2].value << ' ' << (forward + 2 - forward) << '\n';
     free(forward);
+    int base = 19;
+    auto callback = [base](int value) { return base + value; };
+    ++base;
+    auto* pointer = &callback;
+    cout << (*pointer)(ordinary.value) << ' ' << callback(-17) << '\n';
 }
