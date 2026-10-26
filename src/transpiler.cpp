@@ -468,6 +468,7 @@ class Emitter {
     std::unordered_map<const Type*, std::string> constantArrayLayouts;
     std::vector<std::pair<std::string, std::string>> arrayLayoutFields;
     std::map<std::string, std::string> literalArrays;
+    std::map<std::string, std::string> extendedConstants;
     std::set<unsigned> tupleArities;
     std::map<std::vector<bool>, std::string> productReferenceKinds;
     bool vectorStorage = false;
@@ -586,6 +587,21 @@ class Emitter {
         if (auto enumeration = t->getAs<EnumType>())
             return enumeration->getDecl()->getIntegerType().getCanonicalType();
         return t;
+    }
+    bool longDouble(QualType t) const {
+        t = clean(t);
+        return t->isRealFloatingType() &&
+               &ctx.getFloatTypeSemantics(t) == &llvm::APFloat::x87DoubleExtended();
+    }
+    std::string extendedConstant(const llvm::APFloat& value) {
+        if (value.isNaN() && value.isSignaling())
+            fail(SourceLocation(), "signaling long double NaNs need floating-environment lowering");
+        llvm::SmallString<48> digits;
+        value.toString(digits);
+        auto [entry, inserted] = extendedConstants.try_emplace(digits.str().str());
+        if (inserted)
+            entry->second = temporary("jppLongDouble");
+        return options.className + "." + entry->second;
     }
     const CXXRecordDecl* record(QualType t) const {
         return clean(t)->getAsCXXRecordDecl();
@@ -802,7 +818,7 @@ class Emitter {
             return false;
         while (auto a = ctx.getAsArrayType(t))
             t = clean(a->getElementType());
-        return t->isArithmeticType() || t->isEnumeralType();
+        return (t->isArithmeticType() || t->isEnumeralType()) && !longDouble(t);
     }
     std::string arrayBound(const ArrayType* a) {
         if (auto fixed = dyn_cast<ConstantArrayType>(a))
@@ -1648,6 +1664,8 @@ class Emitter {
         if (t->isIntegerType())
             return ctx.getTypeSize(t) > 32 ? "long" : "int";
         if (t->isRealFloatingType()) {
+            if (longDouble(t))
+                return "JppLongDouble";
             if (ctx.getTypeSize(t) != 32 && ctx.getTypeSize(t) != 64)
                 fail(SourceLocation(),
                      "extended floating-point types need a software precision backend");
@@ -1794,6 +1812,8 @@ class Emitter {
         if (ctx.getAsArrayType(t))
             return newArray(t, nullptr);
         auto jt = type(t);
+        if (longDouble(t))
+            return "JppLongDouble.ZERO";
         if (jt == "boolean")
             return "false";
         if (jt == "char")
@@ -2009,6 +2029,22 @@ class Emitter {
             return convertProduct(s, from, target);
         if (target->isBooleanType())
             return booleanValue(s, from);
+        if (longDouble(target)) {
+            if (longDouble(from))
+                return s;
+            if (from->isRealFloatingType())
+                return "JppLongDouble.floating(" + s + ")";
+            return "JppLongDouble.integer(" + converted(s, from, ctx.Int128Ty) + ")";
+        }
+        if (longDouble(from) && (target->isArithmeticType() || target->isEnumeralType())) {
+            if (target->isRealFloatingType())
+                return "(" + s + ")." +
+                       (target->isSpecificBuiltinType(BuiltinType::Float) ? "floatValue()"
+                                                                          : "doubleValue()");
+            return converted("(" + s + ").integerValue()", ctx.Int128Ty, target);
+        }
+        if (from->isRealFloatingType() && target->isUnsignedIntegerType())
+            return converted("Jpp.floatingInteger(" + s + ")", ctx.Int128Ty, target);
         if (from->isCharType() && ctx.getTypeSize(from) == 8)
             s = "(char)((int)(char)(" + s + ") & 255)";
         if (from->isBooleanType() && (target->isArithmeticType() || target->isEnumeralType())) {
@@ -2795,6 +2831,8 @@ class Emitter {
             return "(((int)(char)(" + s + ") & 255) != 0)";
         if (big(t))
             return "((" + s + ").signum() != 0)";
+        if (longDouble(t))
+            return "!(" + s + ").isZero()";
         if (t->isArithmeticType() || t->isEnumeralType())
             return "((" + s + ") != 0)";
         if (t->isPointerType())
@@ -2881,7 +2919,7 @@ class Emitter {
         if (base.find('<') != std::string::npos) {
             allocation = "(" + type(t) + ") new " + eraseTypeArguments(base) + dims;
         }
-        if ((initializeObjects && part->isRecordType()) || big(part))
+        if ((initializeObjects && part->isRecordType()) || big(part) || longDouble(part))
             return "Jpp.objects(" + allocation + ", () -> " + defaultValue(part) + ")";
         return allocation;
     }
@@ -2905,6 +2943,8 @@ class Emitter {
             return source + ".nextChar(" + previous + ")";
         if (jt == "double")
             return source + ".nextDouble(" + previous + ")";
+        if (longDouble(t))
+            return "Jpp.readLongDouble(" + source + ", " + previous + ")";
         if (jt == "float")
             return source + ".nextFloat(" + previous + ")";
         if (jt == "boolean")
@@ -2961,6 +3001,8 @@ class Emitter {
     std::string outputChain(const CXXOperatorCallExpr* op) {
         std::string left = expr(op->getArg(0));
         auto right = bare(op->getArg(1));
+        if (longDouble(right->getType()))
+            fail(right, "long double text formatting needs additional lowering");
         if (auto dr = dyn_cast<DeclRefExpr>(right)) {
             auto n = dr->getDecl()->getNameAsString();
             if (n == "endl")
@@ -3041,6 +3083,17 @@ class Emitter {
                            QualType rightType, std::string op) {
         bool comparison =
             op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=";
+        if (longDouble(leftType) || longDouble(rightType)) {
+            auto left = converted(lhs, leftType, ctx.LongDoubleTy);
+            auto right = converted(rhs, rightType, ctx.LongDoubleTy);
+            if (comparison)
+                return "(" + left + ").test(" + right + ", " + quote(op) + ")";
+            static const std::map<std::string, std::string> operations = {
+                {"+", "add"}, {"-", "subtract"}, {"*", "multiply"}, {"/", "divide"}};
+            if (auto operation = operations.find(op); operation != operations.end())
+                return "(" + left + ")." + operation->second + "(" + right + ")";
+            fail(SourceLocation(), "unsupported long double arithmetic operation " + op);
+        }
         if (comparison && clean(leftType)->isCharType() && ctx.getTypeSize(clean(leftType)) == 8)
             return arithmetic(converted(lhs, leftType, ctx.IntTy), ctx.IntTy,
                               converted(rhs, rightType, ctx.IntTy), ctx.IntTy, op);
@@ -3316,7 +3369,7 @@ class Emitter {
             bool javaLvalue =
                 dr || isa<MemberExpr>(bare(lhs)) || (indexed && javaArray(indexed->getBase()));
             javaLvalue &= !referenceMember(lhs);
-            if (javaLvalue && !t->isBooleanType() && !big(t) &&
+            if (javaLvalue && !t->isBooleanType() && !big(t) && !longDouble(t) &&
                 ctx.hasSameType(t, clean(computeResult)) &&
                 !(t->isUnsignedIntegerType() && (op == "/" || op == "%"))) {
                 if (t->isUnsignedIntegerType() && op == ">>")
@@ -3907,6 +3960,8 @@ class Emitter {
         }
         if (evaluated.isFloat()) {
             const auto& value = evaluated.getFloat();
+            if (longDouble(t))
+                return extendedConstant(value);
             auto destination = type(t);
             if (destination != "float" && destination != "double")
                 return {};
@@ -4477,6 +4532,9 @@ class Emitter {
             fail(c, "unsupported compiler intrinsic '" + n + "'");
         }
         if (n == "printf") {
+            for (auto argument : c->arguments())
+                if (longDouble(argument->getType()))
+                    fail(c, "long double formatted output needs additional lowering");
             std::vector<std::string> a = {"Jpp.cString(" + expr(c->getArg(0)) + ")"};
             for (unsigned i = 1; i < c->getNumArgs(); ++i) {
                 auto arg = c->getArg(i);
@@ -4690,6 +4748,8 @@ class Emitter {
             return "Jpp.isdigit(" + expr(c->getArg(0)) + ")";
         if (n == "move" || n == "forward" || n == "as_const")
             return expr(c->getArg(0));
+        if (n == "to_string" && c->getNumArgs() && longDouble(c->getArg(0)->getType()))
+            fail(c, "long double text formatting needs additional lowering");
         if (n == "to_string")
             return "new JppString(" + expr(c->getArg(0)) + ")";
         if (n == "to_underlying")
@@ -4752,6 +4812,51 @@ class Emitter {
                    "))";
         if (n == "advance")
             return expr(c->getArg(0)) + ".advance(" + intArgument(c->getArg(1)) + ")";
+        if (c->getNumArgs() && longDouble(c->getArg(0)->getType()) && n != "min" && n != "max" &&
+            n != "clamp") {
+            auto argument = expr(c->getArg(0));
+            auto operation = n;
+            if (operation.starts_with("__builtin_"))
+                operation.erase(0, 10);
+            static const std::set<std::string> extendedMath = {
+                "fabsl",      "sqrtl",  "floorl",  "ceill",     "truncl", "roundl",  "rintl",
+                "nearbyintl", "ldexpl", "scalbnl", "copysignl", "frexpl", "lroundl", "llroundl"};
+            if (extendedMath.count(operation))
+                operation.pop_back();
+            if (operation == "isnan" || operation == "isinf" || operation == "isfinite" ||
+                operation == "isnormal") {
+                auto result = operation == "isnormal" ? "(" + argument + ").isNormal()"
+                                                      : "(" + argument + ").special " +
+                                                            (operation == "isfinite" ? "== 0"
+                                                             : operation == "isnan"  ? "== 2"
+                                                                                     : "== 1");
+                return converted("(" + result + ")", ctx.BoolTy, c->getType());
+            }
+            if (operation == "signbit")
+                return converted("(" + argument + ").negative", ctx.BoolTy, c->getType());
+            if (operation == "fabs" || operation == "abs")
+                return "(" + argument + ").abs()";
+            if (operation == "sqrt")
+                return "(" + argument + ").sqrt()";
+            if (operation == "floor" || operation == "ceil" || operation == "trunc" ||
+                operation == "round" || operation == "rint" || operation == "nearbyint" ||
+                operation == "lround" || operation == "llround") {
+                auto mode = operation == "floor"                              ? "1"
+                            : operation == "ceil"                             ? "2"
+                            : operation == "trunc"                            ? "0"
+                            : operation == "rint" || operation == "nearbyint" ? "4"
+                                                                              : "3";
+                return converted("(" + argument + ").integral(" + mode + ")", ctx.LongDoubleTy,
+                                 c->getType());
+            }
+            if (operation == "ldexp" || operation == "scalbn")
+                return "(" + argument + ").scaleB(" + value(c->getArg(1), ctx.IntTy) + ")";
+            if (operation == "frexp")
+                return "Jpp.longDoubleFrexp(" + argument + ", " + expr(c->getArg(1)) + ")";
+            if (operation == "copysign")
+                return "(" + argument + ").copySign(" + value(c->getArg(1), ctx.LongDoubleTy) + ")";
+            fail(c, "this long double library operation needs additional lowering: " + n);
+        }
         if (n == "log2" || n == "round" || n == "roundf" || n == "lround" || n == "llround" ||
             n == "rint" || n == "nearbyint" || n == "trunc") {
             std::string result;
@@ -4938,13 +5043,13 @@ class Emitter {
                     expr(a->getImplicitObjectArgument()) == expr(b->getImplicitObjectArgument())) {
                     auto v = expr(a->getImplicitObjectArgument());
                     if (n == "reverse")
-                        return "Collections.reverse(" + v + ")";
+                        return "Jpp.reverseList(" + v + ")";
                     auto item = iteratorElement(c->getArg(0)->getType());
                     auto predicate = c->getNumArgs() > 2
                                          ? comparatorPredicate(c->getArg(2)->getType(), item, item,
                                                                expr(c->getArg(2)))
                                          : comparisonPredicate(item, item);
-                    return v + ".sort(Jpp.comparator(" + predicate + "))";
+                    return "Jpp.sortList(" + v + ", Jpp.comparator(" + predicate + "))";
                 }
             }
             std::vector<std::string> args;
@@ -5076,6 +5181,8 @@ class Emitter {
             return integerLiteral(x->getValue(), x->getType());
         }
         if (auto x = dyn_cast<FloatingLiteral>(e)) {
+            if (longDouble(x->getType()))
+                return extendedConstant(x->getValue());
             llvm::SmallString<40> b;
             x->getValue().toString(b);
             std::string v = b.str().str();
@@ -5324,6 +5431,9 @@ class Emitter {
                 return address(a);
             if (x->isIncrementDecrementOp()) {
                 int delta = x->isIncrementOp() ? 1 : -1;
+                if (longDouble(a->getType()))
+                    return "Jpp.updateLongDouble(" + reference(a) + ", " + std::to_string(delta) +
+                           ", " + (x->isPostfix() ? "true" : "false") + ")";
                 if (referenceMember(a))
                     return "Jpp.update(" + reference(a) + ", " + std::to_string(delta) + ", " +
                            (x->isPostfix() ? "true" : "false") + ")";
@@ -5378,6 +5488,8 @@ class Emitter {
                 if (x->getOpcode() == UO_Not)
                     return s + ".not()";
             }
+            if (longDouble(a->getType()) && x->getOpcode() == UO_Minus)
+                return "(" + s + ").negate()";
             if (x->getOpcode() == UO_Deref)
                 fail(e, "raw pointer dereference is not supported");
             return "(" + UnaryOperator::getOpcodeStr(x->getOpcode()).str() + "(" + s + "))";
@@ -7068,8 +7180,9 @@ class Emitter {
         if (destructor && !destructor->hasBody())
             fail(destructor->getLocation(), "the destructor definition is needed for translation");
         line("static class " + n + (byteRecords.count(r) ? " extends JppRecord" : "") +
-             " implements JppAssignable<" + n + ">" + (destructor ? ", AutoCloseable" : "") +
-             (less ? ", Comparable<" + n + ">" : ""));
+             " implements JppAssignable<" + n + ">" +
+             (r->isTriviallyCopyable() && !r->isUnion() ? ", JppTrivialValue" : "") +
+             (destructor ? ", AutoCloseable" : "") + (less ? ", Comparable<" + n + ">" : ""));
         line("{");
         ++indent;
         if (byteRecords.count(r)) {
@@ -7381,6 +7494,9 @@ class Emitter {
         for (const auto& [bytes, name] : literalArrays)
             layouts += "static final char[] " + name + " = Jpp.charArray(" + quote(bytes, true) +
                        ", " + std::to_string(bytes.size() + 1) + ");\n";
+        for (const auto& [value, name] : extendedConstants)
+            layouts += "static final JppLongDouble " + name + " = JppLongDouble.parse(" +
+                       quote(value) + ");\n";
         program.insert(startupAt, layouts + pointerFields);
         std::string startup;
         auto support = supportFor(program, startup);

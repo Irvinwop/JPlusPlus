@@ -8,6 +8,328 @@ interface JppAssignable<T> extends JppCopyable<T> {
 }
 interface JppUninitialized {}
 interface JppMove {}
+interface JppTrivialValue {}
+
+// x87 values are immutable scalars. BigInteger supplies exact intermediates;
+// every arithmetic operation rounds once to the target's 64-bit significand.
+static class JppLongDouble implements Comparable<JppLongDouble> {
+    static final int MIN_POWER = -16445;
+    static final JppLongDouble ZERO = new JppLongDouble(false, BigInteger.ZERO, 0, 0);
+    static final JppLongDouble ONE = integer(BigInteger.ONE);
+    static final JppLongDouble TWO = integer(BigInteger.valueOf(2));
+    static final JppLongDouble MAX = new JppLongDouble(
+        false, BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE), 16320, 0);
+    final boolean negative;
+    final BigInteger significand;
+    final int power;
+    final int special; // 0 finite, 1 infinity, 2 quiet NaN
+    JppLongDouble(boolean negative, BigInteger significand, int power, int special) {
+        this.negative = negative;
+        this.significand = significand;
+        this.power = power;
+        this.special = special;
+    }
+    static JppLongDouble zero(boolean negative) {
+        return negative ? new JppLongDouble(true, BigInteger.ZERO, 0, 0) : ZERO;
+    }
+    static JppLongDouble infinity(boolean negative) {
+        return new JppLongDouble(negative, BigInteger.ZERO, 0, 1);
+    }
+    static JppLongDouble nan(boolean negative) {
+        return new JppLongDouble(negative, BigInteger.ZERO, 0, 2);
+    }
+    static BigInteger roundedQuotient(BigInteger numerator, BigInteger denominator) {
+        BigInteger[] parts = numerator.divideAndRemainder(denominator);
+        int half = parts[1].shiftLeft(1).compareTo(denominator);
+        return half > 0 || (half == 0 && parts[0].testBit(0))
+            ? parts[0].add(BigInteger.ONE) : parts[0];
+    }
+    static JppLongDouble rounded(BigInteger numerator, BigInteger denominator, long power,
+                                 boolean negative) {
+        if (numerator.signum() == 0)
+            return zero(negative);
+        int difference = numerator.bitLength() - denominator.bitLength();
+        long top = power + difference;
+        int comparison = difference >= 0
+            ? numerator.compareTo(denominator.shiftLeft(difference))
+            : numerator.shiftLeft(-difference).compareTo(denominator);
+        if (comparison < 0)
+            --top;
+        if (top > 16383)
+            return infinity(negative);
+        if (top < MIN_POWER - 1)
+            return zero(negative);
+        int quantum = (int)Math.max(top - 63, MIN_POWER);
+        long shift = power - quantum;
+        BigInteger rounded = shift >= 0
+            ? roundedQuotient(numerator.shiftLeft(Math.toIntExact(shift)), denominator)
+            : roundedQuotient(numerator, denominator.shiftLeft(Math.toIntExact(-shift)));
+        if (rounded.signum() == 0)
+            return zero(negative);
+        if (rounded.bitLength() > 64) {
+            rounded = rounded.shiftRight(1);
+            ++quantum;
+        }
+        if ((long)quantum + rounded.bitLength() - 1 > 16383)
+            return infinity(negative);
+        return new JppLongDouble(negative, rounded, quantum, 0);
+    }
+    static JppLongDouble integer(BigInteger value) {
+        return rounded(value.abs(), BigInteger.ONE, 0, value.signum() < 0);
+    }
+    static JppLongDouble integer(long value) {
+        return integer(BigInteger.valueOf(value));
+    }
+    static JppLongDouble floating(double value) {
+        long bits = Double.doubleToRawLongBits(value);
+        boolean negative = bits < 0;
+        int exponent = (int)((bits >>> 52) & 2047);
+        long fraction = bits & 0xfffffffffffffL;
+        if (exponent == 2047)
+            return fraction == 0 ? infinity(negative) : nan(negative);
+        if (exponent != 0)
+            fraction |= 1L << 52;
+        return rounded(BigInteger.valueOf(fraction), BigInteger.ONE,
+                       exponent == 0 ? -1074 : exponent - 1075, negative);
+    }
+    static long exponent(String text) {
+        try {
+            return Long.parseLong(text);
+        } catch (NumberFormatException error) {
+            if (!text.matches("[+-]?[0-9]+"))
+                throw error;
+            return text.startsWith("-") ? Long.MIN_VALUE : Long.MAX_VALUE;
+        }
+    }
+    static JppLongDouble parse(String source) {
+        String text = source.toLowerCase(Locale.ROOT);
+        boolean negative = text.startsWith("-");
+        if (text.startsWith("-") || text.startsWith("+"))
+            text = text.substring(1);
+        if (text.equals("inf") || text.equals("infinity"))
+            return infinity(negative);
+        if (text.equals("nan"))
+            return nan(negative);
+        if (text.matches("0x(?:[0-9a-f]+(?:\\.[0-9a-f]*)?|\\.[0-9a-f]+)[p][+-]?[0-9]+")) {
+            int marker = text.indexOf('p'), point = text.indexOf('.');
+            String digits = text.substring(2, marker).replace(".", "");
+            long scale = exponent(text.substring(marker + 1));
+            scale = Math.max(-1000000000L, Math.min(1000000000L, scale));
+            if (point >= 0)
+                scale -= 4L * (marker - point - 1);
+            return rounded(new BigInteger(digits, 16), BigInteger.ONE, scale, negative);
+        }
+        if (!text.matches("(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:e[+-]?[0-9]+)?"))
+            throw new NumberFormatException(source);
+        int marker = text.indexOf('e');
+        String mantissa = marker >= 0 ? text.substring(0, marker) : text;
+        String digits = mantissa.replace(".", "");
+        int first = 0;
+        while (first < digits.length() && digits.charAt(first) == '0')
+            ++first;
+        if (first == digits.length())
+            return zero(negative);
+        long exponent = marker >= 0 ? exponent(text.substring(marker + 1)) : 0;
+        // No Java string has enough digits to cancel an exponent this large.
+        if (exponent > 10000000000L || exponent < -10000000000L)
+            return exponent > 0 ? infinity(negative) : zero(negative);
+        int point = mantissa.indexOf('.');
+        long leading = digits.length() - first - 1L + exponent -
+            (point >= 0 ? mantissa.length() - point - 1L : 0);
+        if (leading > 5000)
+            return infinity(negative);
+        if (leading < -5000)
+            return zero(negative);
+        BigDecimal decimal = new BigDecimal(text);
+        BigInteger numerator = decimal.unscaledValue();
+        if (numerator.signum() == 0)
+            return zero(negative);
+        long magnitude = (long)decimal.precision() - decimal.scale();
+        if (magnitude > 5000)
+            return infinity(negative);
+        if (magnitude < -5000)
+            return zero(negative);
+        int scale = decimal.scale();
+        return scale >= 0
+            ? rounded(numerator, BigInteger.TEN.pow(scale), 0, negative)
+            : rounded(numerator.multiply(BigInteger.TEN.pow(-scale)), BigInteger.ONE, 0, negative);
+    }
+    boolean isZero() {
+        return special == 0 && significand.signum() == 0;
+    }
+    boolean isNormal() {
+        return special == 0 && significand.bitLength() == 64;
+    }
+    JppLongDouble negate() {
+        return new JppLongDouble(!negative, significand, power, special);
+    }
+    JppLongDouble abs() {
+        return negative ? negate() : this;
+    }
+    JppLongDouble copySign(JppLongDouble other) {
+        return negative == other.negative ? this : negate();
+    }
+    JppLongDouble add(JppLongDouble other) {
+        if (special == 2 || other.special == 2)
+            return special == 2 ? this : other;
+        if (special == 1 || other.special == 1) {
+            if (special == 1 && other.special == 1 && negative != other.negative)
+                return nan(true);
+            return special == 1 ? this : other;
+        }
+        int common = Math.min(power, other.power);
+        BigInteger left = significand.shiftLeft(power - common);
+        BigInteger right = other.significand.shiftLeft(other.power - common);
+        BigInteger sum = (negative ? left.negate() : left).add(
+            other.negative ? right.negate() : right);
+        return rounded(sum.abs(), BigInteger.ONE, common,
+                       sum.signum() < 0 || (sum.signum() == 0 && negative && other.negative));
+    }
+    JppLongDouble subtract(JppLongDouble other) {
+        return other.special == 2 ? other : add(other.negate());
+    }
+    JppLongDouble multiply(JppLongDouble other) {
+        if (special == 2 || other.special == 2)
+            return special == 2 ? this : other;
+        if (special == 1 || other.special == 1)
+            return isZero() || other.isZero() ? nan(true) : infinity(negative != other.negative);
+        return rounded(significand.multiply(other.significand), BigInteger.ONE,
+                       (long)power + other.power, negative != other.negative);
+    }
+    JppLongDouble divide(JppLongDouble other) {
+        if (special == 2 || other.special == 2)
+            return special == 2 ? this : other;
+        if ((special == 1 && other.special == 1) || (isZero() && other.isZero()))
+            return nan(true);
+        if (special == 1 || other.isZero())
+            return infinity(negative != other.negative);
+        if (other.special == 1)
+            return zero(negative != other.negative);
+        return rounded(significand, other.significand, (long)power - other.power,
+                       negative != other.negative);
+    }
+    JppLongDouble scaleB(int exponent) {
+        return special != 0 ? this
+            : rounded(significand, BigInteger.ONE, (long)power + exponent, negative);
+    }
+    // Modes: truncate, floor, ceiling, halfway away from zero, ties to even.
+    JppLongDouble integral(int mode) {
+        if (special != 0 || power >= 0 || isZero())
+            return this;
+        BigInteger whole = significand.shiftRight(-power);
+        BigInteger fraction = significand.subtract(whole.shiftLeft(-power));
+        if (fraction.signum() != 0) {
+            int half = fraction.shiftLeft(1).compareTo(BigInteger.ONE.shiftLeft(-power));
+            if ((mode == 1 && negative) || (mode == 2 && !negative) ||
+                (mode >= 3 && (half > 0 || (half == 0 && (mode == 3 || whole.testBit(0))))))
+                whole = whole.add(BigInteger.ONE);
+        }
+        return rounded(whole, BigInteger.ONE, 0, negative);
+    }
+    BigInteger integerValue() {
+        if (special != 0)
+            throw new ArithmeticException("nonfinite long double to integer conversion");
+        BigInteger value = power >= 0 ? significand.shiftLeft(power)
+                                     : significand.shiftRight(-power);
+        return negative ? value.negate() : value;
+    }
+    static BigInteger integerSqrt(BigInteger value) {
+        if (value.signum() == 0)
+            return value;
+        BigInteger result = BigInteger.ONE.shiftLeft((value.bitLength() + 1) / 2);
+        while (true) {
+            BigInteger next = result.add(value.divide(result)).shiftRight(1);
+            if (next.compareTo(result) >= 0)
+                return result;
+            result = next;
+        }
+    }
+    JppLongDouble sqrt() {
+        if (special == 2 || isZero())
+            return this;
+        if (negative)
+            return nan(true);
+        if (special == 1)
+            return this;
+        int top = power + significand.bitLength() - 1;
+        int quantum = Math.floorDiv(top, 2) - 63;
+        int shift = power - 2 * quantum;
+        BigInteger numerator = shift >= 0 ? significand.shiftLeft(shift) : significand;
+        BigInteger denominator = shift >= 0 ? BigInteger.ONE : BigInteger.ONE.shiftLeft(-shift);
+        BigInteger root = integerSqrt(numerator.divide(denominator));
+        BigInteger midpoint = root.shiftLeft(1).add(BigInteger.ONE);
+        int comparison = numerator.shiftLeft(2).compareTo(
+            midpoint.multiply(midpoint).multiply(denominator));
+        if (comparison > 0 || (comparison == 0 && root.testBit(0)))
+            root = root.add(BigInteger.ONE);
+        return rounded(root, BigInteger.ONE, quantum, false);
+    }
+    int magnitudeCompare(JppLongDouble other) {
+        if (isZero() || other.isZero())
+            return Integer.compare(significand.signum(), other.significand.signum());
+        int top = power + significand.bitLength(), otherTop = other.power + other.significand.bitLength();
+        if (top != otherTop)
+            return Integer.compare(top, otherTop);
+        int common = Math.min(power, other.power);
+        return significand.shiftLeft(power - common).compareTo(
+            other.significand.shiftLeft(other.power - common));
+    }
+    public int compareTo(JppLongDouble other) {
+        if (special == 2 || other.special == 2 || (isZero() && other.isZero()))
+            return 0;
+        if (negative != other.negative)
+            return negative ? -1 : 1;
+        int order = special == 1 || other.special == 1
+            ? Integer.compare(special, other.special) : magnitudeCompare(other);
+        return negative ? -order : order;
+    }
+    boolean test(JppLongDouble other, String operation) {
+        if (special == 2 || other.special == 2)
+            return operation.equals("!=");
+        int order = compareTo(other);
+        switch (operation) {
+        case "==": return order == 0;
+        case "!=": return order != 0;
+        case "<": return order < 0;
+        case "<=": return order <= 0;
+        case ">": return order > 0;
+        case ">=": return order >= 0;
+        default: throw new IllegalArgumentException(operation);
+        }
+    }
+    long floatingBits(int precision, int minimum, int maximum, int bias, int fractionBits) {
+        long sign = negative ? 1L << (fractionBits + (precision == 53 ? 11 : 8)) : 0;
+        long infinity = ((1L << (precision == 53 ? 11 : 8)) - 1) << fractionBits;
+        if (special != 0)
+            return sign | infinity | (special == 2 ? 1L << (fractionBits - 1) : 0);
+        if (isZero())
+            return sign;
+        int top = power + significand.bitLength() - 1;
+        int quantum = Math.max(top - precision + 1, minimum - precision + 1);
+        int shift = power - quantum;
+        BigInteger value = shift >= 0 ? significand.shiftLeft(shift)
+            : roundedQuotient(significand, BigInteger.ONE.shiftLeft(-shift));
+        if (value.signum() == 0)
+            return sign;
+        if (value.bitLength() > precision) {
+            value = value.shiftRight(1);
+            ++quantum;
+        }
+        top = quantum + value.bitLength() - 1;
+        if (top > maximum)
+            return sign | infinity;
+        if (top < minimum)
+            return sign | value.longValue();
+        return sign | ((long)(top + bias) << fractionBits) |
+            (value.longValue() & ((1L << fractionBits) - 1));
+    }
+    double doubleValue() {
+        return Double.longBitsToDouble(floatingBits(53, -1022, 1023, 1023, 52));
+    }
+    float floatValue() {
+        return Float.intBitsToFloat((int)floatingBits(24, -126, 127, 127, 23));
+    }
+}
 
 static class JppJumpTarget {
     boolean active = true;
@@ -5123,6 +5445,35 @@ static class Jpp {
         buffer.get().target = target;
         return target;
     }
+    static JppLongDouble readLongDouble(JppInput source, JppLongDouble previous) {
+        String token = source.floatingToken();
+        if (token == null)
+            return previous;
+        try {
+            JppLongDouble value = JppLongDouble.parse(token);
+            if (value.special == 1) {
+                source.good = false;
+                return JppLongDouble.MAX.copySign(value);
+            }
+            return value;
+        } catch (NumberFormatException error) {
+            source.good = false;
+            return JppLongDouble.ZERO;
+        }
+    }
+    static JppLongDouble longDoubleFrexp(JppLongDouble value, JppPtr<Integer> exponent) {
+        int power = value.special != 0 || value.isZero() ? 0
+            : value.power + value.significand.bitLength();
+        exponent.put(power);
+        return value.scaleB(-power);
+    }
+    static JppLongDouble updateLongDouble(JppRef<JppLongDouble> target, int amount, boolean post) {
+        JppLongDouble previous = target.get();
+        JppLongDouble value = amount > 0 ? previous.add(JppLongDouble.ONE)
+                                       : previous.subtract(JppLongDouble.ONE);
+        target.set(value);
+        return post ? previous : value;
+    }
     static void longJump(JppPtr<JppJumpBuffer> buffer, int value) {
         JppJumpTarget target = buffer.get().target;
         if (target == null || !target.active)
@@ -5233,22 +5584,45 @@ static class Jpp {
     static JppIter<Boolean> end(boolean[] a) {
         return begin(a).plus(a.length);
     }
+    static <T> void sortList(List<T> values, Comparator<? super T> comparison) {
+        if (!values.isEmpty() && values.get(0) instanceof JppTrivialValue)
+            sort(begin(values), end(values), (a, b) -> comparison.compare(a, b) < 0);
+        else
+            values.sort(comparison);
+    }
+    static <T> void reverseList(List<T> values) {
+        if (!values.isEmpty() && values.get(0) instanceof JppTrivialValue)
+            reverse(begin(values), end(values));
+        else
+            Collections.reverse(values);
+    }
     static <T> void sort(JppIter<T> first, JppIter<T> last) {
         sort(first, last, (a, b) -> compare(a, b) < 0);
     }
     static <T> void sort(JppIter<T> first, JppIter<T> last,
                          java.util.function.BiPredicate<? super T, ? super T> less) {
         ArrayList<T> values = new ArrayList<T>();
-        for (int i = first.index(); i != last.index(); i += first.step)
-            values.add(first.list.get(i));
+        for (int i = first.index(); i != last.index(); i += first.step) {
+            T value = first.list.get(i);
+            values.add(value instanceof JppTrivialValue ? jppCopy(value) : value);
+        }
         values.sort((a, b) -> less.test(a, b) ? -1 : less.test(b, a) ? 1 : 0);
-        for (int i = 0, p = first.index(); i < values.size(); ++i, p += first.step)
-            first.list.set(p, values.get(i));
+        for (int i = 0, p = first.index(); i < values.size(); ++i, p += first.step) {
+            T previous = first.list.get(p), value = values.get(i);
+            first.list.set(p, previous instanceof JppTrivialValue ? assignValue(previous, value) : value);
+        }
     }
     static <T> void reverse(JppIter<T> first, JppIter<T> last) {
         for (int l = first.index(), r = last.index() - first.step; (r - l) * first.step > 0;
-             l += first.step, r -= first.step)
-            Collections.swap(first.list, l, r);
+             l += first.step, r -= first.step) {
+            T left = first.list.get(l), right = first.list.get(r);
+            if (left instanceof JppTrivialValue) {
+                T saved = jppCopy(left);
+                first.list.set(l, assignValue(left, right));
+                first.list.set(r, assignValue(right, saved));
+            } else
+                Collections.swap(first.list, l, r);
+        }
     }
     static <T> void fill(JppIter<T> first, JppIter<T> last, T value) {
         for (int i = first.index(); i != last.index(); i += first.step)

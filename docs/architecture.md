@@ -75,6 +75,10 @@ Java's integer switch accepts only narrow integer conditions. Wider switches use
 
 Unsigned 32/64-bit ordering, division, remainder, and right shifts use Java's unsigned operations. `__int128` arithmetic uses `BigInteger`; it is slower than native arithmetic and currently targets defined signed calculations, not an emulation of every overflow behavior.
 
+x87 `long double` values use an immutable scalar helper with a sign, an integer significand and a binary exponent. `BigInteger` provides exact intermediates before each arithmetic result rounds to the target's 64-bit significand and exponent range. This preserves precision that Java `double` cannot represent. Source variables and functions remain ordinary Java declarations; the helper is included only when used. Text output, byte representations and the floating environment still need additional lowering.
+
+Sorting trivially copyable user records takes independent value snapshots before writing into the original slots. Assigning those values into the existing objects preserves retained record and field references, including records backed by byte views. Reverse uses the same assignment rule for each pair. Collections with ordinary scalar elements keep Java's standard sorting and reversal paths.
+
 Library comparisons also need the original C++ types. Generated predicates retain signedness and integer promotion rules for sorting, ordered containers, extrema, and heterogeneous bounds searches. Pair and vector predicates compare their elements recursively. User comparators are bound once when constructing the Java comparator, so their constructors do not run for each comparison.
 
 Callable adapters bridge compatible C++ signatures when their Java interfaces differ. They convert parameters and results explicitly, including conversion to boolean and discarding a result for a void callback. This keeps the callable body in an ordinary translated method or lambda.

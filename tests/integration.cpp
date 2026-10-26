@@ -161,6 +161,20 @@ int main() {
         cases.emplace_back("pbds", policyOperations.str());
         cases.emplace_back("checkpoints", "31\n");
         cases.emplace_back("checkpoint_values", "31\n");
+        cases.emplace_back("record_algorithms", "");
+        std::ostringstream extendedInputs;
+        extendedInputs << 80 << '\n';
+        for (int i = 0; i < 80; ++i) {
+            int exponent = static_cast<int>(random() % 32701) - 16400;
+            extendedInputs << static_cast<long long>(random()) << ' '
+                           << static_cast<long long>(random()) << ' '
+                           << (i % 4 == 0 ? r(101) - 50 : exponent) << ' '
+                           << (i % 4 == 1 ? exponent : static_cast<int>(random() % 32701) - 16400)
+                           << '\n';
+        }
+        extendedInputs << "1.0000000000000000001\n-0\n1e-4950\n1e-4951\n-1e-4951\n1e4932\n12."
+                          "5x\n9\n1e99999\n3\n";
+        cases.emplace_back("long_double", extendedInputs.str());
         cases.emplace_back("cpp23", "-9\n");
         std::ostringstream bits;
         bits << 70 << '\n';
