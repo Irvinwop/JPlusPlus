@@ -10,6 +10,7 @@
 #include <clang/AST/ParentMapContext.h>
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/StmtCXX.h>
+#include <clang/Analysis/CFG.h>
 #include <clang/Basic/TargetInfo.h>
 #include <clang/Format/Format.h>
 #include <clang/Frontend/CompilerInstance.h>
@@ -21,6 +22,7 @@
 #include <clang/Sema/Sema.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
+#include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -28,6 +30,7 @@
 #include <cctype>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -6286,6 +6289,7 @@ class Emitter {
             bodyStatements(b);
         else
             stmt(f->getBody());
+        finishNonvoid(f);
         if (terminateBoundary(f))
             endTerminateBoundary();
         --indent;
@@ -6630,8 +6634,15 @@ class Emitter {
                     return false;
             return true;
         }
-        if (auto i = dyn_cast<IfStmt>(s))
+        if (auto i = dyn_cast<IfStmt>(s)) {
+            if (i->isConstexpr())
+                return terminates(i->getCond()->EvaluateKnownConstInt(ctx).getBoolValue()
+                                      ? i->getThen()
+                                      : i->getElse());
+            if (i->isConsteval())
+                return terminates(i->isNegatedConsteval() ? i->getThen() : i->getElse());
             return i->getElse() && terminates(i->getThen()) && terminates(i->getElse());
+        }
         if (auto loop = dyn_cast<ForStmt>(s)) {
             bool condition = true;
             return (!loop->getCond() ||
@@ -6649,6 +6660,161 @@ class Emitter {
                    !escapesLoop(loop->getBody());
         }
         return false;
+    }
+    using StatementParents = std::unordered_map<const Stmt*, const Stmt*>;
+    struct RuntimeCFGBody {
+        Stmt* body;
+        ASTContext& context;
+        StatementParents parents;
+        std::vector<std::pair<Stmt**, Stmt*>> replacements;
+        RuntimeCFGBody(Stmt* source, ASTContext& ctx) : body(source), context(ctx) {
+            prepare(body, nullptr);
+        }
+        ~RuntimeCFGBody() {
+            for (auto replacement = replacements.rbegin(); replacement != replacements.rend();
+                 ++replacement)
+                *replacement->first = replacement->second;
+        }
+        void prepare(Stmt*& statement, const Stmt* parent) {
+            if (!statement)
+                return;
+            if (auto branch = dyn_cast<IfStmt>(statement); branch && branch->isConsteval()) {
+                // Clang 18's CFG builder visits the nonexistent condition of
+                // if consteval. Analyze its emitted runtime branch instead,
+                // restoring every AST slot before leaving this analysis.
+                replacements.emplace_back(&statement, statement);
+                statement = branch->isNegatedConsteval() ? branch->getThen() : branch->getElse();
+                if (!statement)
+                    statement = new (context) NullStmt(branch->getIfLoc());
+            }
+            auto [entry, inserted] = parents.emplace(statement, parent);
+            if (!inserted && entry->second != parent)
+                entry->second = nullptr;
+            if (isa<LambdaExpr>(statement))
+                return;
+            for (auto child = statement->child_begin(); child != statement->child_end(); ++child)
+                prepare(*child, statement);
+        }
+    };
+    std::optional<bool> javaConstantBranch(const CFGBlock& block, const StatementParents& parents) {
+        auto control = block.getTerminatorStmt();
+        if (!control)
+            return {};
+        if (isa<Expr>(control)) {
+            // Short-circuit operands have their own CFG blocks. Follow their
+            // expression parents to identify the enclosing condition.
+            while (isa<Expr>(control)) {
+                auto entry = parents.find(control);
+                if (entry == parents.end() || !entry->second)
+                    return {};
+                auto parent = entry->second;
+                if (isa<Expr>(parent)) {
+                    control = parent;
+                    continue;
+                }
+                const Expr* condition = nullptr;
+                if (auto branch = dyn_cast<IfStmt>(parent))
+                    condition = branch->getCond();
+                else if (auto loop = dyn_cast<WhileStmt>(parent))
+                    condition = loop->getCond();
+                else if (auto loop = dyn_cast<ForStmt>(parent))
+                    condition = loop->getCond();
+                else if (auto loop = dyn_cast<DoStmt>(parent))
+                    condition = loop->getCond();
+                if (condition != control)
+                    return {};
+                control = parent;
+            }
+        }
+        if (auto branch = dyn_cast<IfStmt>(control)) {
+            if (branch->isConsteval())
+                return branch->isNegatedConsteval();
+            if (!branch->isConstexpr())
+                return {};
+        } else {
+            const Expr* condition = nullptr;
+            if (auto loop = dyn_cast<WhileStmt>(control))
+                condition = loop->getCond();
+            else if (auto loop = dyn_cast<ForStmt>(control)) {
+                condition = loop->getCond();
+                if (!condition)
+                    return true;
+            } else if (auto loop = dyn_cast<DoStmt>(control))
+                condition = loop->getCond();
+            else
+                return {};
+            bool value;
+            if (!foldedCondition(condition, value) || !value)
+                return {};
+        }
+        auto condition = dyn_cast_or_null<Expr>(block.getTerminatorCondition());
+        bool value;
+        return condition && condition->EvaluateAsBooleanCondition(value, ctx)
+                   ? std::optional<bool>(value)
+                   : std::nullopt;
+    }
+    bool javaFunctionCanComplete(const FunctionDecl* function) {
+        CFG::BuildOptions options;
+        // Java keeps both ordinary if branches reachable, including if (true).
+        // Prune only branches omitted by emission or constant-true loop exits.
+        options.PruneTriviallyFalseEdges = false;
+        options.AddEHEdges = true;
+        options.AddImplicitDtors = true;
+        options.AddTemporaryDtors = true;
+        RuntimeCFGBody runtimeBody(function->getBody(), ctx);
+        auto graph = CFG::buildCFG(function, runtimeBody.body, &ctx, options);
+        if (!graph)
+            fail(function->getLocation(), "cannot determine non-void function fallthrough");
+        llvm::BitVector live(graph->getNumBlockIDs());
+        llvm::BitVector exitEdges(graph->getNumBlockIDs());
+        std::vector<const CFGBlock*> pending{&graph->getEntry()};
+        live.set(graph->getEntry().getBlockID());
+        while (!pending.empty()) {
+            auto block = pending.back();
+            pending.pop_back();
+            auto selected = javaConstantBranch(*block, runtimeBody.parents);
+            unsigned index = 0;
+            for (auto edge : block->succs()) {
+                bool omitted =
+                    selected && block->succ_size() == 2 && index != (*selected ? 0U : 1U);
+                ++index;
+                auto next = edge.getReachableBlock();
+                if (omitted || !next)
+                    continue;
+                if (next == &graph->getExit())
+                    exitEdges.set(block->getBlockID());
+                if (live[next->getBlockID()])
+                    continue;
+                live.set(next->getBlockID());
+                pending.push_back(next);
+            }
+        }
+        for (auto edge : graph->getExit().preds()) {
+            auto block = edge.getReachableBlock();
+            // A live block can still have its edge to the exit pruned.
+            if (!block || !exitEdges[block->getBlockID()] || block->hasNoReturnElement())
+                continue;
+            const Stmt* last = nullptr;
+            for (auto element = block->rbegin(); element != block->rend(); ++element)
+                if (auto statement = element->getAs<CFGStmt>()) {
+                    last = statement->getStmt();
+                    break;
+                }
+            if (last && isa<ReturnStmt, CXXThrowExpr, CXXTryStmt>(last))
+                continue;
+            if (!last && isa_and_nonnull<CXXTryStmt>(block->getTerminatorStmt()))
+                continue;
+            return true;
+        }
+        return false;
+    }
+    void finishNonvoid(const FunctionDecl* function) {
+        if (!function->isMain() && !function->getReturnType()->isVoidType() &&
+            !terminates(function->getBody()) && javaFunctionCanComplete(function))
+            line("throw new IllegalStateException(" +
+                 quote("C++ non-void function fell through without returning: " +
+                       function->getQualifiedNameAsString()) +
+                 ");");
     }
     void requireCheckpointFlow(const Stmt* statement, unsigned loops = 0, unsigned breaks = 0) {
         if (!statement || isa<LambdaExpr>(statement))
@@ -7437,6 +7603,7 @@ class Emitter {
                 stmt(f->getBody());
             if (f->isMain() && !terminates(f->getBody()))
                 line("return 0;");
+            finishNonvoid(f);
             if (terminateBoundary(f))
                 endTerminateBoundary();
             --indent;

@@ -205,6 +205,13 @@ int main() {
         }
         cases.emplace_back("gmp_integers", gmpInputs.str());
         cases.emplace_back("field_format", "");
+        std::mt19937 returnRandom(0x66616c6c);
+        std::ostringstream returnInputs;
+        returnInputs << 300 << '\n';
+        for (int i = 0; i < 300; ++i)
+            returnInputs << 1 + returnRandom() % 100000 << '\n';
+        cases.emplace_back("nonvoid_returns", returnInputs.str());
+        cases.emplace_back("return_reachability", returnInputs.str());
         cases.emplace_back("cpp23", "-9\n");
         std::ostringstream bits;
         bits << 70 << '\n';

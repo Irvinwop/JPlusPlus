@@ -7,7 +7,7 @@ J++ is an experimental source transpiler for competitive programming. **It does 
 | Area | Implemented paths |
 | :-- | :-- |
 | Frontend | GNU++23, preprocessing, local includes, `bits/stdc++.h`, aliases, resolved overloads, concrete function template instantiations |
-| Control flow | Functions, recursion, blocks, `if`, `if constexpr`, runtime branches of `if consteval`, loops, integer switches including 64/128-bit conditions and GNU case ranges, break, continue, return, forward goto exits to enclosing blocks |
+| Control flow | Functions, recursion, blocks, `if`, `if constexpr`, runtime branches of `if consteval`, loops, integer switches including 64/128-bit conditions and GNU case ranges, break, continue, return, forward goto exits to enclosing blocks; selected Java reachability handling for constant conditions and non-void function completion |
 | Expressions | Chained assignments, boolean arithmetic and numeric conversions, arithmetic compound assignments, void comma/conditional expressions, discarded values in statements and loop updates, GNU omitted-middle conditionals and statement expressions with local control flow; RHS-before-destination sequencing and one destination evaluation for supported lvalues |
 | Types | Boolean, character, signed integer and floating primitives; common unsigned 32/64-bit operations, widening and floating conversions; enums; signed `__int128` arithmetic via `BigInteger`; typed pointers into supported arrays, objects, and reference cells |
 | Arrays | Fixed bounds, GNU variable length arrays with captured dimensions and nested `sizeof`, multidimensional primitive arrays, partial initialization, string-initialized character arrays; primitive array references and value copies; `std::array` via `ArrayList`, including nested/partial/empty aggregate initialization, fill, memberwise moves and assignment retaining inline element aliases; nested built-in array elements and zero-length arrays of immovable elements |
@@ -67,6 +67,8 @@ Implemented paths have limits. A container appearing in this table does not impl
 - Exact unsigned `__int128` wraparound and all edge cases of C++ integer promotion and conversion rules.
 
 Java's stack depth, boxing and collection memory overhead, and `BigInteger` costs differ from native C++. Passing a differential test is evidence for that tested behavior, not a full conformance claim or a time-limit guarantee.
+
+Reaching the end of an ordinary non-void C++ function without returning a value has undefined behavior, apart from `main`'s implicit zero return. Translated functions retain their returning paths and raise `IllegalStateException` on supported fallthrough paths. This guard can also satisfy Java's conservative return analysis for a C++ path that cannot execute.
 
 ## Diagnostics
 
