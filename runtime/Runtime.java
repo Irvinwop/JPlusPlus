@@ -145,6 +145,36 @@ static class JppGmpInteger {
     }
 }
 
+// The default GNU libc rand/random stream has 31 words of shared state.
+static class JppGlibcRandom {
+    static final int[] words = new int[31];
+    static int front, rear;
+    static { seed(1); }
+    static synchronized void seed(int bits) {
+        long value = bits == 0 ? 1 : bits;
+        words[0] = (int)value;
+        for (int i = 1; i < words.length; ++i) {
+            value = value * 16807 % 2147483647;
+            if (value < 0)
+                value += 2147483647;
+            words[i] = (int)value;
+        }
+        front = 3;
+        rear = 0;
+        for (int i = 0; i < words.length * 10; ++i)
+            next();
+    }
+    static synchronized int next() {
+        int value = words[front] + words[rear];
+        words[front] = value;
+        if (++front == words.length)
+            front = 0;
+        if (++rear == words.length)
+            rear = 0;
+        return value >>> 1;
+    }
+}
+
 // C++ handlers catch only translated C++ exceptions. Nonlocal jumps and JVM
 // failures keep their own control paths.
 static class JppException extends RuntimeException {

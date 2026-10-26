@@ -212,6 +212,28 @@ int main() {
             returnInputs << 1 + returnRandom() % 100000 << '\n';
         cases.emplace_back("nonvoid_returns", returnInputs.str());
         cases.emplace_back("return_reachability", returnInputs.str());
+#ifdef __GLIBC__
+        std::mt19937_64 cRandom(0x72616e646f6d);
+        std::vector<unsigned long long> cSeeds = {0,
+                                                  1,
+                                                  2,
+                                                  3,
+                                                  2147483646ULL,
+                                                  2147483647ULL,
+                                                  2147483648ULL,
+                                                  2147483649ULL,
+                                                  4294967295ULL,
+                                                  4294967296ULL,
+                                                  4294967297ULL,
+                                                  ULLONG_MAX};
+        std::ostringstream cRandomInputs;
+        cRandomInputs << 300 << '\n';
+        for (int i = 0; i < 300; ++i)
+            cRandomInputs << (i < cSeeds.size() ? cSeeds[i] : cRandom()) << ' '
+                          << (i < cSeeds.size() ? 1001 : cRandom() % 100) << '\n';
+        cases.emplace_back("gnu_random", cRandomInputs.str());
+        cases.emplace_back("gnu_random_threads", "");
+#endif
         cases.emplace_back("cpp23", "-9\n");
         std::ostringstream bits;
         bits << 70 << '\n';
@@ -387,6 +409,8 @@ int main() {
                                         "ArrayList<Integer> values = new ArrayList<Integer>();"
                                         "while (n-- > 0) values.add(in.nextInt());"
                                         "System.out.println(Main.score(values)); }}\n");
+        write(p / "GnuRandomThreadDriver.java",
+              read(fs::path(JPP_SOURCE) / "tests/fixtures/GnuRandomThreadDriver.java"));
 
         auto javacs = configured("JPP_TEST_JAVACS", "javac");
         auto javas = configured("JPP_TEST_JAVAS", "java");
@@ -424,10 +448,18 @@ int main() {
             auto source = (fs::path(JPP_SOURCE) / "tests/fixtures" / (name + ".cpp")).string();
             write(p / "input", input);
             write(p / "jpp-redirect.in", input);
-            auto nativeSource =
-                name == "library"
-                    ? (fs::path(JPP_SOURCE) / "tests/fixtures/library_driver.cpp").string()
-                    : source;
+            auto nativeSource = source;
+            std::string javaDriver;
+            if (name == "library") {
+                nativeSource =
+                    (fs::path(JPP_SOURCE) / "tests/fixtures/library_driver.cpp").string();
+                javaDriver = "LibraryDriver";
+            } else if (name == "gnu_random_threads") {
+                nativeSource =
+                    (fs::path(JPP_SOURCE) / "tests/fixtures/gnu_random_threads_driver.cpp")
+                        .string();
+                javaDriver = "GnuRandomThreadDriver";
+            }
             // GCC binds a pointer-reference catch parameter to a temporary. Use
             // Clang's native object reference as the oracle for this standard rule.
             auto oracleCompiler = cxx;
@@ -439,6 +471,8 @@ int main() {
                 oracleCompiler, "-std=gnu++23", "-O2", nativeSource, "-o", (p / "native").string()};
             if (name == "gmp_integers")
                 nativeCompile.push_back("-lgmp");
+            if (name == "gnu_random_threads")
+                nativeCompile.push_back("-pthread");
             must(nativeCompile, p / "empty");
             std::vector<std::string> programArguments;
             if (name == "arguments")
@@ -508,8 +542,8 @@ int main() {
                     } else
                         compile.insert(compile.end(), {"--release", std::to_string(release)});
                     compile.push_back((p / "Main.java").string());
-                    if (name == "library")
-                        compile.push_back((p / "LibraryDriver.java").string());
+                    if (!javaDriver.empty())
+                        compile.push_back((p / (javaDriver + ".java")).string());
                     must(compile, p / "empty");
                     auto bytes = read(classes / "Main.class");
                     if (bytes.size() < 8 || static_cast<unsigned char>(bytes[7]) != release + 44)
@@ -523,9 +557,8 @@ int main() {
                         if (name == "allocation_release" || name == "scoped_allocations" ||
                             name == "record_release")
                             execute.push_back("-Xmx64m");
-                        execute.insert(execute.end(),
-                                       {"-cp", classes.string(),
-                                        name == "library" ? "LibraryDriver" : "Main"});
+                        execute.insert(execute.end(), {"-cp", classes.string(),
+                                                       javaDriver.empty() ? "Main" : javaDriver});
                         execute.insert(execute.end(), programArguments.begin(),
                                        programArguments.end());
                         for (const auto& oracle : oracles) {

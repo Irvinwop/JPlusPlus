@@ -4679,6 +4679,15 @@ class Emitter {
         if (n.starts_with("__gmpz_"))
             return gmpCall(c, n.substr(7));
         auto memoryOperation = n.starts_with("__builtin_") ? n.substr(10) : n;
+        if (memoryOperation == "rand" || memoryOperation == "random" ||
+            memoryOperation == "srand" || memoryOperation == "srandom") {
+            auto triple = ctx.getTargetInfo().getTriple();
+            if (!triple.isOSLinux() || !triple.isGNUEnvironment())
+                fail(c, "C random streams for this target library need additional lowering");
+            if (memoryOperation == "srand" || memoryOperation == "srandom")
+                return "JppGlibcRandom.seed(" + value(c->getArg(0), ctx.UnsignedIntTy) + ")";
+            return converted("JppGlibcRandom.next()", ctx.IntTy, c->getType());
+        }
         if (memoryOperation == "strlen")
             return converted("Jpp.strlen(" + expr(c->getArg(0)) + ")", ctx.UnsignedLongLongTy,
                              c->getType());
