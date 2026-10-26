@@ -7698,6 +7698,14 @@ class Emitter {
         for (auto d : dc->decls()) {
             if (!user(d))
                 continue;
+            if (auto exports = dyn_cast<ExportDecl>(d)) {
+                collect(exports);
+                continue;
+            }
+            if (auto linkage = dyn_cast<LinkageSpecDecl>(d)) {
+                collect(linkage);
+                continue;
+            }
             if (auto ns = dyn_cast<NamespaceDecl>(d)) {
                 collect(ns);
                 continue;

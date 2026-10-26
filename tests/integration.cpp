@@ -307,6 +307,8 @@ int main() {
         for (int i = 0; i < 48; ++i)
             expressions << (i % 8 == 0 ? 0 : r(101) - 50) << ' ' << r(17) - 8 << '\n';
         cases.emplace_back("expressions", expressions.str());
+        cases.emplace_back("linkage", expressions.str());
+        cases.emplace_back("exported_library", expressions.str());
         cases.emplace_back("closure_copies", expressions.str());
         cases.emplace_back("ranges", expressions.str());
         cases.emplace_back("integer_pointers", expressions.str());
@@ -471,6 +473,8 @@ int main() {
                                         "System.out.println(Main.score(values)); }}\n");
         write(p / "GnuRandomThreadDriver.java",
               read(fs::path(JPP_SOURCE) / "tests/fixtures/GnuRandomThreadDriver.java"));
+        write(p / "ExportedLibraryDriver.java",
+              read(fs::path(JPP_SOURCE) / "tests/fixtures/ExportedLibraryDriver.java"));
 
         auto javacs = configured("JPP_TEST_JAVACS", "javac");
         auto javas = configured("JPP_TEST_JAVAS", "java");
@@ -506,6 +510,8 @@ int main() {
             if (!selected.empty() && !selected.count(name))
                 continue;
             auto source = (fs::path(JPP_SOURCE) / "tests/fixtures" / (name + ".cpp")).string();
+            if (name == "exported_library")
+                source = (fs::path(JPP_SOURCE) / "tests/fixtures/exported_library.cppm").string();
             write(p / "input", input);
             write(p / "jpp-redirect.in", input);
             auto nativeSource = source;
@@ -514,6 +520,10 @@ int main() {
                 nativeSource =
                     (fs::path(JPP_SOURCE) / "tests/fixtures/library_driver.cpp").string();
                 javaDriver = "LibraryDriver";
+            } else if (name == "exported_library") {
+                nativeSource =
+                    (fs::path(JPP_SOURCE) / "tests/fixtures/exported_library_driver.cpp").string();
+                javaDriver = "ExportedLibraryDriver";
             } else if (name == "gnu_random_threads") {
                 nativeSource =
                     (fs::path(JPP_SOURCE) / "tests/fixtures/gnu_random_threads_driver.cpp")
@@ -529,6 +539,15 @@ int main() {
                                      : "clang++-18";
             bool compatibilityModule =
                 name == "std_compat" || name == "character_classification_module";
+            if (name == "exported_library") {
+                oracleCompiler = std::getenv("JPP_TEST_MODULE_CXX")
+                                     ? std::getenv("JPP_TEST_MODULE_CXX")
+                                     : "clang++-18";
+                must({oracleCompiler, "-std=gnu++23", "-c", source,
+                      "-fmodule-output=" + (p / "practice.pcm").string(), "-o",
+                      (p / "practice.o").string()},
+                     p / "empty");
+            }
             if (name == "std_module" || compatibilityModule) {
                 oracleCompiler = std::getenv("JPP_TEST_MODULE_CXX")
                                      ? std::getenv("JPP_TEST_MODULE_CXX")
@@ -555,6 +574,11 @@ int main() {
                 nativeCompile.push_back("-lgmp");
             if (name == "gnu_random_threads")
                 nativeCompile.push_back("-pthread");
+            if (name == "exported_library") {
+                nativeCompile.push_back("-fmodule-file=jpp_practice=" +
+                                        (p / "practice.pcm").string());
+                nativeCompile.push_back((p / "practice.o").string());
+            }
             if (name == "std_module" || compatibilityModule) {
                 nativeCompile.push_back("-fmodule-file=std=" + (p / "std.pcm").string());
                 nativeCompile.push_back((p / "std.o").string());
